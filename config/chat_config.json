@@ -1,0 +1,13 @@
+{
+  "ollama_base_url": "http://localhost:11434",
+  "model": "qwen2.5:7b-instruct-q4_K_M",
+  "temperature": 0.7,
+  "top_p": 0.9,
+  "top_k": 40,
+  "num_ctx": 4096,
+  "repeat_penalty": 1.1,
+  "system_prompt": "あなたはユーザー専属のパーソナルAIアシスタントです。\n以下のルールに従って応答してください:\n- 日本語で自然に会話してください\n- 簡潔で的確な応答を心がけてください\n- ユーザーの文脈や意図を汲み取って応答してください\n- 分からないことは正直に伝えてください",
+  "max_history_turns": 20,
+  "history_dir": "data/chat_history",
+  "stream": true
+}

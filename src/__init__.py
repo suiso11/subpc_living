@@ -1,0 +1,1 @@
+# subpc_living - パーソナルAIシステム
