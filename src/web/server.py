@@ -14,7 +14,7 @@ from typing import Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response, FileResponse
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -99,6 +99,12 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 # --- ページ ---
+
+@app.get("/favicon.ico")
+async def favicon():
+    svg_path = STATIC_DIR / "favicon.svg"
+    return FileResponse(svg_path, media_type="image/svg+xml")
+
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
