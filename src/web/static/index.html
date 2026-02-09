@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#0f0f14">
+  <title>subpc_living</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="app">
+    <!-- ヘッダー -->
+    <div class="header">
+      <div class="header-title">
+        <span id="status-dot" class="status-dot"></span>
+        <span>subpc_living</span>
+      </div>
+      <div class="header-actions">
+        <button class="icon-btn" id="new-session-btn" title="新しい会話">🗑️</button>
+        <button class="icon-btn" id="settings-btn" title="設定">⚙️</button>
+      </div>
+    </div>
+
+    <!-- チャットエリア -->
+    <div class="chat-area" id="chat-area">
+      <div class="welcome">
+        <h2>💬 subpc_living</h2>
+        <p>パーソナルAIとチャットできます。<br>メッセージを入力してください。</p>
+      </div>
+    </div>
+
+    <!-- 入力エリア -->
+    <div class="input-area">
+      <div class="input-row">
+        <div class="input-wrapper">
+          <textarea id="message-input" placeholder="メッセージを入力..." rows="1"></textarea>
+        </div>
+        <button class="send-btn" id="send-btn" title="送信">➤</button>
+      </div>
+      <div class="input-options">
+        <label class="toggle-label">
+          <input type="checkbox" class="toggle-input" id="tts-toggle">
+          <span class="toggle-switch"></span>
+          🔊 読み上げ
+        </label>
+      </div>
+    </div>
+  </div>
+
+  <!-- 設定パネル -->
+  <div class="settings-panel" id="settings-panel">
+    <div class="settings-content">
+      <div class="settings-header">
+        <h3>⚙️ 設定</h3>
+        <button class="icon-btn" id="settings-close">✕</button>
+      </div>
+
+      <div class="setting-group">
+        <label>TTS ボイス</label>
+        <select id="voice-select">
+          <option value="jf_alpha">jf_alpha — 日本語 女性 (Alpha)</option>
+        </select>
+      </div>
+
+      <div class="setting-group">
+        <label>接続情報</label>
+        <div class="conn-info">
+          <strong>サーバー:</strong> <span id="server-url"></span><br>
+          <strong>WebSocket:</strong> <span id="ws-status">接続中...</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+  <script>
+    // 接続情報表示
+    document.getElementById('server-url').textContent = location.origin;
+  </script>
+</body>
+</html>
