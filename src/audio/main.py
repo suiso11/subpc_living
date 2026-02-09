@@ -1,0 +1,145 @@
+"""
+Phase 3: 音声対話 CLIメインエントリポイント
+STT + LLM + TTS のパイプラインを統合した音声対話
+"""
+import sys
+import argparse
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+
+# --- ANSI カラーコード ---
+class Color:
+    CYAN = "\033[96m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    RED = "\033[91m"
+    DIM = "\033[2m"
+    BOLD = "\033[1m"
+    RESET = "\033[0m"
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Phase 3: 音声対話")
+    parser.add_argument("--stt-model", default="small", help="Whisperモデルサイズ (tiny/base/small/medium)")
+    parser.add_argument("--tts-voice", default="jf_alpha", help="kokoro-onnx 音声名 (jf_alpha/jm_kumo等)")
+    parser.add_argument("--text-mode", action="store_true", help="テキスト入力モード (マイクなし)")
+    args = parser.parse_args()
+
+    print(f"""
+{Color.CYAN}{Color.BOLD}╔══════════════════════════════════════════╗
+║   subpc_living — 音声対話 (Phase 3)       ║
+╚══════════════════════════════════════════╝{Color.RESET}
+""")
+
+    if args.text_mode:
+        # テキスト入力 → TTS再生モード（マイクなしでTTSをテスト可能）
+        run_text_to_speech_mode(args)
+    else:
+        # フル音声対話モード
+        run_voice_mode(args)
+
+
+def run_voice_mode(args):
+    """フル音声対話モード: マイク → STT → LLM → TTS → スピーカー"""
+    from src.audio.pipeline import VoicePipeline
+    from src.chat.config import ChatConfig
+
+    config = ChatConfig.load(PROJECT_ROOT / "config" / "chat_config.json")
+    pipeline = VoicePipeline(
+        chat_config=config,
+        stt_model=args.stt_model,
+        tts_voice=args.tts_voice,
+    )
+
+    if not pipeline.initialize():
+        print(f"\n{Color.RED}初期化に失敗しました。{Color.RESET}")
+        sys.exit(1)
+
+    pipeline.run_interactive()
+
+
+def run_text_to_speech_mode(args):
+    """テキスト入力 → LLM応答 → TTS再生モード"""
+    from src.audio.tts import KokoroTTS
+    from src.audio.audio_io import AudioPlayer
+    from src.chat.client import OllamaClient
+    from src.chat.session import ChatSession
+    from src.chat.config import ChatConfig
+
+    config = ChatConfig.load(PROJECT_ROOT / "config" / "chat_config.json")
+
+    # TTS初期化 (kokoro-onnx)
+    tts = KokoroTTS(
+        models_dir=PROJECT_ROOT / "models" / "tts" / "kokoro",
+        voice=args.tts_voice,
+    )
+    tts.load()
+
+    player = AudioPlayer(sample_rate=24000)
+
+    # LLM初期化
+    client = OllamaClient(base_url=config.ollama_base_url, model=config.model)
+    if not client.is_available():
+        print(f"{Color.RED}Ollamaに接続できません{Color.RESET}")
+        sys.exit(1)
+
+    session = ChatSession(
+        system_prompt=config.system_prompt,
+        max_history_turns=config.max_history_turns,
+        history_dir=str(PROJECT_ROOT / config.history_dir),
+    )
+
+    print(f"{Color.DIM}テキスト入力 → LLM応答 → 音声再生モード{Color.RESET}")
+    print(f"{Color.DIM}モデル: {config.model}{Color.RESET}")
+    print(f"{Color.YELLOW}Ctrl+C で終了{Color.RESET}\n")
+
+    try:
+        while True:
+            user_input = input(f"{Color.GREEN}{Color.BOLD}あなた> {Color.RESET}").strip()
+            if not user_input:
+                continue
+            if user_input in ("/quit", "/exit"):
+                break
+
+            session.add_user_message(user_input)
+            messages = session.build_messages()
+
+            # LLM応答生成
+            print(f"{Color.CYAN}{Color.BOLD}AI> {Color.RESET}", end="", flush=True)
+            response = ""
+            for token in client.generate_stream(
+                messages,
+                temperature=config.temperature,
+                top_p=config.top_p,
+                top_k=config.top_k,
+                num_ctx=config.num_ctx,
+                repeat_penalty=config.repeat_penalty,
+            ):
+                print(token, end="", flush=True)
+                response += token
+            print()
+
+            session.add_assistant_message(response)
+
+            # TTS再生
+            print(f"{Color.DIM}🔊 読み上げ中...{Color.RESET}")
+            try:
+                wav_data = tts.synthesize(response)
+                player.play_wav(wav_data, blocking=True)
+            except Exception as e:
+                print(f"{Color.RED}TTS再生エラー: {e}{Color.RESET}")
+
+    except KeyboardInterrupt:
+        print(f"\n{Color.YELLOW}終了します...{Color.RESET}")
+
+    if session.turn_count > 0:
+        saved = session.save()
+        print(f"{Color.DIM}会話を保存しました: {saved}{Color.RESET}")
+    client.close()
+
+
+if __name__ == "__main__":
+    main()

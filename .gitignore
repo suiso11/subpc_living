@@ -10,6 +10,10 @@ build/
 # データ（個人データはgitに含めない）
 data/
 
+# モデル・バイナリ（サイズが大きいためgit管理外）
+models/
+tools/
+
 # OS
 .DS_Store
 Thumbs.db
