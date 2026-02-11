@@ -71,7 +71,7 @@ async def lifespan(app: FastAPI):
     config = ChatConfig.load(config_path)
 
     # LLM 初期化
-    print("[1/5] Ollama 接続確認...")
+    print("[1/6] Ollama 接続確認...")
     llm = OllamaClient(base_url=config.ollama_base_url, model=config.model)
     if not llm.is_available():
         print("⚠️  Ollamaに接続できません。チャット機能は使用不可です。")
@@ -79,7 +79,7 @@ async def lifespan(app: FastAPI):
         print(f"✅ Ollama OK (model: {config.model})")
 
     # TTS 初期化
-    print("[2/5] TTS 初期化...")
+    print("[2/6] TTS 初期化...")
     tts = KokoroTTS(models_dir=PROJECT_ROOT / "models" / "tts" / "kokoro")
     try:
         tts.load()
@@ -89,7 +89,7 @@ async def lifespan(app: FastAPI):
         tts = None
 
     # RAG 初期化 (Phase 4)
-    print("[3/5] RAG (長期記憶) 初期化...")
+    print("[3/6] RAG (長期記憶) 初期化...")
     try:
         vector_store = VectorStore(
             persist_dir=str(PROJECT_ROOT / "data" / "vectordb"),
@@ -103,7 +103,7 @@ async def lifespan(app: FastAPI):
         rag = None
 
     # Vision 初期化 (Phase 5)
-    print("[4/5] Vision (映像入力) 初期化...")
+    print("[4/6] Vision (映像入力) 初期化...")
     try:
         emotion_model = str(PROJECT_ROOT / "models" / "vision" / "emotion-ferplus-8.onnx")
         vision = VisionContext(
@@ -125,7 +125,7 @@ async def lifespan(app: FastAPI):
         vision = None
 
     # Monitor 初期化 (Phase 6)
-    print("[5/5] Monitor (PCログ収集) 初期化...")
+    print("[5/6] Monitor (PCログ収集) 初期化...")
     try:
         monitor = MonitorContext(
             db_path=str(PROJECT_ROOT / "data" / "metrics" / "system_metrics.db"),
@@ -140,6 +140,30 @@ async def lifespan(app: FastAPI):
         print(f"⚠️  Monitor 初期化失敗 (Monitorなしで続行): {e}")
         monitor = None
 
+    # Persona 初期化 (Phase 7)
+    print("[6/6] Persona (パーソナライズ) 初期化...")
+    try:
+        profile = UserProfile(
+            profile_path=str(PROJECT_ROOT / "data" / "profile" / "user_profile.json"),
+        )
+        profile.load()
+        summarizer = ConversationSummarizer(
+            summaries_dir=str(PROJECT_ROOT / "data" / "profile" / "summaries"),
+        )
+        preloader = SessionPreloader(
+            profile=profile,
+            summarizer=summarizer,
+        )
+        profile_name = profile.name or "(未設定)"
+        facts_count = len(profile.extracted_facts)
+        today_count = len(profile.get_today_schedule())
+        print(f"✅ Persona OK (名前: {profile_name}, 事実: {facts_count}件, 今日の予定: {today_count}件)")
+    except Exception as e:
+        print(f"⚠️  Persona 初期化失敗 (Personaなしで続行): {e}")
+        profile = None
+        summarizer = None
+        preloader = None
+
     local_ip = get_local_ip()
     print()
     print("=" * 50)
@@ -152,6 +176,19 @@ async def lifespan(app: FastAPI):
     yield
 
     # 終了処理
+    # セッション要約 (Phase 7)
+    if summarizer is not None and llm is not None:
+        for sid, sess in sessions.items():
+            if sess.turn_count >= 2:
+                try:
+                    summarizer.process_session_end(
+                        llm=llm,
+                        messages=sess.messages,
+                        session_id=sess.session_id,
+                        profile=profile,
+                    )
+                except Exception:
+                    pass
     if monitor is not None:
         monitor.stop()
     if vision is not None:
@@ -199,6 +236,8 @@ async def status():
         "vision_status": vision.get_status() if vision else None,
         "monitor": monitor is not None and monitor.is_running,
         "monitor_status": monitor.get_status() if monitor else None,
+        "persona": profile is not None,
+        "persona_status": preloader.get_status() if preloader else None,
     }
 
 
@@ -296,6 +335,77 @@ async def monitor_summary(minutes: int = 60):
     return monitor.get_recent_summary(minutes=minutes)
 
 
+# --- Persona API (Phase 7) ---
+
+@app.get("/api/persona/status")
+async def persona_status():
+    """パーソナライズの状態"""
+    if profile is None:
+        return {"enabled": False}
+    return {
+        "enabled": True,
+        "profile": profile.get_status(),
+        "preloader": preloader.get_status() if preloader else None,
+    }
+
+
+@app.get("/api/persona/profile")
+async def persona_profile():
+    """ユーザープロフィール取得"""
+    if profile is None:
+        return JSONResponse({"error": "Persona not available"}, status_code=503)
+    return profile.data
+
+
+@app.post("/api/persona/profile")
+async def update_persona_profile(request: Request):
+    """ユーザープロフィール更新"""
+    if profile is None:
+        return JSONResponse({"error": "Persona not available"}, status_code=503)
+
+    body = await request.json()
+
+    if "name" in body:
+        profile.name = body["name"]
+    if "nickname" in body:
+        profile.data["nickname"] = body["nickname"]
+        profile.save()
+    if "preferences" in body and isinstance(body["preferences"], dict):
+        for k, v in body["preferences"].items():
+            profile.set_preference(k, v)
+    if "habits" in body and isinstance(body["habits"], dict):
+        for k, v in body["habits"].items():
+            profile.set_habit(k, v)
+    if "note" in body:
+        profile.add_note(body["note"])
+    if "schedule" in body and isinstance(body["schedule"], dict):
+        s = body["schedule"]
+        profile.add_schedule(
+            title=s.get("title", ""),
+            date_str=s.get("date", ""),
+            time_str=s.get("time", ""),
+            note=s.get("note", ""),
+        )
+
+    return {"status": "updated", "profile": profile.get_status()}
+
+
+@app.get("/api/persona/summaries")
+async def persona_summaries(count: int = 5):
+    """直近の会話要約を取得"""
+    if summarizer is None:
+        return JSONResponse({"error": "Persona not available"}, status_code=503)
+    return {"summaries": summarizer.get_recent_summaries(count=count)}
+
+
+@app.get("/api/persona/context")
+async def persona_context():
+    """現在のプリロードコンテキスト（デバッグ用）"""
+    if preloader is None:
+        return {"context": "", "enabled": False}
+    return {"context": preloader.build_preload_context(), "enabled": True}
+
+
 # --- WebSocket チャット ---
 
 def get_or_create_session(session_id: str) -> ChatSession:
@@ -308,6 +418,7 @@ def get_or_create_session(session_id: str) -> ChatSession:
             rag=rag,
             vision_context=vision,
             monitor_context=monitor,
+            preloader=preloader,
         )
     return sessions[session_id]
 
