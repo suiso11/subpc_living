@@ -2,6 +2,7 @@
 チャットセッション管理
 Phase 2: 会話履歴の管理・永続化を担当するモジュール
 Phase 4: RAG統合 — ベクトルDBから関連文脈をプロンプトに注入
+Phase 5: Vision統合 — カメラ映像の解析結果をプロンプトに注入
 """
 from datetime import datetime
 from pathlib import Path
@@ -10,6 +11,7 @@ from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from src.memory.rag import RAGRetriever
+    from src.vision.context import VisionContext
 
 
 class ChatSession:
@@ -21,6 +23,7 @@ class ChatSession:
         max_history_turns: int = 20,
         history_dir: str = "data/chat_history",
         rag: Optional["RAGRetriever"] = None,
+        vision_context: Optional["VisionContext"] = None,
     ):
         self.system_prompt = system_prompt
         self.max_history_turns = max_history_turns
@@ -31,6 +34,7 @@ class ChatSession:
         self._messages: list[dict] = []  # {"role": "user"|"assistant", "content": "..."}
         self._created_at = datetime.now()
         self.rag = rag
+        self.vision_context = vision_context
 
     def add_user_message(self, content: str) -> None:
         """ユーザーのメッセージを追加"""
@@ -60,7 +64,7 @@ class ChatSession:
         """
         messages = []
 
-        # システムプロンプト + RAGコンテキスト
+        # システムプロンプト + RAGコンテキスト + Visionコンテキスト
         system_content = self.system_prompt or ""
 
         if self.rag is not None and self._messages:
@@ -74,6 +78,12 @@ class ChatSession:
                 rag_context = self.rag.build_context_prompt(last_user)
                 if rag_context:
                     system_content = system_content + rag_context
+
+        # Vision: カメラ映像の現在の状態を注入
+        if self.vision_context is not None:
+            vision_text = self.vision_context.get_context_text()
+            if vision_text:
+                system_content = system_content + vision_text
 
         if system_content:
             messages.append({"role": "system", "content": system_content})

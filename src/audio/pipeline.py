@@ -24,6 +24,7 @@ from src.chat.session import ChatSession
 from src.chat.config import ChatConfig
 from src.memory.vectorstore import VectorStore
 from src.memory.rag import RAGRetriever
+from src.vision.context import VisionContext
 
 
 class VoicePipeline:
@@ -44,6 +45,8 @@ class VoicePipeline:
         vad_type: str = "auto",
         streaming_tts: bool = True,
         enable_rag: bool = True,
+        enable_vision: bool = True,
+        camera_id: int = 0,
     ):
         # チャット設定
         self.config = chat_config or ChatConfig.load(PROJECT_ROOT / "config" / "chat_config.json")
@@ -89,12 +92,28 @@ class VoicePipeline:
                 print(f"⚠️  RAG初期化スキップ: {e}")
                 self.rag = None
 
+        # Vision (Phase 5: 映像入力)
+        self.enable_vision = enable_vision
+        self.vision_context: Optional[VisionContext] = None
+        if enable_vision:
+            try:
+                emotion_model = str(PROJECT_ROOT / "models" / "vision" / "emotion-ferplus-8.onnx")
+                self.vision_context = VisionContext(
+                    camera_id=camera_id,
+                    analysis_interval=2.0,
+                    emotion_model_path=emotion_model,
+                )
+            except Exception as e:
+                print(f"⚠️  Vision初期化スキップ: {e}")
+                self.vision_context = None
+
         # セッション
         self.session = ChatSession(
             system_prompt=self.config.system_prompt,
             max_history_turns=self.config.max_history_turns,
             history_dir=str(PROJECT_ROOT / self.config.history_dir),
             rag=self.rag,
+            vision_context=self.vision_context,
         )
 
         # ストリーミングTTS設定
@@ -173,7 +192,7 @@ class VoicePipeline:
 
         # RAG (Phase 4)
         if self.enable_rag and self.rag is not None:
-            print("\n[5/5] RAG (長期記憶) 初期化...")
+            print("\n[5/6] RAG (長期記憶) 初期化...")
             try:
                 self.vector_store.initialize()
                 stats = self.rag.get_stats()
@@ -182,7 +201,28 @@ class VoicePipeline:
                 print(f"⚠️  RAG 初期化失敗 (RAGなしで続行): {e}")
                 self.session.rag = None
         else:
-            print("\n[5/5] RAG (長期記憶) スキップ")
+            print("\n[5/6] RAG (長期記憶) スキップ")
+
+        # Vision (Phase 5)
+        if self.enable_vision and self.vision_context is not None:
+            print("\n[6/6] Vision (映像入力) 初期化...")
+            try:
+                if self.vision_context.start():
+                    import time
+                    time.sleep(1.0)  # カメラ安定待ち
+                    status = self.vision_context.get_status()
+                    emotion_str = "有効" if status["emotion_detection"] else "顔検出のみ"
+                    print(f"✅ Vision OK (カメラ起動, 感情推定: {emotion_str})")
+                else:
+                    print("⚠️  カメラを開けません (Visionなしで続行)")
+                    self.session.vision_context = None
+                    self.vision_context = None
+            except Exception as e:
+                print(f"⚠️  Vision 初期化失敗 (Visionなしで続行): {e}")
+                self.session.vision_context = None
+                self.vision_context = None
+        else:
+            print("\n[6/6] Vision (映像入力) スキップ")
 
         print("\n" + "=" * 50)
         print(" ✅ 初期化完了！")
@@ -411,4 +451,6 @@ class VoicePipeline:
     def cleanup(self) -> None:
         """リソースの解放"""
         self._running = False
+        if self.vision_context is not None:
+            self.vision_context.stop()
         self.llm.close()

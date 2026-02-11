@@ -32,6 +32,10 @@ def main():
                         help="ストリーミングTTSを無効化 (全文完了後に音声合成)")
     parser.add_argument("--no-rag", action="store_true",
                         help="RAG (長期記憶) を無効化")
+    parser.add_argument("--no-vision", action="store_true",
+                        help="Vision (映像入力) を無効化")
+    parser.add_argument("--camera-id", type=int, default=0,
+                        help="カメラデバイスID (default: 0)")
     args = parser.parse_args()
 
     print(f"""
@@ -61,6 +65,8 @@ def run_voice_mode(args):
         vad_type=args.vad,
         streaming_tts=not args.no_streaming_tts,
         enable_rag=not args.no_rag,
+        enable_vision=not args.no_vision,
+        camera_id=args.camera_id,
     )
 
     if not pipeline.initialize():

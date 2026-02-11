@@ -25,6 +25,7 @@ from src.chat.config import ChatConfig
 from src.audio.tts import KokoroTTS
 from src.memory.vectorstore import VectorStore
 from src.memory.rag import RAGRetriever
+from src.vision.context import VisionContext
 
 
 # --- グローバル状態 ---
@@ -32,6 +33,7 @@ config: ChatConfig = None
 llm: OllamaClient = None
 tts: KokoroTTS = None
 rag: RAGRetriever = None
+vision: VisionContext = None
 sessions: dict[str, ChatSession] = {}
 
 
@@ -50,7 +52,7 @@ def get_local_ip() -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """サーバー起動/終了時の処理"""
-    global config, llm, tts, rag
+    global config, llm, tts, rag, vision
 
     print("=" * 50)
     print(" Web UI サーバー起動中...")
@@ -61,7 +63,7 @@ async def lifespan(app: FastAPI):
     config = ChatConfig.load(config_path)
 
     # LLM 初期化
-    print("[1/3] Ollama 接続確認...")
+    print("[1/4] Ollama 接続確認...")
     llm = OllamaClient(base_url=config.ollama_base_url, model=config.model)
     if not llm.is_available():
         print("⚠️  Ollamaに接続できません。チャット機能は使用不可です。")
@@ -69,7 +71,7 @@ async def lifespan(app: FastAPI):
         print(f"✅ Ollama OK (model: {config.model})")
 
     # TTS 初期化
-    print("[2/3] TTS 初期化...")
+    print("[2/4] TTS 初期化...")
     tts = KokoroTTS(models_dir=PROJECT_ROOT / "models" / "tts" / "kokoro")
     try:
         tts.load()
@@ -79,7 +81,7 @@ async def lifespan(app: FastAPI):
         tts = None
 
     # RAG 初期化 (Phase 4)
-    print("[3/3] RAG (長期記憶) 初期化...")
+    print("[3/4] RAG (長期記憶) 初期化...")
     try:
         vector_store = VectorStore(
             persist_dir=str(PROJECT_ROOT / "data" / "vectordb"),
@@ -91,6 +93,28 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"⚠️  RAG 初期化失敗 (RAGなしで続行): {e}")
         rag = None
+
+    # Vision 初期化 (Phase 5)
+    print("[4/4] Vision (映像入力) 初期化...")
+    try:
+        emotion_model = str(PROJECT_ROOT / "models" / "vision" / "emotion-ferplus-8.onnx")
+        vision = VisionContext(
+            camera_id=0,
+            analysis_interval=2.0,
+            emotion_model_path=emotion_model,
+        )
+        if vision.start():
+            import time
+            time.sleep(1.0)
+            status = vision.get_status()
+            emotion_str = "有効" if status["emotion_detection"] else "顔検出のみ"
+            print(f"✅ Vision OK (カメラ起動, 感情推定: {emotion_str})")
+        else:
+            print("⚠️  カメラを開けません (Visionなしで続行)")
+            vision = None
+    except Exception as e:
+        print(f"⚠️  Vision 初期化失敗 (Visionなしで続行): {e}")
+        vision = None
 
     local_ip = get_local_ip()
     print()
@@ -104,6 +128,8 @@ async def lifespan(app: FastAPI):
     yield
 
     # 終了処理
+    if vision is not None:
+        vision.stop()
     llm.close()
     print("サーバーを終了しました。")
 
@@ -143,6 +169,8 @@ async def status():
         "tts_voices": KokoroTTS.list_ja_voices(),
         "rag": rag is not None,
         "rag_stats": rag.get_stats() if rag else None,
+        "vision": vision is not None and vision.is_running,
+        "vision_status": vision.get_status() if vision else None,
     }
 
 
@@ -183,6 +211,37 @@ async def set_voice(request: Request):
     return {"voice": voice, "description": KokoroTTS.JA_VOICES[voice]}
 
 
+# --- Vision API ---
+
+@app.get("/api/vision/status")
+async def vision_status():
+    """映像入力の状態"""
+    if vision is None:
+        return {"enabled": False}
+    return {"enabled": True, **vision.get_status()}
+
+
+@app.get("/api/vision/snapshot")
+async def vision_snapshot():
+    """現在のカメラ画像をJPEGで取得"""
+    if vision is None or not vision.is_running:
+        return JSONResponse({"error": "Vision not available"}, status_code=503)
+
+    jpeg = vision.camera.get_jpeg(quality=75)
+    if jpeg is None:
+        return JSONResponse({"error": "No frame available"}, status_code=503)
+
+    return Response(content=jpeg, media_type="image/jpeg")
+
+
+@app.get("/api/vision/context")
+async def vision_context_text():
+    """現在の映像コンテキストテキスト（デバッグ用）"""
+    if vision is None:
+        return {"context": "", "enabled": False}
+    return {"context": vision.get_context_text(), "enabled": True, **vision.get_status()}
+
+
 # --- WebSocket チャット ---
 
 def get_or_create_session(session_id: str) -> ChatSession:
@@ -193,6 +252,7 @@ def get_or_create_session(session_id: str) -> ChatSession:
             max_history_turns=config.max_history_turns,
             history_dir=str(PROJECT_ROOT / config.history_dir),
             rag=rag,
+            vision_context=vision,
         )
     return sessions[session_id]
 

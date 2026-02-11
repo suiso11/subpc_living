@@ -3,7 +3,7 @@
 ## 前提条件
 
 - Ubuntu 24.04 LTS
-- Phase 1〜3 のセットアップスクリプトを実行済み
+- Phase 1〜5 のセットアップスクリプトを実行済み
 - Ollama がインストール済み・起動中
 
 ---
@@ -58,6 +58,16 @@ bash scripts/phase4_setup.sh
 
 # 検証
 bash scripts/phase4_verify.sh
+```
+
+### Phase 5: 映像入力
+
+```bash
+# OpenCV + 感情推定 ONNX モデル DL
+bash scripts/phase5_setup.sh
+
+# 検証
+bash scripts/phase5_verify.sh
 ```
 
 ---
@@ -132,6 +142,8 @@ python src/audio/main.py --text-mode
 | `--vad` | `auto` | VAD 方式: `auto`, `silero`, `energy` |
 | `--no-streaming-tts` | ― | ストリーミング TTS を無効化 (全文完了後に合成) |
 | `--no-rag` | ― | RAG (長期記憶) を無効化 |
+| `--no-vision` | ― | Vision (映像入力) を無効化 |
+| `--camera-id` | `0` | カメラデバイスID |
 
 ### VAD 方式
 
@@ -172,6 +184,12 @@ python src/audio/main.py --vad silero
 # RAG無効で起動
 python src/audio/main.py --no-rag
 
+# Vision無効で起動
+python src/audio/main.py --no-vision
+
+# カメラデバイスを指定
+python src/audio/main.py --camera-id 1
+
 # テキストモードで TTS テスト
 python src/audio/main.py --text-mode --tts-voice jf_nezumi
 ```
@@ -203,9 +221,12 @@ python src/web/server.py
 
 | エンドポイント | メソッド | 説明 |
 |---------------|---------|------|
-| `/api/status` | GET | システム状態 (Ollama/TTS/RAG の接続状況) |
+| `/api/status` | GET | システム状態 (Ollama/TTS/RAG/Vision の接続状況) |
 | `/api/tts` | POST | テキスト → WAV 音声合成 (`{"text": "..."}`) |
 | `/api/tts/voice` | POST | TTS ボイス変更 (`{"voice": "jm_kumo"}`) |
+| `/api/vision/status` | GET | 映像入力の状態 (在席/感情/カメラ情報) |
+| `/api/vision/snapshot` | GET | 現在のカメラ画像 (JPEG) |
+| `/api/vision/context` | GET | 映像コンテキストテキスト (デバッグ用) |
 | `/ws/chat` | WebSocket | ストリーミングチャット (トークン単位) |
 
 ---
@@ -260,6 +281,60 @@ rag.store_knowledge("毎週水曜日にジムに行く", category="schedule")
 
 ---
 
+## 5. 映像入力 — Vision (Phase 5)
+
+カメラ映像からユーザーの在席状況・表情を解析し、LLMのシステムプロンプトに自動注入する。
+
+### 仕組み
+
+1. バックグラウンドスレッドでカメラフレームを連続取得 (15fps)
+2. 2秒間隔で顔検出 (OpenCV Haar Cascade) + 感情推定 (emotion-ferplus ONNX)
+3. 在席/離席、表情の状態を追跡
+4. 会話時、映像コンテキストがシステムプロンプトに追加される
+
+**LLMに注入されるコンテキスト例:**
+
+```
+--- 現在の映像情報 ---
+- ユーザーはカメラの前にいます
+- ユーザーの表情: 嬉しそう
+  (この表情がしばらく続いています)
+```
+
+### 感情ラベル
+
+| English | 日本語 |
+|---------|--------|
+| neutral | 普通 |
+| happiness | 嬉しそう |
+| surprise | 驚いている |
+| sadness | 悲しそう |
+| anger | 怒っている |
+| disgust | 嫌そう |
+| fear | 怖がっている |
+| contempt | 冷めている |
+
+### 使用モデル
+
+| モデル | 用途 | サイズ | 実行環境 |
+|--------|------|--------|---------|
+| OpenCV Haar Cascade | 顔検出 | OpenCV内蔵 | CPU |
+| emotion-ferplus-8.onnx | 感情推定 | ~34MB | CPU (onnxruntime) |
+
+### Vision を無効にする場合
+
+```bash
+# 音声対話
+python src/audio/main.py --no-vision
+
+# カメラデバイスを指定
+python src/audio/main.py --camera-id 1
+```
+
+カメラが接続されていない場合は自動的にスキップされる（エラーにはならない）。
+
+---
+
 ## 設定ファイル
 
 ### config/chat_config.json
@@ -291,8 +366,10 @@ subpc_living/
 │   └── vectordb/              # ChromaDB ベクトルDB (Phase 4)
 ├── models/
 │   ├── stt/                   # Whisper モデルキャッシュ (自動DL)
-│   └── tts/
-│       └── kokoro/            # kokoro-onnx モデル
+│   ├── tts/
+│   │   └── kokoro/            # kokoro-onnx モデル
+│   └── vision/
+│       └── emotion-ferplus-8.onnx  # 感情推定 ONNX モデル
 ├── scripts/
 │   ├── phase1_setup_nvidia.sh
 │   ├── phase1_setup_ollama.sh
@@ -302,7 +379,9 @@ subpc_living/
 │   ├── phase3_setup.sh
 │   ├── phase3_verify.sh
 │   ├── phase4_setup.sh
-│   └── phase4_verify.sh
+│   ├── phase4_verify.sh
+│   ├── phase5_setup.sh
+│   └── phase5_verify.sh
 ├── src/
 │   ├── audio/                 # Phase 3: 音声対話
 │   │   ├── main.py            # CLI エントリポイント
@@ -314,12 +393,16 @@ subpc_living/
 │   ├── chat/                  # Phase 2: テキスト対話
 │   │   ├── main.py            # CLI エントリポイント
 │   │   ├── client.py          # Ollama API クライアント
-│   │   ├── session.py         # 会話セッション管理 + RAG統合
+│   │   ├── session.py         # 会話セッション管理 + RAG/Vision統合
 │   │   └── config.py          # 設定管理
 │   ├── memory/                # Phase 4: 長期記憶
 │   │   ├── embedding.py       # 埋め込みモデル (multilingual-e5-small)
 │   │   ├── vectorstore.py     # ChromaDB ベクトルストア
 │   │   └── rag.py             # RAG リトリーバー
+│   ├── vision/                # Phase 5: 映像入力
+│   │   ├── camera.py          # カメラキャプチャ (バックグラウンド)
+│   │   ├── detector.py        # 顔検出 + 感情推定
+│   │   └── context.py         # 映像コンテキスト管理
 │   └── web/                   # Web UI
 │       ├── server.py          # FastAPI サーバー
 │       └── static/            # HTML/JS/CSS
