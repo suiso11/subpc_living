@@ -50,6 +50,16 @@ source .venv/bin/activate
 pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
 ```
 
+### Phase 4: 長期記憶 (RAG)
+
+```bash
+# ChromaDB + sentence-transformers + 埋め込みモデル DL
+bash scripts/phase4_setup.sh
+
+# 検証
+bash scripts/phase4_verify.sh
+```
+
 ---
 
 ## 仮想環境の有効化
@@ -121,6 +131,7 @@ python src/audio/main.py --text-mode
 | `--text-mode` | ― | テキスト入力モード (マイクなし) |
 | `--vad` | `auto` | VAD 方式: `auto`, `silero`, `energy` |
 | `--no-streaming-tts` | ― | ストリーミング TTS を無効化 (全文完了後に合成) |
+| `--no-rag` | ― | RAG (長期記憶) を無効化 |
 
 ### VAD 方式
 
@@ -158,6 +169,9 @@ python src/audio/main.py --vad energy --no-streaming-tts
 # Silero VAD を指定
 python src/audio/main.py --vad silero
 
+# RAG無効で起動
+python src/audio/main.py --no-rag
+
 # テキストモードで TTS テスト
 python src/audio/main.py --text-mode --tts-voice jf_nezumi
 ```
@@ -189,10 +203,60 @@ python src/web/server.py
 
 | エンドポイント | メソッド | 説明 |
 |---------------|---------|------|
-| `/api/status` | GET | システム状態 (Ollama/TTS の接続状況) |
+| `/api/status` | GET | システム状態 (Ollama/TTS/RAG の接続状況) |
 | `/api/tts` | POST | テキスト → WAV 音声合成 (`{"text": "..."}`) |
 | `/api/tts/voice` | POST | TTS ボイス変更 (`{"voice": "jm_kumo"}`) |
 | `/ws/chat` | WebSocket | ストリーミングチャット (トークン単位) |
+
+---
+
+## 4. 長期記憶 — RAG (Phase 4)
+
+会話が自動でベクトルDB (ChromaDB) に保存され、関連する過去の文脈がLLMのシステムプロンプトに自動注入される。
+
+### 仕組み
+
+1. 会話のたびに user + assistant のペアが ChromaDB に保存される
+2. 新しい発言時に、埋め込みモデル (multilingual-e5-small, 384次元) でセマンティック検索
+3. 関連する過去の会話・知識がシステムプロンプトに追加される
+4. LLM は過去の文脈を参考に応答（不自然に持ち出さないよう指示付き）
+
+### データ保存先
+
+- ベクトルDB: `data/vectordb/`
+- 会話履歴 (JSON): `data/chat_history/`
+
+### RAG を無効にする場合
+
+```bash
+# 音声対話
+python src/audio/main.py --no-rag
+
+# テキスト対話・Web UI は自動有効 (コード上で無効化する場合は ChatSession(rag=None))
+```
+
+### 知識の手動追加 (Python)
+
+```python
+from src.memory.vectorstore import VectorStore
+from src.memory.rag import RAGRetriever
+
+vs = VectorStore(persist_dir="data/vectordb")
+vs.initialize()
+rag = RAGRetriever(vector_store=vs)
+
+# 知識を追加
+rag.store_knowledge("ユーザーは猫のミケを飼っている", category="preference")
+rag.store_knowledge("毎週水曜日にジムに行く", category="schedule")
+```
+
+### RAG 設定パラメータ
+
+| パラメータ | デフォルト | 説明 |
+|-----------|-----------|------|
+| `max_context_items` | `5` | 検索結果の最大数 |
+| `max_context_chars` | `2000` | コンテキストの最大文字数 |
+| `relevance_threshold` | `1.5` | 類似度の閾値 (コサイン距離) |
 
 ---
 
@@ -223,7 +287,8 @@ subpc_living/
 ├── config/
 │   └── chat_config.json       # チャット設定
 ├── data/
-│   └── chat_history/          # 会話履歴 (JSON)
+│   ├── chat_history/          # 会話履歴 (JSON)
+│   └── vectordb/              # ChromaDB ベクトルDB (Phase 4)
 ├── models/
 │   ├── stt/                   # Whisper モデルキャッシュ (自動DL)
 │   └── tts/
@@ -235,7 +300,9 @@ subpc_living/
 │   ├── phase2_setup.sh
 │   ├── phase2_verify.sh
 │   ├── phase3_setup.sh
-│   └── phase3_verify.sh
+│   ├── phase3_verify.sh
+│   ├── phase4_setup.sh
+│   └── phase4_verify.sh
 ├── src/
 │   ├── audio/                 # Phase 3: 音声対話
 │   │   ├── main.py            # CLI エントリポイント
@@ -247,8 +314,12 @@ subpc_living/
 │   ├── chat/                  # Phase 2: テキスト対話
 │   │   ├── main.py            # CLI エントリポイント
 │   │   ├── client.py          # Ollama API クライアント
-│   │   ├── session.py         # 会話セッション管理
+│   │   ├── session.py         # 会話セッション管理 + RAG統合
 │   │   └── config.py          # 設定管理
+│   ├── memory/                # Phase 4: 長期記憶
+│   │   ├── embedding.py       # 埋め込みモデル (multilingual-e5-small)
+│   │   ├── vectorstore.py     # ChromaDB ベクトルストア
+│   │   └── rag.py             # RAG リトリーバー
 │   └── web/                   # Web UI
 │       ├── server.py          # FastAPI サーバー
 │       └── static/            # HTML/JS/CSS

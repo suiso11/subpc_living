@@ -223,8 +223,8 @@
 |---------|------|------|------|
 | Phase 1 | 環境構築 | Ubuntu + CUDA + **GTX 1060**セットアップ。Ollamaインストール | ✅ **完了** |
 | Phase 2 | テキスト対話 | 7Bモデル(Q4)でテキストベース対話を実現 | ✅ **完了** |
-| Phase 3 | 音声対話 | STT(faster-whisper/CPU) + TTS(Piper/CPU) パイプライン構築 | ⬜ |
-| Phase 4 | 長期記憶 | ベクトルDB + RAG で会話履歴の蓄積・参照 | ⬜ |
+| Phase 3 | 音声対話 | STT(faster-whisper/CPU) + TTS(kokoro-onnx/CPU) + VAD(Silero/Energy) + ストリーミングTTS | ✅ **完了** |
+| Phase 4 | 長期記憶 | ChromaDB + multilingual-e5-small + RAG で会話履歴の蓄積・参照 | ✅ **完了** |
 | Phase 5 | 映像入力 | カメラ常時ON + 顔認識・感情推定（CPU実行） | ⬜ |
 | Phase 6 | PCログ収集 | サブPC/メインPCの挙動ログ収集・蓄積・分析 | ⬜ |
 | Phase 7 | パーソナライズ | セッションプリロード・プロアクティブ発話・応答最適化 | ⬜ |
