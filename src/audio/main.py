@@ -36,6 +36,8 @@ def main():
                         help="Vision (映像入力) を無効化")
     parser.add_argument("--camera-id", type=int, default=0,
                         help="カメラデバイスID (default: 0)")
+    parser.add_argument("--no-monitor", action="store_true",
+                        help="Monitor (PCログ収集) を無効化")
     args = parser.parse_args()
 
     print(f"""
@@ -67,6 +69,7 @@ def run_voice_mode(args):
         enable_rag=not args.no_rag,
         enable_vision=not args.no_vision,
         camera_id=args.camera_id,
+        enable_monitor=not args.no_monitor,
     )
 
     if not pipeline.initialize():

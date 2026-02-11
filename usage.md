@@ -3,7 +3,7 @@
 ## 前提条件
 
 - Ubuntu 24.04 LTS
-- Phase 1〜5 のセットアップスクリプトを実行済み
+- Phase 1〜6 のセットアップスクリプトを実行済み
 - Ollama がインストール済み・起動中
 
 ---
@@ -68,6 +68,16 @@ bash scripts/phase5_setup.sh
 
 # 検証
 bash scripts/phase5_verify.sh
+```
+
+### Phase 6: PCログ収集
+
+```bash
+# psutil インストール + データディレクトリ作成
+bash scripts/phase6_setup.sh
+
+# 検証
+bash scripts/phase6_verify.sh
 ```
 
 ---
@@ -144,6 +154,7 @@ python src/audio/main.py --text-mode
 | `--no-rag` | ― | RAG (長期記憶) を無効化 |
 | `--no-vision` | ― | Vision (映像入力) を無効化 |
 | `--camera-id` | `0` | カメラデバイスID |
+| `--no-monitor` | ― | Monitor (PCログ収集) を無効化 |
 
 ### VAD 方式
 
@@ -221,12 +232,15 @@ python src/web/server.py
 
 | エンドポイント | メソッド | 説明 |
 |---------------|---------|------|
-| `/api/status` | GET | システム状態 (Ollama/TTS/RAG/Vision の接続状況) |
+| `/api/status` | GET | システム状態 (Ollama/TTS/RAG/Vision/Monitor の接続状況) |
 | `/api/tts` | POST | テキスト → WAV 音声合成 (`{"text": "..."}`) |
 | `/api/tts/voice` | POST | TTS ボイス変更 (`{"voice": "jm_kumo"}`) |
 | `/api/vision/status` | GET | 映像入力の状態 (在席/感情/カメラ情報) |
 | `/api/vision/snapshot` | GET | 現在のカメラ画像 (JPEG) |
 | `/api/vision/context` | GET | 映像コンテキストテキスト (デバッグ用) |
+| `/api/monitor/status` | GET | PCモニター状態 (CPU/メモリ/GPU/ディスク等) |
+| `/api/monitor/context` | GET | PCモニターコンテキストテキスト (デバッグ用) |
+| `/api/monitor/summary?minutes=60` | GET | 直近N分のメトリクスサマリー |
 | `/ws/chat` | WebSocket | ストリーミングチャット (トークン単位) |
 
 ---
@@ -335,6 +349,53 @@ python src/audio/main.py --camera-id 1
 
 ---
 
+## 6. PCログ収集 — Monitor (Phase 6)
+
+psutil でサブPCのシステムメトリクスを常時収集・SQLiteに蓄積し、LLMのシステムプロンプトに自動注入する。
+
+### 仕組み
+
+1. バックグラウンドスレッドで 30秒間隔でメトリクスを収集 (psutil)
+2. SQLite (WALモード) に時系列データとして蓄積
+3. 会話時、PCの現在の状態がシステムプロンプトに追加される
+4. 異常検知 (CPU過負荷、メモリ逆迫、高温等) は自動で警告注入
+
+**LLMに注入されるコンテキスト例:**
+
+```
+--- サブPCの現在の状態 ---
+- CPU: 25% (低負荷)
+  温度: 52°C
+- メモリ: 8.2GB / 15.6GB (53%, 余裕あり)
+- GPU: 15% (稼働中)
+  VRAM: 1200MB / 6144MB
+  温度: 45°C
+```
+
+### 収集されるメトリクス
+
+| カテゴリ | 項目 |
+|------------|------|
+| CPU | 使用率 (全体/コア別)、クロック周波数、ロードアベレージ、温度 |
+| メモリ | 合計/使用量/使用率、スワップ |
+| ディスク | 合計/使用量/使用率、I/Oレート |
+| ネットワーク | 送受信レート |
+| GPU | 使用率、VRAM、温度、電力 (nvidia-smi経由) |
+| プロセス | 総数、CPUトップ5 |
+
+### Monitor を無効にする場合
+
+```bash
+python src/audio/main.py --no-monitor
+```
+
+### データ保存先
+
+- DB: `data/metrics/system_metrics.db` (SQLite, WALモード)
+- 古いデータは 30日で自動クリーンアップ可能
+
+---
+
 ## 設定ファイル
 
 ### config/chat_config.json
@@ -363,7 +424,8 @@ subpc_living/
 │   └── chat_config.json       # チャット設定
 ├── data/
 │   ├── chat_history/          # 会話履歴 (JSON)
-│   └── vectordb/              # ChromaDB ベクトルDB (Phase 4)
+│   ├── vectordb/              # ChromaDB ベクトルDB (Phase 4)
+│   └── metrics/               # システムメトリクスDB (Phase 6)
 ├── models/
 │   ├── stt/                   # Whisper モデルキャッシュ (自動DL)
 │   ├── tts/
@@ -381,7 +443,9 @@ subpc_living/
 │   ├── phase4_setup.sh
 │   ├── phase4_verify.sh
 │   ├── phase5_setup.sh
-│   └── phase5_verify.sh
+│   ├── phase5_verify.sh
+│   ├── phase6_setup.sh
+│   └── phase6_verify.sh
 ├── src/
 │   ├── audio/                 # Phase 3: 音声対話
 │   │   ├── main.py            # CLI エントリポイント
@@ -393,7 +457,7 @@ subpc_living/
 │   ├── chat/                  # Phase 2: テキスト対話
 │   │   ├── main.py            # CLI エントリポイント
 │   │   ├── client.py          # Ollama API クライアント
-│   │   ├── session.py         # 会話セッション管理 + RAG/Vision統合
+│   │   ├── session.py         # 会話セッション管理 + RAG/Vision/Monitor統合
 │   │   └── config.py          # 設定管理
 │   ├── memory/                # Phase 4: 長期記憶
 │   │   ├── embedding.py       # 埋め込みモデル (multilingual-e5-small)
@@ -403,6 +467,10 @@ subpc_living/
 │   │   ├── camera.py          # カメラキャプチャ (バックグラウンド)
 │   │   ├── detector.py        # 顔検出 + 感情推定
 │   │   └── context.py         # 映像コンテキスト管理
+│   ├── monitor/               # Phase 6: PCログ収集
+│   │   ├── collector.py       # psutilメトリクス収集
+│   │   ├── storage.py         # SQLite時系列ストレージ
+│   │   └── context.py         # モニターコンテキスト管理
 │   └── web/                   # Web UI
 │       ├── server.py          # FastAPI サーバー
 │       └── static/            # HTML/JS/CSS

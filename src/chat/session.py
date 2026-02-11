@@ -12,6 +12,7 @@ from typing import Optional, TYPE_CHECKING
 if TYPE_CHECKING:
     from src.memory.rag import RAGRetriever
     from src.vision.context import VisionContext
+    from src.monitor.context import MonitorContext
 
 
 class ChatSession:
@@ -24,6 +25,7 @@ class ChatSession:
         history_dir: str = "data/chat_history",
         rag: Optional["RAGRetriever"] = None,
         vision_context: Optional["VisionContext"] = None,
+        monitor_context: Optional["MonitorContext"] = None,
     ):
         self.system_prompt = system_prompt
         self.max_history_turns = max_history_turns
@@ -35,6 +37,7 @@ class ChatSession:
         self._created_at = datetime.now()
         self.rag = rag
         self.vision_context = vision_context
+        self.monitor_context = monitor_context
 
     def add_user_message(self, content: str) -> None:
         """ユーザーのメッセージを追加"""
@@ -84,6 +87,12 @@ class ChatSession:
             vision_text = self.vision_context.get_context_text()
             if vision_text:
                 system_content = system_content + vision_text
+
+        # Monitor: サブPCの状態を注入 (Phase 6)
+        if self.monitor_context is not None:
+            monitor_text = self.monitor_context.get_context_text()
+            if monitor_text:
+                system_content = system_content + monitor_text
 
         if system_content:
             messages.append({"role": "system", "content": system_content})

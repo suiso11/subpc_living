@@ -25,6 +25,7 @@ from src.chat.config import ChatConfig
 from src.memory.vectorstore import VectorStore
 from src.memory.rag import RAGRetriever
 from src.vision.context import VisionContext
+from src.monitor.context import MonitorContext
 
 
 class VoicePipeline:
@@ -47,6 +48,7 @@ class VoicePipeline:
         enable_rag: bool = True,
         enable_vision: bool = True,
         camera_id: int = 0,
+        enable_monitor: bool = True,
     ):
         # チャット設定
         self.config = chat_config or ChatConfig.load(PROJECT_ROOT / "config" / "chat_config.json")
@@ -107,6 +109,19 @@ class VoicePipeline:
                 print(f"⚠️  Vision初期化スキップ: {e}")
                 self.vision_context = None
 
+        # Monitor (Phase 6: PCログ収集)
+        self.enable_monitor = enable_monitor
+        self.monitor_context: Optional[MonitorContext] = None
+        if enable_monitor:
+            try:
+                self.monitor_context = MonitorContext(
+                    db_path=str(PROJECT_ROOT / "data" / "metrics" / "system_metrics.db"),
+                    collect_interval=30.0,
+                )
+            except Exception as e:
+                print(f"⚠️  Monitor初期化スキップ: {e}")
+                self.monitor_context = None
+
         # セッション
         self.session = ChatSession(
             system_prompt=self.config.system_prompt,
@@ -114,6 +129,7 @@ class VoicePipeline:
             history_dir=str(PROJECT_ROOT / self.config.history_dir),
             rag=self.rag,
             vision_context=self.vision_context,
+            monitor_context=self.monitor_context,
         )
 
         # ストリーミングTTS設定
@@ -151,14 +167,14 @@ class VoicePipeline:
         print("=" * 50)
 
         # Ollama 接続チェック
-        print("\n[1/4] Ollama 接続確認...")
+        print("\n[1/7] Ollama 接続確認...")
         if not self.llm.is_available():
             print("❌ Ollamaに接続できません")
             return False
         print("✅ Ollama OK")
 
         # STT モデルロード
-        print("\n[2/4] STT モデルロード...")
+        print("\n[2/7] STT モデルロード...")
         try:
             self.stt.load()
             print("✅ STT OK")
@@ -167,7 +183,7 @@ class VoicePipeline:
             return False
 
         # TTS チェック
-        print("\n[3/4] TTS 確認...")
+        print("\n[3/7] TTS 確認...")
         try:
             self.tts.load()
             print("✅ TTS OK")
@@ -176,7 +192,7 @@ class VoicePipeline:
             return False
 
         # VAD キャリブレーション (Energy VADの場合のみ環境ノイズ計測)
-        print("\n[4/4] VAD キャリブレーション...")
+        print("\n[4/7] VAD キャリブレーション...")
         vad_name = type(self.vad).__name__
         print(f"  VAD方式: {vad_name}")
         try:
@@ -192,7 +208,7 @@ class VoicePipeline:
 
         # RAG (Phase 4)
         if self.enable_rag and self.rag is not None:
-            print("\n[5/6] RAG (長期記憶) 初期化...")
+            print("\n[5/7] RAG (長期記憶) 初期化...")
             try:
                 self.vector_store.initialize()
                 stats = self.rag.get_stats()
@@ -201,11 +217,11 @@ class VoicePipeline:
                 print(f"⚠️  RAG 初期化失敗 (RAGなしで続行): {e}")
                 self.session.rag = None
         else:
-            print("\n[5/6] RAG (長期記憶) スキップ")
+            print("\n[5/7] RAG (長期記憶) スキップ")
 
         # Vision (Phase 5)
         if self.enable_vision and self.vision_context is not None:
-            print("\n[6/6] Vision (映像入力) 初期化...")
+            print("\n[6/7] Vision (映像入力) 初期化...")
             try:
                 if self.vision_context.start():
                     import time
@@ -222,7 +238,24 @@ class VoicePipeline:
                 self.session.vision_context = None
                 self.vision_context = None
         else:
-            print("\n[6/6] Vision (映像入力) スキップ")
+            print("\n[6/7] Vision (映像入力) スキップ")
+
+        # Monitor (Phase 6)
+        if self.enable_monitor and self.monitor_context is not None:
+            print("\n[7/7] Monitor (PCログ収集) 初期化...")
+            try:
+                if self.monitor_context.start():
+                    print("✅ Monitor OK (メトリクス収集開始)")
+                else:
+                    print("⚠️  Monitor 起動失敗 (Monitorなしで続行)")
+                    self.session.monitor_context = None
+                    self.monitor_context = None
+            except Exception as e:
+                print(f"⚠️  Monitor 初期化失敗 (Monitorなしで続行): {e}")
+                self.session.monitor_context = None
+                self.monitor_context = None
+        else:
+            print("\n[7/7] Monitor (PCログ収集) スキップ")
 
         print("\n" + "=" * 50)
         print(" ✅ 初期化完了！")
@@ -451,6 +484,8 @@ class VoicePipeline:
     def cleanup(self) -> None:
         """リソースの解放"""
         self._running = False
+        if self.monitor_context is not None:
+            self.monitor_context.stop()
         if self.vision_context is not None:
             self.vision_context.stop()
         self.llm.close()

@@ -226,7 +226,7 @@
 | Phase 3 | 音声対話 | STT(faster-whisper/CPU) + TTS(kokoro-onnx/CPU) + VAD(Silero/Energy) + ストリーミングTTS | ✅ **完了** |
 | Phase 4 | 長期記憶 | ChromaDB + multilingual-e5-small + RAG で会話履歴の蓄積・参照 | ✅ **完了** |
 | Phase 5 | 映像入力 | カメラ + OpenCV顔検出 + emotion-ferplus感情推定（CPU実行） | ✅ **完了** |
-| Phase 6 | PCログ収集 | サブPC/メインPCの挙動ログ収集・蓄積・分析 | ⬜ |
+| Phase 6 | PCログ収集 | psutil + SQLite でサブPCのシステムメトリクスを常時収集・蓄積・LLM注入 | ✅ **完了** |
 | Phase 7 | パーソナライズ | セッションプリロード・プロアクティブ発話・応答最適化 | ⬜ |
 | Phase 8 | 常時稼働化 | systemd 管理、自動再起動、省電力制御 | ⬜ |
 | **Phase 9** | **GPU換装** | **P40に換装、モデル13B化、全モジュールGPU化、レイテンシ改善** | ⬜ |

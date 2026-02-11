@@ -26,6 +26,7 @@ from src.audio.tts import KokoroTTS
 from src.memory.vectorstore import VectorStore
 from src.memory.rag import RAGRetriever
 from src.vision.context import VisionContext
+from src.monitor.context import MonitorContext
 
 
 # --- グローバル状態 ---
@@ -34,6 +35,7 @@ llm: OllamaClient = None
 tts: KokoroTTS = None
 rag: RAGRetriever = None
 vision: VisionContext = None
+monitor: MonitorContext = None
 sessions: dict[str, ChatSession] = {}
 
 
@@ -52,7 +54,7 @@ def get_local_ip() -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """サーバー起動/終了時の処理"""
-    global config, llm, tts, rag, vision
+    global config, llm, tts, rag, vision, monitor
 
     print("=" * 50)
     print(" Web UI サーバー起動中...")
@@ -63,7 +65,7 @@ async def lifespan(app: FastAPI):
     config = ChatConfig.load(config_path)
 
     # LLM 初期化
-    print("[1/4] Ollama 接続確認...")
+    print("[1/5] Ollama 接続確認...")
     llm = OllamaClient(base_url=config.ollama_base_url, model=config.model)
     if not llm.is_available():
         print("⚠️  Ollamaに接続できません。チャット機能は使用不可です。")
@@ -71,7 +73,7 @@ async def lifespan(app: FastAPI):
         print(f"✅ Ollama OK (model: {config.model})")
 
     # TTS 初期化
-    print("[2/4] TTS 初期化...")
+    print("[2/5] TTS 初期化...")
     tts = KokoroTTS(models_dir=PROJECT_ROOT / "models" / "tts" / "kokoro")
     try:
         tts.load()
@@ -81,7 +83,7 @@ async def lifespan(app: FastAPI):
         tts = None
 
     # RAG 初期化 (Phase 4)
-    print("[3/4] RAG (長期記憶) 初期化...")
+    print("[3/5] RAG (長期記憶) 初期化...")
     try:
         vector_store = VectorStore(
             persist_dir=str(PROJECT_ROOT / "data" / "vectordb"),
@@ -95,7 +97,7 @@ async def lifespan(app: FastAPI):
         rag = None
 
     # Vision 初期化 (Phase 5)
-    print("[4/4] Vision (映像入力) 初期化...")
+    print("[4/5] Vision (映像入力) 初期化...")
     try:
         emotion_model = str(PROJECT_ROOT / "models" / "vision" / "emotion-ferplus-8.onnx")
         vision = VisionContext(
@@ -116,6 +118,22 @@ async def lifespan(app: FastAPI):
         print(f"⚠️  Vision 初期化失敗 (Visionなしで続行): {e}")
         vision = None
 
+    # Monitor 初期化 (Phase 6)
+    print("[5/5] Monitor (PCログ収集) 初期化...")
+    try:
+        monitor = MonitorContext(
+            db_path=str(PROJECT_ROOT / "data" / "metrics" / "system_metrics.db"),
+            collect_interval=30.0,
+        )
+        if monitor.start():
+            print("✅ Monitor OK (メトリクス収集開始)")
+        else:
+            print("⚠️  Monitor 起動失敗 (Monitorなしで続行)")
+            monitor = None
+    except Exception as e:
+        print(f"⚠️  Monitor 初期化失敗 (Monitorなしで続行): {e}")
+        monitor = None
+
     local_ip = get_local_ip()
     print()
     print("=" * 50)
@@ -128,6 +146,8 @@ async def lifespan(app: FastAPI):
     yield
 
     # 終了処理
+    if monitor is not None:
+        monitor.stop()
     if vision is not None:
         vision.stop()
     llm.close()
@@ -171,6 +191,8 @@ async def status():
         "rag_stats": rag.get_stats() if rag else None,
         "vision": vision is not None and vision.is_running,
         "vision_status": vision.get_status() if vision else None,
+        "monitor": monitor is not None and monitor.is_running,
+        "monitor_status": monitor.get_status() if monitor else None,
     }
 
 
@@ -242,6 +264,32 @@ async def vision_context_text():
     return {"context": vision.get_context_text(), "enabled": True, **vision.get_status()}
 
 
+# --- Monitor API (Phase 6) ---
+
+@app.get("/api/monitor/status")
+async def monitor_status():
+    """PCモニターの状態"""
+    if monitor is None:
+        return {"enabled": False}
+    return {"enabled": True, **monitor.get_status()}
+
+
+@app.get("/api/monitor/context")
+async def monitor_context_text():
+    """現在のPCモニターコンテキストテキスト（デバッグ用）"""
+    if monitor is None:
+        return {"context": "", "enabled": False}
+    return {"context": monitor.get_context_text(), "enabled": True}
+
+
+@app.get("/api/monitor/summary")
+async def monitor_summary(minutes: int = 60):
+    """直近N分のメトリクスサマリー"""
+    if monitor is None:
+        return JSONResponse({"error": "Monitor not available"}, status_code=503)
+    return monitor.get_recent_summary(minutes=minutes)
+
+
 # --- WebSocket チャット ---
 
 def get_or_create_session(session_id: str) -> ChatSession:
@@ -253,6 +301,7 @@ def get_or_create_session(session_id: str) -> ChatSession:
             history_dir=str(PROJECT_ROOT / config.history_dir),
             rag=rag,
             vision_context=vision,
+            monitor_context=monitor,
         )
     return sessions[session_id]
 

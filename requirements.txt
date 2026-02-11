@@ -19,6 +19,9 @@ sentence-transformers>=3.0.0
 # Phase 5: 映像入力
 opencv-python-headless>=4.8.0
 
+# Phase 6: PCログ収集
+psutil>=5.9.0
+
 # Web UI
 fastapi>=0.110.0
 uvicorn[standard]>=0.27.0
