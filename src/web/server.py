@@ -23,12 +23,15 @@ from src.chat.client import OllamaClient
 from src.chat.session import ChatSession
 from src.chat.config import ChatConfig
 from src.audio.tts import KokoroTTS
+from src.memory.vectorstore import VectorStore
+from src.memory.rag import RAGRetriever
 
 
 # --- グローバル状態 ---
 config: ChatConfig = None
 llm: OllamaClient = None
 tts: KokoroTTS = None
+rag: RAGRetriever = None
 sessions: dict[str, ChatSession] = {}
 
 
@@ -47,7 +50,7 @@ def get_local_ip() -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """サーバー起動/終了時の処理"""
-    global config, llm, tts
+    global config, llm, tts, rag
 
     print("=" * 50)
     print(" Web UI サーバー起動中...")
@@ -58,7 +61,7 @@ async def lifespan(app: FastAPI):
     config = ChatConfig.load(config_path)
 
     # LLM 初期化
-    print("[1/2] Ollama 接続確認...")
+    print("[1/3] Ollama 接続確認...")
     llm = OllamaClient(base_url=config.ollama_base_url, model=config.model)
     if not llm.is_available():
         print("⚠️  Ollamaに接続できません。チャット機能は使用不可です。")
@@ -66,7 +69,7 @@ async def lifespan(app: FastAPI):
         print(f"✅ Ollama OK (model: {config.model})")
 
     # TTS 初期化
-    print("[2/2] TTS 初期化...")
+    print("[2/3] TTS 初期化...")
     tts = KokoroTTS(models_dir=PROJECT_ROOT / "models" / "tts" / "kokoro")
     try:
         tts.load()
@@ -74,6 +77,20 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"⚠️  TTS ロード失敗: {e}")
         tts = None
+
+    # RAG 初期化 (Phase 4)
+    print("[3/3] RAG (長期記憶) 初期化...")
+    try:
+        vector_store = VectorStore(
+            persist_dir=str(PROJECT_ROOT / "data" / "vectordb"),
+        )
+        vector_store.initialize()
+        rag = RAGRetriever(vector_store=vector_store)
+        stats = rag.get_stats()
+        print(f"✅ RAG OK (会話: {stats['conversations']}件, 知識: {stats['knowledge']}件)")
+    except Exception as e:
+        print(f"⚠️  RAG 初期化失敗 (RAGなしで続行): {e}")
+        rag = None
 
     local_ip = get_local_ip()
     print()
@@ -124,6 +141,8 @@ async def status():
         "tts": tts is not None and tts.is_loaded(),
         "tts_voice": tts.voice if tts else None,
         "tts_voices": KokoroTTS.list_ja_voices(),
+        "rag": rag is not None,
+        "rag_stats": rag.get_stats() if rag else None,
     }
 
 
@@ -173,6 +192,7 @@ def get_or_create_session(session_id: str) -> ChatSession:
             system_prompt=config.system_prompt,
             max_history_turns=config.max_history_turns,
             history_dir=str(PROJECT_ROOT / config.history_dir),
+            rag=rag,
         )
     return sessions[session_id]
 

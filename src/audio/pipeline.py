@@ -1,9 +1,10 @@
 """
 音声対話パイプライン
 Phase 3: VAD → STT → LLM (Ollama) → TTS → 再生
-Phase 2 のチャットモジュールと統合
+改善: ストリーミングTTS (文単位で合成・再生)、Silero VAD対応
 """
 import sys
+import re
 import time
 import threading
 import queue
@@ -16,11 +17,13 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.audio.stt import WhisperSTT
 from src.audio.tts import KokoroTTS
-from src.audio.vad import EnergyVAD
+from src.audio.vad import EnergyVAD, create_vad
 from src.audio.audio_io import AudioRecorder, AudioPlayer
 from src.chat.client import OllamaClient
 from src.chat.session import ChatSession
 from src.chat.config import ChatConfig
+from src.memory.vectorstore import VectorStore
+from src.memory.rag import RAGRetriever
 
 
 class VoicePipeline:
@@ -38,6 +41,9 @@ class VoicePipeline:
         stt_model: str = "small",
         tts_models_dir: str = "models/tts/kokoro",
         tts_voice: str = "jf_alpha",
+        vad_type: str = "auto",
+        streaming_tts: bool = True,
+        enable_rag: bool = True,
     ):
         # チャット設定
         self.config = chat_config or ChatConfig.load(PROJECT_ROOT / "config" / "chat_config.json")
@@ -56,13 +62,9 @@ class VoicePipeline:
             voice=tts_voice,
         )
 
-        # VAD
-        self.vad = EnergyVAD(
-            sample_rate=16000,
-            energy_threshold=0.01,
-            silence_duration_ms=800,
-            min_speech_duration_ms=300,
-        )
+        # VAD (auto: Silero優先、フォールバックでEnergy)
+        self.vad_type = vad_type
+        self.vad = create_vad(vad_type=vad_type, sample_rate=16000)
 
         # オーディオ I/O
         self.recorder = AudioRecorder(sample_rate=16000)
@@ -74,17 +76,45 @@ class VoicePipeline:
             model=self.config.model,
         )
 
+        # RAG (Phase 4: 長期記憶)
+        self.enable_rag = enable_rag
+        self.rag = None
+        if enable_rag:
+            try:
+                self.vector_store = VectorStore(
+                    persist_dir=str(PROJECT_ROOT / "data" / "vectordb"),
+                )
+                self.rag = RAGRetriever(vector_store=self.vector_store)
+            except Exception as e:
+                print(f"⚠️  RAG初期化スキップ: {e}")
+                self.rag = None
+
         # セッション
         self.session = ChatSession(
             system_prompt=self.config.system_prompt,
             max_history_turns=self.config.max_history_turns,
             history_dir=str(PROJECT_ROOT / self.config.history_dir),
+            rag=self.rag,
         )
+
+        # ストリーミングTTS設定
+        self.streaming_tts = streaming_tts
+        self._tts_queue: queue.Queue = queue.Queue()
 
         # 状態
         self._state = self.STATE_IDLE
         self._running = False
         self._audio_queue: queue.Queue = queue.Queue()
+
+    # --- 文分割ユーティリティ ---
+    # 日本語の文末パターン: 。！？!? + 改行
+    _SENTENCE_SPLIT_RE = re.compile(r'(?<=[。！？!?\n])')
+
+    @staticmethod
+    def _split_sentences(text: str) -> list[str]:
+        """テキストを文単位に分割する"""
+        parts = VoicePipeline._SENTENCE_SPLIT_RE.split(text)
+        return [p for p in parts if p.strip()]
 
     @property
     def state(self) -> str:
@@ -126,15 +156,33 @@ class VoicePipeline:
             print(f"❌ TTS ロード失敗: {e}")
             return False
 
-        # VAD キャリブレーション
+        # VAD キャリブレーション (Energy VADの場合のみ環境ノイズ計測)
         print("\n[4/4] VAD キャリブレーション...")
+        vad_name = type(self.vad).__name__
+        print(f"  VAD方式: {vad_name}")
         try:
-            print("  環境ノイズを計測中 (2秒間、静かにしてください)...")
-            noise_sample = self.recorder.record(2.0)
-            self.vad.calibrate(noise_sample)
+            if isinstance(self.vad, EnergyVAD):
+                print("  環境ノイズを計測中 (2秒間、静かにしてください)...")
+                noise_sample = self.recorder.record(2.0)
+                self.vad.calibrate(noise_sample)
+            else:
+                self.vad.calibrate(np.zeros(16000, dtype=np.float32))
             print("✅ VAD OK")
         except Exception as e:
             print(f"⚠️  VAD キャリブレーション失敗 (デフォルト閾値を使用): {e}")
+
+        # RAG (Phase 4)
+        if self.enable_rag and self.rag is not None:
+            print("\n[5/5] RAG (長期記憶) 初期化...")
+            try:
+                self.vector_store.initialize()
+                stats = self.rag.get_stats()
+                print(f"✅ RAG OK (会話: {stats['conversations']}件, 知識: {stats['knowledge']}件)")
+            except Exception as e:
+                print(f"⚠️  RAG 初期化失敗 (RAGなしで続行): {e}")
+                self.session.rag = None
+        else:
+            print("\n[5/5] RAG (長期記憶) スキップ")
 
         print("\n" + "=" * 50)
         print(" ✅ 初期化完了！")
@@ -145,6 +193,9 @@ class VoicePipeline:
         """
         1ターンの音声対話を処理する:
         録音 → STT → LLM → TTS → 再生
+
+        streaming_tts=True の場合、LLMのストリーミング応答を文単位で
+        逐次TTS合成・再生する（全文完成を待たない）。
 
         Returns:
             AIの応答テキスト。エラー時は None。
@@ -168,24 +219,16 @@ class VoicePipeline:
 
         print(f"\n👤 あなた: {user_text}")
 
-        # --- LLM ---
+        # --- LLM → TTS (ストリーミング) ---
         print("\n🤖 考え中...")
         self.session.add_user_message(user_text)
         messages = self.session.build_messages()
 
         try:
-            response_text = ""
-            for token in self.llm.generate_stream(
-                messages,
-                temperature=self.config.temperature,
-                top_p=self.config.top_p,
-                top_k=self.config.top_k,
-                num_ctx=self.config.num_ctx,
-                repeat_penalty=self.config.repeat_penalty,
-            ):
-                response_text += token
-                print(token, end="", flush=True)
-            print()
+            if self.streaming_tts:
+                response_text = self._stream_llm_with_tts(messages)
+            else:
+                response_text = self._sequential_llm_then_tts(messages)
 
             if not response_text:
                 return None
@@ -198,6 +241,100 @@ class VoicePipeline:
                 self.session._messages.pop()
             return None
 
+        self._state = self.STATE_IDLE
+        return response_text
+
+    def _stream_llm_with_tts(self, messages: list[dict]) -> str:
+        """
+        LLMストリーミング応答を文単位でTTS合成・再生する
+
+        LLMがトークンを生成する間、文の区切りを検出して
+        完成した文から順にTTSキューに投入・再生する。
+        """
+        response_text = ""
+        sentence_buffer = ""
+        tts_thread = None
+        played_sentences: list[str] = []
+
+        # TTS再生ワーカースレッド
+        self._tts_stop = False
+        tts_thread = threading.Thread(target=self._tts_worker, daemon=True)
+        tts_thread.start()
+
+        self._state = self.STATE_PROCESSING
+        try:
+            for token in self.llm.generate_stream(
+                messages,
+                temperature=self.config.temperature,
+                top_p=self.config.top_p,
+                top_k=self.config.top_k,
+                num_ctx=self.config.num_ctx,
+                repeat_penalty=self.config.repeat_penalty,
+            ):
+                response_text += token
+                sentence_buffer += token
+                print(token, end="", flush=True)
+
+                # 文の区切りをチェック
+                sentences = self._split_sentences(sentence_buffer)
+                if len(sentences) > 1:
+                    # 最後の要素はまだ不完全な可能性があるので保持
+                    for sent in sentences[:-1]:
+                        sent = sent.strip()
+                        if sent:
+                            self._tts_queue.put(sent)
+                            played_sentences.append(sent)
+                    sentence_buffer = sentences[-1]
+
+            # 残りのバッファも送信
+            if sentence_buffer.strip():
+                self._tts_queue.put(sentence_buffer.strip())
+                played_sentences.append(sentence_buffer.strip())
+
+            print()  # 改行
+
+        finally:
+            # TTS完了を待機
+            self._tts_queue.put(None)  # 終了シグナル
+            if tts_thread:
+                tts_thread.join(timeout=60)
+
+        return response_text
+
+    def _tts_worker(self) -> None:
+        """TTS合成・再生のワーカースレッド"""
+        while True:
+            text = self._tts_queue.get()
+            if text is None:
+                break
+            if self._tts_stop:
+                break
+
+            self._state = self.STATE_SPEAKING
+            try:
+                wav_data = self.tts.synthesize(text)
+                self.player.play_wav(wav_data, blocking=True)
+            except Exception as e:
+                print(f"\n⚠️  TTS再生エラー: {e}")
+
+    def _sequential_llm_then_tts(self, messages: list[dict]) -> str:
+        """従来のシーケンシャル方式: LLM全文完了後にTTS"""
+        response_text = ""
+        for token in self.llm.generate_stream(
+            messages,
+            temperature=self.config.temperature,
+            top_p=self.config.top_p,
+            top_k=self.config.top_k,
+            num_ctx=self.config.num_ctx,
+            repeat_penalty=self.config.repeat_penalty,
+        ):
+            response_text += token
+            print(token, end="", flush=True)
+        print()
+
+        if not response_text:
+            return ""
+
         # --- TTS & 再生 ---
         self._state = self.STATE_SPEAKING
         print("\n🔊 読み上げ中...")
@@ -207,7 +344,6 @@ class VoicePipeline:
         except Exception as e:
             print(f"⚠️  TTS/再生エラー: {e}")
 
-        self._state = self.STATE_IDLE
         return response_text
 
     def _listen_for_speech(self, max_duration: float = 30.0) -> Optional[np.ndarray]:

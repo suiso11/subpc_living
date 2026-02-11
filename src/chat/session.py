@@ -1,11 +1,15 @@
 """
 チャットセッション管理
 Phase 2: 会話履歴の管理・永続化を担当するモジュール
+Phase 4: RAG統合 — ベクトルDBから関連文脈をプロンプトに注入
 """
 from datetime import datetime
 from pathlib import Path
 import json
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.memory.rag import RAGRetriever
 
 
 class ChatSession:
@@ -16,6 +20,7 @@ class ChatSession:
         system_prompt: str = "",
         max_history_turns: int = 20,
         history_dir: str = "data/chat_history",
+        rag: Optional["RAGRetriever"] = None,
     ):
         self.system_prompt = system_prompt
         self.max_history_turns = max_history_turns
@@ -25,6 +30,7 @@ class ChatSession:
         self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._messages: list[dict] = []  # {"role": "user"|"assistant", "content": "..."}
         self._created_at = datetime.now()
+        self.rag = rag
 
     def add_user_message(self, content: str) -> None:
         """ユーザーのメッセージを追加"""
@@ -32,14 +38,46 @@ class ChatSession:
         self._trim_history()
 
     def add_assistant_message(self, content: str) -> None:
-        """アシスタントの応答を追加"""
+        """アシスタントの応答を追加（RAG有効時はベクトルDBにも保存）"""
         self._messages.append({"role": "assistant", "content": content})
 
+        # RAG: 直前のuser+assistantをベクトルDBに保存
+        if self.rag is not None and len(self._messages) >= 2:
+            user_msg = self._messages[-2]
+            if user_msg.get("role") == "user":
+                self.rag.store_turn(
+                    user_message=user_msg["content"],
+                    assistant_message=content,
+                    session_id=self.session_id,
+                )
+
     def build_messages(self) -> list[dict]:
-        """Ollama APIに渡すメッセージリストを構築"""
+        """
+        Ollama APIに渡すメッセージリストを構築
+
+        RAGが有効な場合、最新のユーザーメッセージで長期記憶を検索し、
+        関連する過去の文脈をシステムプロンプトに注入する。
+        """
         messages = []
-        if self.system_prompt:
-            messages.append({"role": "system", "content": self.system_prompt})
+
+        # システムプロンプト + RAGコンテキスト
+        system_content = self.system_prompt or ""
+
+        if self.rag is not None and self._messages:
+            # 最新のユーザーメッセージで検索
+            last_user = None
+            for msg in reversed(self._messages):
+                if msg["role"] == "user":
+                    last_user = msg["content"]
+                    break
+            if last_user:
+                rag_context = self.rag.build_context_prompt(last_user)
+                if rag_context:
+                    system_content = system_content + rag_context
+
+        if system_content:
+            messages.append({"role": "system", "content": system_content})
+
         messages.extend(self._messages)
         return messages
 

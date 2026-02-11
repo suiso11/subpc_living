@@ -7,6 +7,15 @@ numpy>=1.24.0
 kokoro-onnx>=0.5.0
 misaki[ja]>=0.1.0
 
+# Phase 3: Silero VAD (高精度VAD、オプション)
+# torch がインストールされていれば Silero VAD を自動使用
+# 未インストールの場合は Energy VAD にフォールバック
+# pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+# Phase 4: 長期記憶 (RAG)
+chromadb>=0.5.0
+sentence-transformers>=3.0.0
+
 # Web UI
 fastapi>=0.110.0
 uvicorn[standard]>=0.27.0
