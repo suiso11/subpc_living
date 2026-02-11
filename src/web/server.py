@@ -27,6 +27,9 @@ from src.memory.vectorstore import VectorStore
 from src.memory.rag import RAGRetriever
 from src.vision.context import VisionContext
 from src.monitor.context import MonitorContext
+from src.persona.profile import UserProfile
+from src.persona.summarizer import ConversationSummarizer
+from src.persona.preloader import SessionPreloader
 
 
 # --- グローバル状態 ---
@@ -36,6 +39,9 @@ tts: KokoroTTS = None
 rag: RAGRetriever = None
 vision: VisionContext = None
 monitor: MonitorContext = None
+profile: UserProfile = None
+summarizer: ConversationSummarizer = None
+preloader: SessionPreloader = None
 sessions: dict[str, ChatSession] = {}
 
 
@@ -54,7 +60,7 @@ def get_local_ip() -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """サーバー起動/終了時の処理"""
-    global config, llm, tts, rag, vision, monitor
+    global config, llm, tts, rag, vision, monitor, profile, summarizer, preloader
 
     print("=" * 50)
     print(" Web UI サーバー起動中...")

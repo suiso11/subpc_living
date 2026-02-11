@@ -26,6 +26,10 @@ from src.memory.vectorstore import VectorStore
 from src.memory.rag import RAGRetriever
 from src.vision.context import VisionContext
 from src.monitor.context import MonitorContext
+from src.persona.profile import UserProfile
+from src.persona.summarizer import ConversationSummarizer
+from src.persona.preloader import SessionPreloader
+from src.persona.proactive import ProactiveEngine
 
 
 class VoicePipeline:
@@ -49,6 +53,7 @@ class VoicePipeline:
         enable_vision: bool = True,
         camera_id: int = 0,
         enable_monitor: bool = True,
+        enable_persona: bool = True,
     ):
         # チャット設定
         self.config = chat_config or ChatConfig.load(PROJECT_ROOT / "config" / "chat_config.json")
@@ -122,6 +127,35 @@ class VoicePipeline:
                 print(f"⚠️  Monitor初期化スキップ: {e}")
                 self.monitor_context = None
 
+        # Persona (Phase 7: パーソナライズ)
+        self.enable_persona = enable_persona
+        self.profile: Optional[UserProfile] = None
+        self.summarizer: Optional[ConversationSummarizer] = None
+        self.preloader: Optional[SessionPreloader] = None
+        self.proactive: Optional[ProactiveEngine] = None
+        if enable_persona:
+            try:
+                self.profile = UserProfile(
+                    profile_path=str(PROJECT_ROOT / "data" / "profile" / "user_profile.json"),
+                )
+                self.profile.load()
+                self.summarizer = ConversationSummarizer(
+                    summaries_dir=str(PROJECT_ROOT / "data" / "profile" / "summaries"),
+                )
+                self.preloader = SessionPreloader(
+                    profile=self.profile,
+                    summarizer=self.summarizer,
+                )
+                self.proactive = ProactiveEngine(
+                    profile=self.profile,
+                    check_interval=60.0,
+                    monitor_context=self.monitor_context,
+                )
+            except Exception as e:
+                print(f"⚠️  Persona初期化スキップ: {e}")
+                self.preloader = None
+                self.proactive = None
+
         # セッション
         self.session = ChatSession(
             system_prompt=self.config.system_prompt,
@@ -130,6 +164,7 @@ class VoicePipeline:
             rag=self.rag,
             vision_context=self.vision_context,
             monitor_context=self.monitor_context,
+            preloader=self.preloader,
         )
 
         # ストリーミングTTS設定
@@ -167,14 +202,14 @@ class VoicePipeline:
         print("=" * 50)
 
         # Ollama 接続チェック
-        print("\n[1/7] Ollama 接続確認...")
+        print("\n[1/9] Ollama 接続確認...")
         if not self.llm.is_available():
             print("❌ Ollamaに接続できません")
             return False
         print("✅ Ollama OK")
 
         # STT モデルロード
-        print("\n[2/7] STT モデルロード...")
+        print("\n[2/9] STT モデルロード...")
         try:
             self.stt.load()
             print("✅ STT OK")
@@ -183,7 +218,7 @@ class VoicePipeline:
             return False
 
         # TTS チェック
-        print("\n[3/7] TTS 確認...")
+        print("\n[3/9] TTS 確認...")
         try:
             self.tts.load()
             print("✅ TTS OK")
@@ -192,7 +227,7 @@ class VoicePipeline:
             return False
 
         # VAD キャリブレーション (Energy VADの場合のみ環境ノイズ計測)
-        print("\n[4/7] VAD キャリブレーション...")
+        print("\n[4/9] VAD キャリブレーション...")
         vad_name = type(self.vad).__name__
         print(f"  VAD方式: {vad_name}")
         try:
@@ -208,7 +243,7 @@ class VoicePipeline:
 
         # RAG (Phase 4)
         if self.enable_rag and self.rag is not None:
-            print("\n[5/7] RAG (長期記憶) 初期化...")
+            print("\n[5/9] RAG (長期記憶) 初期化...")
             try:
                 self.vector_store.initialize()
                 stats = self.rag.get_stats()
@@ -217,11 +252,11 @@ class VoicePipeline:
                 print(f"⚠️  RAG 初期化失敗 (RAGなしで続行): {e}")
                 self.session.rag = None
         else:
-            print("\n[5/7] RAG (長期記憶) スキップ")
+            print("\n[5/9] RAG (長期記憶) スキップ")
 
         # Vision (Phase 5)
         if self.enable_vision and self.vision_context is not None:
-            print("\n[6/7] Vision (映像入力) 初期化...")
+            print("\n[6/9] Vision (映像入力) 初期化...")
             try:
                 if self.vision_context.start():
                     import time
@@ -238,11 +273,11 @@ class VoicePipeline:
                 self.session.vision_context = None
                 self.vision_context = None
         else:
-            print("\n[6/7] Vision (映像入力) スキップ")
+            print("\n[6/9] Vision (映像入力) スキップ")
 
         # Monitor (Phase 6)
         if self.enable_monitor and self.monitor_context is not None:
-            print("\n[7/7] Monitor (PCログ収集) 初期化...")
+            print("\n[7/9] Monitor (PCログ収集) 初期化...")
             try:
                 if self.monitor_context.start():
                     print("✅ Monitor OK (メトリクス収集開始)")
@@ -255,12 +290,71 @@ class VoicePipeline:
                 self.session.monitor_context = None
                 self.monitor_context = None
         else:
-            print("\n[7/7] Monitor (PCログ収集) スキップ")
+            print("\n[7/9] Monitor (PCログ収集) スキップ")
+
+        # Persona (Phase 7)
+        if self.enable_persona and self.preloader is not None:
+            print("\n[8/9] Persona (パーソナライズ) 初期化...")
+            try:
+                profile_name = self.profile.name or "(未設定)"
+                facts_count = len(self.profile.extracted_facts)
+                today_count = len(self.profile.get_today_schedule())
+                print(f"✅ Persona OK (名前: {profile_name}, 抽出済み事実: {facts_count}件, 今日の予定: {today_count}件)")
+            except Exception as e:
+                print(f"⚠️  Persona 初期化失敗 (Personaなしで続行): {e}")
+                self.session.preloader = None
+                self.preloader = None
+        else:
+            print("\n[8/9] Persona (パーソナライズ) スキップ")
+
+        # Proactive (Phase 7)
+        if self.enable_persona and self.proactive is not None:
+            print("\n[9/9] Proactive (プロアクティブ発話) 初期化...")
+            try:
+                self.proactive.start(callback=self._on_proactive_trigger)
+                print("✅ Proactive OK (バックグラウンド監視開始)")
+            except Exception as e:
+                print(f"⚠️  Proactive 初期化失敗 (Proactiveなしで続行): {e}")
+                self.proactive = None
+        else:
+            print("\n[9/9] Proactive (プロアクティブ発話) スキップ")
 
         print("\n" + "=" * 50)
         print(" ✅ 初期化完了！")
         print("=" * 50)
         return True
+
+    def _on_proactive_trigger(self, trigger_type: str, message: str) -> None:
+        """Proactiveエンジンからのコールバック: AI発話をTTSで再生"""
+        if not self._running:
+            return
+        if self._state != self.STATE_IDLE:
+            return  # 会話中は割り込まない
+        try:
+            print(f"\n\U0001f4ac [Proactive/{trigger_type}] {message}")
+            wav_data = self.tts.synthesize(message)
+            self.player.play_wav(wav_data, blocking=True)
+        except Exception as e:
+            print(f"\n⚠️  Proactive 発話失敗: {e}")
+
+    def _summarize_session(self) -> None:
+        """セッション終了時に会話を要約・知識抽出 (Phase 7)"""
+        if self.summarizer is None or self.session.turn_count < 2:
+            return
+        try:
+            print("ℹ️  会話を要約中...")
+            result = self.summarizer.process_session_end(
+                llm=self.llm,
+                messages=self.session.messages,
+                session_id=self.session.session_id,
+                profile=self.profile,
+            )
+            if result["summary"]:
+                print(f"  要約: {result['summary'][:80]}...")
+            if result["extracted_facts"]:
+                print(f"  抽出した事実: {len(result['extracted_facts'])}件")
+        except Exception as e:
+            print(f"⚠️  会話要約失敗: {e}")
 
     def process_voice_turn(self) -> Optional[str]:
         """
@@ -473,9 +567,14 @@ class VoicePipeline:
         try:
             while self._running:
                 self.process_voice_turn()
+                # Proactive: ユーザーアクティビティ通知
+                if self.proactive is not None:
+                    self.proactive.notify_user_activity()
         except KeyboardInterrupt:
             print("\n\n終了します...")
             self._running = False
+            # Phase 7: セッション要約
+            self._summarize_session()
             if self.session.turn_count > 0:
                 saved = self.session.save()
                 print(f"会話を保存しました: {saved}")
@@ -484,6 +583,8 @@ class VoicePipeline:
     def cleanup(self) -> None:
         """リソースの解放"""
         self._running = False
+        if self.proactive is not None:
+            self.proactive.stop()
         if self.monitor_context is not None:
             self.monitor_context.stop()
         if self.vision_context is not None:

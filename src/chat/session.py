@@ -3,6 +3,7 @@
 Phase 2: 会話履歴の管理・永続化を担当するモジュール
 Phase 4: RAG統合 — ベクトルDBから関連文脈をプロンプトに注入
 Phase 5: Vision統合 — カメラ映像の解析結果をプロンプトに注入
+Phase 7: パーソナライズ統合 — プリロードコンテキストをプロンプトに注入
 """
 from datetime import datetime
 from pathlib import Path
@@ -13,6 +14,7 @@ if TYPE_CHECKING:
     from src.memory.rag import RAGRetriever
     from src.vision.context import VisionContext
     from src.monitor.context import MonitorContext
+    from src.persona.preloader import SessionPreloader
 
 
 class ChatSession:
@@ -26,6 +28,7 @@ class ChatSession:
         rag: Optional["RAGRetriever"] = None,
         vision_context: Optional["VisionContext"] = None,
         monitor_context: Optional["MonitorContext"] = None,
+        preloader: Optional["SessionPreloader"] = None,
     ):
         self.system_prompt = system_prompt
         self.max_history_turns = max_history_turns
@@ -38,6 +41,7 @@ class ChatSession:
         self.rag = rag
         self.vision_context = vision_context
         self.monitor_context = monitor_context
+        self.preloader = preloader
 
     def add_user_message(self, content: str) -> None:
         """ユーザーのメッセージを追加"""
@@ -67,8 +71,14 @@ class ChatSession:
         """
         messages = []
 
-        # システムプロンプト + RAGコンテキスト + Visionコンテキスト
+        # システムプロンプト + プリロード + RAGコンテキスト + Visionコンテキスト
         system_content = self.system_prompt or ""
+
+        # Preload: プロフィール・スケジュール・最近の会話要約・時刻 (Phase 7)
+        if self.preloader is not None:
+            preload_text = self.preloader.build_preload_context()
+            if preload_text:
+                system_content = system_content + preload_text
 
         if self.rag is not None and self._messages:
             # 最新のユーザーメッセージで検索

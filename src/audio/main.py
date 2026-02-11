@@ -38,6 +38,8 @@ def main():
                         help="カメラデバイスID (default: 0)")
     parser.add_argument("--no-monitor", action="store_true",
                         help="Monitor (PCログ収集) を無効化")
+    parser.add_argument("--no-persona", action="store_true",
+                        help="Persona (パーソナライズ) を無効化")
     args = parser.parse_args()
 
     print(f"""
@@ -70,6 +72,7 @@ def run_voice_mode(args):
         enable_vision=not args.no_vision,
         camera_id=args.camera_id,
         enable_monitor=not args.no_monitor,
+        enable_persona=not args.no_persona,
     )
 
     if not pipeline.initialize():
