@@ -3,7 +3,7 @@
 ## 前提条件
 
 - Ubuntu 24.04 LTS
-- Phase 1〜6 のセットアップスクリプトを実行済み
+- Phase 1〜7 のセットアップスクリプトを実行済み
 - Ollama がインストール済み・起動中
 
 ---
@@ -78,6 +78,16 @@ bash scripts/phase6_setup.sh
 
 # 検証
 bash scripts/phase6_verify.sh
+```
+
+### Phase 7: パーソナライズ
+
+```bash
+# プロフィールディレクトリ作成 + デフォルトプロフィール生成
+bash scripts/phase7_setup.sh
+
+# 検証
+bash scripts/phase7_verify.sh
 ```
 
 
@@ -156,6 +166,7 @@ python src/audio/main.py --text-mode
 | `--no-vision` | ― | Vision (映像入力) を無効化 |
 | `--camera-id` | `0` | カメラデバイスID |
 | `--no-monitor` | ― | Monitor (PCログ収集) を無効化 |
+| `--no-persona` | ― | Persona (パーソナライズ) を無効化 |
 
 ### VAD 方式
 
@@ -242,6 +253,11 @@ python src/web/server.py
 | `/api/monitor/status` | GET | PCモニター状態 (CPU/メモリ/GPU/ディスク等) |
 | `/api/monitor/context` | GET | PCモニターコンテキストテキスト (デバッグ用) |
 | `/api/monitor/summary?minutes=60` | GET | 直近N分のメトリクスサマリー |
+| `/api/persona/status` | GET | パーソナライズ状態 (プロフィール/要約/プリロード) |
+| `/api/persona/profile` | GET | ユーザープロフィール取得 |
+| `/api/persona/profile` | POST | プロフィール更新 (`{"name": "...", "note": "..."}`) |
+| `/api/persona/summaries?count=5` | GET | 直近の会話要約一覧 |
+| `/api/persona/context` | GET | プリロードコンテキスト (デバッグ用) |
 | `/ws/chat` | WebSocket | ストリーミングチャット (トークン単位) |
 
 ---
@@ -397,6 +413,128 @@ python src/audio/main.py --no-monitor
 
 ---
 
+## 7. パーソナライズ — Persona (Phase 7)
+
+ユーザープロフィール管理・会話要約・セッションプリロード・プロアクティブ発話を統合したパーソナライズ機能。
+
+### 仕組み
+
+1. **ユーザープロフィール**: 名前・好み・習慣・スケジュール・メモを JSON で永続化
+2. **セッションプリロード**: 会話開始時に日時・プロフィール・スケジュール・直近の会話要約をシステムプロンプトに自動注入
+3. **会話要約**: セッション終了時にLLMで会話を要約・ユーザー情報を自動抽出してプロフィールに追記
+4. **プロアクティブ発話**: スケジュールリマインド・休憩提案・PC異常通知・時間帯挨拶
+
+**LLMに注入されるコンテキスト例:**
+
+```
+--- 現在の状況 ---
+- 日時: 2026年02月11日 (水曜日) 21:30
+- 時間帯: 夜
+
+--- ユーザープロフィール ---
+- ユーザーの名前: はるか
+- 好み・嗜好: food: カレー, music: ジャズ
+- プログラマー
+- 猫を2匹飼っている
+
+--- 今日のスケジュール (02/11 Wednesday) ---
+- 14:00 会議 (Zoom)
+
+--- 最近の会話の要約 ---
+[2026-02-11] Pythonの非同期処理について議論した。asyncioの基本...
+```
+
+### プロアクティブ発話トリガー
+
+| トリガー | 条件 | クールダウン |
+|---------|------|-------------|
+| `schedule_remind` | 予定の15～5分前 | 30分 |
+| `break_suggest` | 2時間以上連続作業 | 1時間 |
+| `greeting` | セッション開始時 (朝/深夜) | 12時間 |
+| `pc_alert` | CPU/メモリ/温度異常 | 10分 |
+
+### プロフィールの編集
+
+**方法1: JSON直接編集**
+
+`data/profile/user_profile.json` をテキストエディタで編集:
+
+```json
+{
+  "name": "はるか",
+  "nickname": "はるかさん",
+  "preferences": {"food": "カレー", "music": "ジャズ"},
+  "habits": {"wake_time": "07:00", "sleep_time": "24:00"},
+  "schedule": [
+    {"date": "2026-02-12", "time": "14:00", "title": "会議", "note": "Zoom"}
+  ],
+  "notes": ["猫を2匹飼っている", "プログラマー"],
+  "extracted_facts": [],
+  "updated_at": ""
+}
+```
+
+**方法2: Web API**
+
+```bash
+# プロフィール取得
+curl http://localhost:8000/api/persona/profile
+
+# 名前設定
+curl -X POST http://localhost:8000/api/persona/profile \
+  -H 'Content-Type: application/json' \
+  -d '{"name": "はるか"}'
+
+# 好み追加
+curl -X POST http://localhost:8000/api/persona/profile \
+  -H 'Content-Type: application/json' \
+  -d '{"preferences": {"food": "カレー"}}'
+
+# メモ追加
+curl -X POST http://localhost:8000/api/persona/profile \
+  -H 'Content-Type: application/json' \
+  -d '{"note": "猫を2匹飼っている"}'
+
+# スケジュール追加
+curl -X POST http://localhost:8000/api/persona/profile \
+  -H 'Content-Type: application/json' \
+  -d '{"schedule": {"title": "会議", "date": "2026-02-12", "time": "14:00", "note": "Zoom"}}'
+
+# 会話要約一覧
+curl http://localhost:8000/api/persona/summaries
+
+# プリロードコンテキスト確認
+curl http://localhost:8000/api/persona/context
+```
+
+**方法3: Python API**
+
+```python
+from src.persona.profile import UserProfile
+
+p = UserProfile("data/profile/user_profile.json")
+p.load()
+
+p.name = "はるか"
+p.set_preference("food", "カレー")
+p.set_habit("wake_time", "07:00")
+p.add_note("猫を2匹飼っている")
+p.add_schedule("会議", "2026-02-12", "14:00", "Zoom")
+```
+
+### データ保存先
+
+- プロフィール: `data/profile/user_profile.json`
+- 会話要約: `data/profile/summaries/summary_*.json`
+
+### Persona を無効にする場合
+
+```bash
+python src/audio/main.py --no-persona
+```
+
+---
+
 ## 設定ファイル
 
 ### config/chat_config.json
@@ -426,7 +564,10 @@ subpc_living/
 ├── data/
 │   ├── chat_history/          # 会話履歴 (JSON)
 │   ├── vectordb/              # ChromaDB ベクトルDB (Phase 4)
-│   └── metrics/               # システムメトリクスDB (Phase 6)
+│   ├── metrics/               # システムメトリクスDB (Phase 6)
+│   └── profile/               # ユーザープロフィール + 会話要約 (Phase 7)
+│       ├── user_profile.json  # プロフィール
+│       └── summaries/         # 会話要約 JSON
 ├── models/
 │   ├── stt/                   # Whisper モデルキャッシュ (自動DL)
 │   ├── tts/
@@ -446,7 +587,9 @@ subpc_living/
 │   ├── phase5_setup.sh
 │   ├── phase5_verify.sh
 │   ├── phase6_setup.sh
-│   └── phase6_verify.sh
+│   ├── phase6_verify.sh
+│   ├── phase7_setup.sh
+│   └── phase7_verify.sh
 ├── src/
 │   ├── audio/                 # Phase 3: 音声対話
 │   │   ├── main.py            # CLI エントリポイント
@@ -472,6 +615,11 @@ subpc_living/
 │   │   ├── collector.py       # psutilメトリクス収集
 │   │   ├── storage.py         # SQLite時系列ストレージ
 │   │   └── context.py         # モニターコンテキスト管理
+│   ├── persona/               # Phase 7: パーソナライズ
+│   │   ├── profile.py         # ユーザープロフィール管理
+│   │   ├── summarizer.py      # 会話要約 + 知識抽出
+│   │   ├── preloader.py       # セッションプリロード
+│   │   └── proactive.py       # プロアクティブ発話エンジン
 │   └── web/                   # Web UI
 │       ├── server.py          # FastAPI サーバー
 │       └── static/            # HTML/JS/CSS
