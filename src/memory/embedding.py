@@ -2,6 +2,7 @@
 埋め込み (Embedding) モジュール
 Phase 4: テキストをベクトルに変換する
 multilingual-e5-small を使用（日本語対応、ローカル実行）
+Phase 9: device="auto" でGPU自動検出
 """
 import time
 import numpy as np
@@ -26,19 +27,30 @@ class EmbeddingModel:
     def __init__(
         self,
         model_name: str = DEFAULT_MODEL,
-        device: str = "cpu",
+        device: str = "auto",
         cache_dir: Optional[str] = None,
     ):
         """
         Args:
             model_name: HuggingFace モデル名
-            device: 実行デバイス ("cpu" or "cuda")
+            device: 実行デバイス ("auto", "cpu", "cuda")
             cache_dir: モデルキャッシュディレクトリ
         """
         self.model_name = model_name
-        self.device = device
+        self.device = self._resolve_device(device)
         self.cache_dir = cache_dir
         self._model = None
+
+    @staticmethod
+    def _resolve_device(device: str) -> str:
+        """device="auto" を解決する"""
+        if device != "auto":
+            return device
+        try:
+            from src.service.gpu_config import resolve_device
+            return resolve_device("auto", module="embedding")
+        except ImportError:
+            return "cpu"
 
     def load(self) -> None:
         """モデルをロード（初回は自動ダウンロード）"""
@@ -47,7 +59,7 @@ class EmbeddingModel:
 
         from sentence_transformers import SentenceTransformer
 
-        print(f"[Embedding] モデル '{self.model_name}' をロード中...")
+        print(f"[Embedding] モデル '{self.model_name}' をロード中 (device={self.device})...")
         start = time.time()
         kwargs = {"device": self.device}
         if self.cache_dir:

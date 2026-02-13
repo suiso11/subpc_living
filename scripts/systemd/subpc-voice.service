@@ -1,0 +1,33 @@
+[Unit]
+Description=subpc_living 音声対話パイプライン
+Documentation=https://github.com/suiso11/subpc_living
+After=network.target ollama.service
+Wants=ollama.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/ドキュメント/subpc_living
+Environment=PATH=%h/ドキュメント/subpc_living/.venv/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+
+# 起動前にヘルスチェック (Ollama 接続確認)
+ExecStartPre=%h/ドキュメント/subpc_living/.venv/bin/python -m src.service.healthcheck
+
+# メインプロセス
+ExecStart=%h/ドキュメント/subpc_living/.venv/bin/python src/audio/main.py
+
+# 自動再起動
+Restart=on-failure
+RestartSec=15
+
+# リソース制限
+MemoryMax=6G
+CPUQuota=300%
+
+# ロギング
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=subpc-voice
+
+[Install]
+WantedBy=default.target

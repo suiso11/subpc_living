@@ -58,12 +58,10 @@ class VoicePipeline:
         # チャット設定
         self.config = chat_config or ChatConfig.load(PROJECT_ROOT / "config" / "chat_config.json")
 
-        # STT (faster-whisper)
+        # STT (faster-whisper) — Phase 9: device="auto" でGPU自動検出
         self.stt = WhisperSTT(
-            model_size=stt_model,
+            model_size=stt_model if stt_model != "small" else "auto",
             language="ja",
-            device="cpu",
-            compute_type="int8",
         )
 
         # TTS (kokoro-onnx)

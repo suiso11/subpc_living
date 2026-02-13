@@ -24,7 +24,7 @@ class VectorStore:
         self,
         persist_dir: str = "data/vectordb",
         embedding_model: str = "intfloat/multilingual-e5-small",
-        embedding_device: str = "cpu",
+        embedding_device: str = "auto",
     ):
         """
         Args:

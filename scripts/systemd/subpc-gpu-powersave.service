@@ -1,0 +1,17 @@
+[Unit]
+Description=subpc_living GPU 省電力制御 (起動時)
+After=nvidia-persistenced.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# Persistence Mode 有効化 + 電力制限設定
+ExecStart=/usr/bin/nvidia-smi --persistence-mode=1
+ExecStart=/usr/bin/nvidia-smi --power-limit=100
+
+# 停止時にデフォルトに戻す
+ExecStop=/usr/bin/nvidia-smi --power-limit=250
+
+[Install]
+WantedBy=multi-user.target

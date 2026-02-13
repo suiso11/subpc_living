@@ -1,0 +1,36 @@
+[Unit]
+Description=subpc_living Web UI サーバー
+Documentation=https://github.com/suiso11/subpc_living
+After=network.target ollama.service
+Wants=ollama.service
+
+[Service]
+Type=notify
+WorkingDirectory=%h/ドキュメント/subpc_living
+Environment=PATH=%h/ドキュメント/subpc_living/.venv/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+
+# 起動前にヘルスチェック (Ollama 接続確認)
+ExecStartPre=%h/ドキュメント/subpc_living/.venv/bin/python -m src.service.healthcheck
+
+# メインプロセス
+ExecStart=%h/ドキュメント/subpc_living/.venv/bin/python src/web/server.py
+
+# 自動再起動
+Restart=on-failure
+RestartSec=10
+
+# Watchdog (120秒間応答なしで再起動)
+WatchdogSec=120
+
+# リソース制限
+MemoryMax=4G
+CPUQuota=200%
+
+# ロギング
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=subpc-web
+
+[Install]
+WantedBy=default.target

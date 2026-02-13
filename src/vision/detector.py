@@ -1,7 +1,8 @@
 """
 顔検出 + 感情推定
 - 顔検出: OpenCV Haar Cascade (軽量、CPU向け)
-- 感情推定: emotion-ferplus ONNX モデル (onnxruntime、CPU実行)
+- 感情推定: emotion-ferplus ONNX モデル (onnxruntime)
+- Phase 9: onnxruntime-gpu 利用時は CUDAExecutionProvider を自動選択
 """
 import numpy as np
 from pathlib import Path
@@ -115,6 +116,16 @@ class FaceDetector:
 
 # --- 感情推定 ---
 
+def _detect_onnx_providers() -> list[str]:
+    """利用可能な ONNX Runtime プロバイダーを検出する (Phase 9)"""
+    if not HAS_ORT:
+        return ["CPUExecutionProvider"]
+    available = ort.get_available_providers()
+    if "CUDAExecutionProvider" in available:
+        return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    return ["CPUExecutionProvider"]
+
+
 class EmotionDetector:
     """
     emotion-ferplus ONNX モデルによる感情推定
@@ -123,7 +134,7 @@ class EmotionDetector:
     モデル出力: float32 [1, 8] (8感情のスコア)
     """
 
-    def __init__(self, model_path: str):
+    def __init__(self, model_path: str, providers: Optional[list[str]] = None):
         if not HAS_ORT:
             raise RuntimeError("onnxruntime がインストールされていません")
 
@@ -131,15 +142,22 @@ class EmotionDetector:
         if not model_path.exists():
             raise FileNotFoundError(f"感情モデルが見つかりません: {model_path}")
 
+        # providers が未指定の場合は自動検出
+        if providers is None:
+            providers = _detect_onnx_providers()
+
+        self._providers = providers
         self._session = ort.InferenceSession(
             str(model_path),
-            providers=["CPUExecutionProvider"],
+            providers=providers,
         )
         self._input_name = self._session.get_inputs()[0].name
         # 入力形状を確認
         input_shape = self._session.get_inputs()[0].shape
         self._input_h = input_shape[2] if len(input_shape) == 4 else 64
         self._input_w = input_shape[3] if len(input_shape) == 4 else 64
+        provider_str = ", ".join(providers)
+        print(f"  感情推定: emotion-ferplus ONNX ({provider_str})")
 
     def detect(self, face_image: np.ndarray) -> tuple[str, float, dict]:
         """
@@ -197,7 +215,6 @@ class VisionAnalyzer:
         if emotion_model_path and Path(emotion_model_path).exists():
             try:
                 self.emotion_detector = EmotionDetector(emotion_model_path)
-                print(f"  感情推定: emotion-ferplus (ONNX)")
             except Exception as e:
                 print(f"⚠️  感情モデル ロード失敗 (顔検出のみ使用): {e}")
 

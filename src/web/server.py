@@ -4,6 +4,7 @@ Web UIサーバー
 FastAPI + WebSocket によるストリーミング対話
 """
 import sys
+import os
 import json
 import asyncio
 import base64
@@ -30,6 +31,7 @@ from src.monitor.context import MonitorContext
 from src.persona.profile import UserProfile
 from src.persona.summarizer import ConversationSummarizer
 from src.persona.preloader import SessionPreloader
+from src.service.healthcheck import HealthChecker
 
 
 # --- グローバル状態 ---
@@ -173,7 +175,20 @@ async def lifespan(app: FastAPI):
     print("=" * 50)
     print()
 
+    # systemd sd_notify: READY=1 (Type=notify 用)
+    _sd_notify("READY=1")
+
+    # Watchdog 定期通知タスク
+    watchdog_task = asyncio.create_task(_watchdog_loop())
+
     yield
+
+    # Watchdog タスク停止
+    watchdog_task.cancel()
+    try:
+        await watchdog_task
+    except asyncio.CancelledError:
+        pass
 
     # 終了処理
     # セッション要約 (Phase 7)
@@ -219,7 +234,59 @@ async def index():
     return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
 
 
+# --- sd_notify ヘルパー ---
+
+def _sd_notify(state: str) -> None:
+    """systemd sd_notify プロトコルで状態を通知する"""
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if not addr:
+        return
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        if addr[0] == "@":
+            addr = "\0" + addr[1:]
+        sock.sendto(state.encode(), addr)
+        sock.close()
+    except Exception:
+        pass
+
+
+async def _watchdog_loop() -> None:
+    """WatchdogSec に合わせて定期的に WATCHDOG=1 を送信する"""
+    usec = os.environ.get("WATCHDOG_USEC")
+    if not usec:
+        return
+    interval = int(usec) / 1_000_000 / 2  # 半分の間隔で通知
+    if interval < 1:
+        interval = 1
+    while True:
+        await asyncio.sleep(interval)
+        _sd_notify("WATCHDOG=1")
+
+
 # --- REST API ---
+
+@app.get("/api/health")
+async def health():
+    """ヘルスチェック (systemd watchdog / 外部監視用)"""
+    checker = HealthChecker(
+        ollama_url=config.ollama_base_url if config else "http://localhost:11434",
+    )
+    result = checker.check_all(include_web=False)
+
+    # モジュール稼働状況を追加
+    result["modules"] = {
+        "ollama": llm is not None and llm.is_available() if llm else False,
+        "tts": tts is not None and tts.is_loaded(),
+        "rag": rag is not None,
+        "vision": vision is not None and vision.is_running,
+        "monitor": monitor is not None and monitor.is_running,
+        "persona": profile is not None,
+    }
+
+    status_code = 200 if result["status"] == "ok" else 503
+    return JSONResponse(content=result, status_code=status_code)
+
 
 @app.get("/api/status")
 async def status():

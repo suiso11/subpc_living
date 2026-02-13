@@ -1,7 +1,7 @@
 """
 音声認識 (STT) モジュール
 Phase 3: faster-whisper を使用した音声→テキスト変換
-CPU実行 (i7-8700, int8量子化)
+Phase 9: device="auto" でGPU自動検出 (P40: cuda/float16, GTX 1060: cpu/int8)
 """
 import io
 import time
@@ -15,21 +15,41 @@ class WhisperSTT:
 
     def __init__(
         self,
-        model_size: str = "small",
+        model_size: str = "auto",
         language: str = "ja",
-        device: str = "cpu",
-        compute_type: str = "int8",
+        device: str = "auto",
+        compute_type: str = "auto",
         beam_size: int = 5,
         vad_filter: bool = True,
     ):
-        self.model_size = model_size
+        # device="auto" の場合、gpu_config から最適設定を取得
+        resolved_device, resolved_compute, resolved_model = self._resolve_config(
+            device, compute_type, model_size,
+        )
+        self.model_size = resolved_model
         self.language = language
-        self.device = device
-        self.compute_type = compute_type
+        self.device = resolved_device
+        self.compute_type = resolved_compute
         self.beam_size = beam_size
         self.vad_filter = vad_filter
         self._model = None
         self._last_info = None
+
+    @staticmethod
+    def _resolve_config(device: str, compute_type: str, model_size: str) -> tuple[str, str, str]:
+        """device/compute_type/model_size の auto を解決する"""
+        if device != "auto" and compute_type != "auto" and model_size != "auto":
+            return device, compute_type, model_size
+        try:
+            from src.service.gpu_config import resolve_stt_config
+            return resolve_stt_config(device, compute_type, model_size)
+        except ImportError:
+            # gpu_config が無い場合のフォールバック
+            return (
+                "cpu" if device == "auto" else device,
+                "int8" if compute_type == "auto" else compute_type,
+                "small" if model_size == "auto" else model_size,
+            )
 
     def load(self) -> None:
         """モデルをロード（初回は自動ダウンロード）"""

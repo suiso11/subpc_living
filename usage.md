@@ -3,7 +3,7 @@
 ## 前提条件
 
 - Ubuntu 24.04 LTS
-- Phase 1〜7 のセットアップスクリプトを実行済み
+- Phase 1〜9 のセットアップスクリプトを実行済み
 - Ollama がインストール済み・起動中
 
 ---
@@ -89,6 +89,26 @@ bash scripts/phase7_setup.sh
 # 検証
 bash scripts/phase7_verify.sh
 ```
+### Phase 8: 常時稼働化
+
+```bash
+# systemd ユニットインストール + ヘルスチェック
+bash scripts/phase8_setup.sh
+
+# 検証
+bash scripts/phase8_verify.sh
+```
+### Phase 9: GPU換装
+
+```bash
+# GPU検出 + 設定確認
+bash scripts/phase9_setup.sh
+
+# 検証
+bash scripts/phase9_verify.sh
+```
+
+> ℹ️ GPU 省電力サービスは sudo 権限が必要です。セットアップスクリプトの指示に従ってください。
 
 
 ---
@@ -244,6 +264,7 @@ python src/web/server.py
 
 | エンドポイント | メソッド | 説明 |
 |---------------|---------|------|
+| `/api/health` | GET | ヘルスチェック (Ollama/ディスク/メモリ/モジュール状態) |
 | `/api/status` | GET | システム状態 (Ollama/TTS/RAG/Vision/Monitor の接続状況) |
 | `/api/tts` | POST | テキスト → WAV 音声合成 (`{"text": "..."}`) |
 | `/api/tts/voice` | POST | TTS ボイス変更 (`{"voice": "jm_kumo"}`) |
@@ -535,6 +556,136 @@ python src/audio/main.py --no-persona
 
 ---
 
+## 8. 常時稼働 — Service (Phase 8)
+
+systemd で Web UI・音声対話をサービスとして管理。自動再起動・GPU省電力制御を統合。
+
+### サービス管理 (service_ctl.sh)
+
+```bash
+# 全サービスの状態確認
+bash scripts/service_ctl.sh status
+
+# Web UI をサービスとして起動
+bash scripts/service_ctl.sh start web
+
+# 音声対話をサービスとして起動
+bash scripts/service_ctl.sh start voice
+
+# 全サービス起動
+bash scripts/service_ctl.sh start all
+
+# サービス停止
+bash scripts/service_ctl.sh stop web
+
+# ログ確認 (リアルタイムフォロー)
+bash scripts/service_ctl.sh logs web -f
+
+# ヘルスチェック
+bash scripts/service_ctl.sh health
+
+# GPU情報
+bash scripts/service_ctl.sh gpu
+```
+
+### 自動起動 (ブート時)
+
+```bash
+# 自動起動を有効化
+bash scripts/service_ctl.sh enable web
+bash scripts/service_ctl.sh enable voice
+
+# 自動起動を無効化
+bash scripts/service_ctl.sh disable web
+```
+
+### service_ctl.sh コマンド一覧
+
+| コマンド | 説明 |
+|---------|------|
+| `status` | 全サービスの状態を表示 |
+| `start [web│voice│all]` | サービスを開始 |
+| `stop [web│voice│all]` | サービスを停止 |
+| `restart [web│voice│all]` | サービスを再起動 |
+| `enable [web│voice│all]` | 自動起動を有効化 |
+| `disable [web│voice│all]` | 自動起動を無効化 |
+| `logs [web│voice] [-f]` | ログを表示 |
+| `health` | ヘルスチェック実行 |
+| `gpu` | GPU 情報表示 |
+
+### GPU 省電力制御 (オプション)
+
+nvidia-smi で GPU 電力制限を制御。常時稼働時のアイドル消費電力を抑える。
+
+```bash
+# システムサービスとしてインストール (root 権限必要)
+sudo cp scripts/systemd/subpc-gpu-powersave.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable subpc-gpu-powersave
+sudo systemctl start subpc-gpu-powersave
+```
+
+| モード | 電力制限 | 用途 |
+|--------|-----------|------|
+| idle | 100W | アイドル時 (デフォルト) |
+| active | 250W | LLM推論時 (P40 TDP) |
+
+### systemd サービス一覧
+
+| サービス名 | 種類 | 説明 |
+|-------------|------|------|
+| `subpc-web` | ユーザー | Web UI サーバー (Type=notify, Watchdog付き) |
+| `subpc-voice` | ユーザー | 音声対話パイプライン |
+| `subpc-gpu-powersave` | システム | GPU 省電力制御 (oneshot, 要sudo) |
+
+---
+
+## 9. GPU換装 (Phase 9)
+
+### GPU 自動検出
+
+Phase 9 では GPU を自動検出し、各モジュールの設定を最適化します。
+
+```bash
+# 現在の GPU 設定を確認
+python3 -c "from src.service.gpu_config import main; main()"
+```
+
+| GPU | Profile | STT | Embedding | Vision ONNX | LLM推奨 |
+|-----|---------|-----|-----------|-------------|----------|
+| P40 (24GB) | `p40` | cuda / float16 / medium | cuda | CUDAExecutionProvider | 14B Q4 |
+| GTX 1060 (6GB) | `gtx1060` | cpu / int8 / small | cpu | CPUExecutionProvider | 7B Q4 |
+| GPUなし | `cpu` | cpu / int8 / small | cpu | CPUExecutionProvider | 7B Q4 |
+
+### LLM モデルの変更
+
+P40 換装後は大型モデルに切り替え可能です:
+
+```bash
+# 14B モデルのダウンロード
+ollama pull qwen2.5:14b-instruct-q4_K_M
+```
+
+`config/chat_config.json` の `model` を変更:
+
+```json
+{
+  "model": "qwen2.5:14b-instruct-q4_K_M",
+  "num_ctx": 8192
+}
+```
+
+### P40 換装手順
+
+1. P40 を物理的に取り付け
+2. 電源 500W → 650W への換装を推奨 (P40 TDP: 250W)
+3. BIOS で iGPU を映像出力に設定 (P40 は映像出力なし)
+4. Ubuntu 起動後 `nvidia-smi` で認識確認
+5. `bash scripts/phase9_setup.sh` を実行
+6. `config/chat_config.json` の model を 14b に変更
+
+---
+
 ## 設定ファイル
 
 ### config/chat_config.json
@@ -589,7 +740,14 @@ subpc_living/
 │   ├── phase6_setup.sh
 │   ├── phase6_verify.sh
 │   ├── phase7_setup.sh
-│   └── phase7_verify.sh
+│   ├── phase7_verify.sh
+│   ├── phase8_setup.sh
+│   ├── phase8_verify.sh
+│   ├── service_ctl.sh            # サービス管理ヘルパー
+│   └── systemd/
+│       ├── subpc-web.service     # Web UI systemd ユニット
+│       ├── subpc-voice.service   # 音声対話 systemd ユニット
+│       └── subpc-gpu-powersave.service  # GPU省電力 systemd ユニット
 ├── src/
 │   ├── audio/                 # Phase 3: 音声対話
 │   │   ├── main.py            # CLI エントリポイント
@@ -620,6 +778,10 @@ subpc_living/
 │   │   ├── summarizer.py      # 会話要約 + 知識抽出
 │   │   ├── preloader.py       # セッションプリロード
 │   │   └── proactive.py       # プロアクティブ発話エンジン
+│   ├── service/               # Phase 8-9: 常時稼働化 + GPU換装
+│   │   ├── healthcheck.py     # ヘルスチェック (Ollama/ディスク/メモリ)
+│   │   ├── power.py           # GPU省電力制御 (GPU別プリセット)
+│   │   └── gpu_config.py      # GPU自動検出・デバイス設定 (Phase 9)
 │   └── web/                   # Web UI
 │       ├── server.py          # FastAPI サーバー
 │       └── static/            # HTML/JS/CSS
