@@ -2,6 +2,7 @@
 音声対話パイプライン
 Phase 3: VAD → STT → LLM (Ollama) → TTS → 再生
 改善: ストリーミングTTS (文単位で合成・再生)、Silero VAD対応
+Phase 10: ウェイクワード検知モード追加
 """
 import sys
 import re
@@ -19,6 +20,7 @@ from src.audio.stt import WhisperSTT
 from src.audio.tts import KokoroTTS
 from src.audio.vad import EnergyVAD, create_vad
 from src.audio.audio_io import AudioRecorder, AudioPlayer
+from src.audio.wakeword import WakeWordDetector
 from src.chat.client import OllamaClient
 from src.chat.session import ChatSession
 from src.chat.config import ChatConfig
@@ -37,6 +39,7 @@ class VoicePipeline:
 
     # 状態定義
     STATE_IDLE = "idle"
+    STATE_WAITING = "waiting"  # ウェイクワード待機中
     STATE_LISTENING = "listening"
     STATE_PROCESSING = "processing"
     STATE_SPEAKING = "speaking"
@@ -54,6 +57,9 @@ class VoicePipeline:
         camera_id: int = 0,
         enable_monitor: bool = True,
         enable_persona: bool = True,
+        enable_wakeword: bool = False,
+        wakeword_models: Optional[list[str]] = None,
+        wakeword_threshold: float = 0.5,
     ):
         # チャット設定
         self.config = chat_config or ChatConfig.load(PROJECT_ROOT / "config" / "chat_config.json")
@@ -169,6 +175,15 @@ class VoicePipeline:
         self.streaming_tts = streaming_tts
         self._tts_queue: queue.Queue = queue.Queue()
 
+        # ウェイクワード (Phase 10)
+        self.enable_wakeword = enable_wakeword
+        self.wakeword_detector: Optional[WakeWordDetector] = None
+        if enable_wakeword:
+            self.wakeword_detector = WakeWordDetector(
+                model_names=wakeword_models,
+                threshold=wakeword_threshold,
+            )
+
         # 状態
         self._state = self.STATE_IDLE
         self._running = False
@@ -195,19 +210,20 @@ class VoicePipeline:
         Returns:
             成功したら True
         """
+        total_steps = 10 if self.enable_wakeword else 9
         print("=" * 50)
         print(" 音声対話パイプライン 初期化")
         print("=" * 50)
 
         # Ollama 接続チェック
-        print("\n[1/9] Ollama 接続確認...")
+        print(f"\n[1/{total_steps}] Ollama 接続確認...")
         if not self.llm.is_available():
             print("❌ Ollamaに接続できません")
             return False
         print("✅ Ollama OK")
 
         # STT モデルロード
-        print("\n[2/9] STT モデルロード...")
+        print(f"\n[2/{total_steps}] STT モデルロード...")
         try:
             self.stt.load()
             print("✅ STT OK")
@@ -216,7 +232,7 @@ class VoicePipeline:
             return False
 
         # TTS チェック
-        print("\n[3/9] TTS 確認...")
+        print(f"\n[3/{total_steps}] TTS 確認...")
         try:
             self.tts.load()
             print("✅ TTS OK")
@@ -225,7 +241,7 @@ class VoicePipeline:
             return False
 
         # VAD キャリブレーション (Energy VADの場合のみ環境ノイズ計測)
-        print("\n[4/9] VAD キャリブレーション...")
+        print(f"\n[4/{total_steps}] VAD キャリブレーション...")
         vad_name = type(self.vad).__name__
         print(f"  VAD方式: {vad_name}")
         try:
@@ -241,7 +257,7 @@ class VoicePipeline:
 
         # RAG (Phase 4)
         if self.enable_rag and self.rag is not None:
-            print("\n[5/9] RAG (長期記憶) 初期化...")
+            print(f"\n[5/{total_steps}] RAG (長期記憶) 初期化...")
             try:
                 self.vector_store.initialize()
                 stats = self.rag.get_stats()
@@ -250,11 +266,11 @@ class VoicePipeline:
                 print(f"⚠️  RAG 初期化失敗 (RAGなしで続行): {e}")
                 self.session.rag = None
         else:
-            print("\n[5/9] RAG (長期記憶) スキップ")
+            print(f"\n[5/{total_steps}] RAG (長期記憶) スキップ")
 
         # Vision (Phase 5)
         if self.enable_vision and self.vision_context is not None:
-            print("\n[6/9] Vision (映像入力) 初期化...")
+            print(f"\n[6/{total_steps}] Vision (映像入力) 初期化...")
             try:
                 if self.vision_context.start():
                     import time
@@ -271,11 +287,11 @@ class VoicePipeline:
                 self.session.vision_context = None
                 self.vision_context = None
         else:
-            print("\n[6/9] Vision (映像入力) スキップ")
+            print(f"\n[6/{total_steps}] Vision (映像入力) スキップ")
 
         # Monitor (Phase 6)
         if self.enable_monitor and self.monitor_context is not None:
-            print("\n[7/9] Monitor (PCログ収集) 初期化...")
+            print(f"\n[7/{total_steps}] Monitor (PCログ収集) 初期化...")
             try:
                 if self.monitor_context.start():
                     print("✅ Monitor OK (メトリクス収集開始)")
@@ -288,11 +304,11 @@ class VoicePipeline:
                 self.session.monitor_context = None
                 self.monitor_context = None
         else:
-            print("\n[7/9] Monitor (PCログ収集) スキップ")
+            print(f"\n[7/{total_steps}] Monitor (PCログ収集) スキップ")
 
         # Persona (Phase 7)
         if self.enable_persona and self.preloader is not None:
-            print("\n[8/9] Persona (パーソナライズ) 初期化...")
+            print(f"\n[8/{total_steps}] Persona (パーソナライズ) 初期化...")
             try:
                 profile_name = self.profile.name or "(未設定)"
                 facts_count = len(self.profile.extracted_facts)
@@ -303,11 +319,11 @@ class VoicePipeline:
                 self.session.preloader = None
                 self.preloader = None
         else:
-            print("\n[8/9] Persona (パーソナライズ) スキップ")
+            print(f"\n[8/{total_steps}] Persona (パーソナライズ) スキップ")
 
         # Proactive (Phase 7)
         if self.enable_persona and self.proactive is not None:
-            print("\n[9/9] Proactive (プロアクティブ発話) 初期化...")
+            print(f"\n[9/{total_steps}] Proactive (プロアクティブ発話) 初期化...")
             try:
                 self.proactive.start(callback=self._on_proactive_trigger)
                 print("✅ Proactive OK (バックグラウンド監視開始)")
@@ -315,7 +331,25 @@ class VoicePipeline:
                 print(f"⚠️  Proactive 初期化失敗 (Proactiveなしで続行): {e}")
                 self.proactive = None
         else:
-            print("\n[9/9] Proactive (プロアクティブ発話) スキップ")
+            print(f"\n[9/{total_steps}] Proactive (プロアクティブ発話) スキップ")
+
+        # ウェイクワード (Phase 10)
+        if self.enable_wakeword and self.wakeword_detector is not None:
+            print(f"\n[10/{total_steps}] WakeWord (ウェイクワード検知) 初期化...")
+            try:
+                if self.wakeword_detector.load():
+                    models = self.wakeword_detector.loaded_models
+                    print(f"✅ WakeWord OK (モデル: {', '.join(models)}, 閾値: {self.wakeword_detector.threshold})")
+                else:
+                    print("⚠️  WakeWord ロード失敗 (ウェイクワードなしで続行)")
+                    self.wakeword_detector = None
+                    self.enable_wakeword = False
+            except Exception as e:
+                print(f"⚠️  WakeWord 初期化失敗 (ウェイクワードなしで続行): {e}")
+                self.wakeword_detector = None
+                self.enable_wakeword = False
+        elif self.enable_wakeword:
+            print(f"\n[10/{total_steps}] WakeWord (ウェイクワード検知) スキップ")
 
         print("\n" + "=" * 50)
         print(" ✅ 初期化完了！")
@@ -554,17 +588,77 @@ class VoicePipeline:
                         # 発話中のインジケータ
                         print(".", end="", flush=True)
 
+    def _wait_for_wakeword(self) -> Optional[str]:
+        """
+        ウェイクワードが検知されるまでマイクを監視する
+
+        Returns:
+            検知されたウェイクワード名。中断時は None。
+        """
+        if self.wakeword_detector is None:
+            return None
+
+        self._state = self.STATE_WAITING
+        self.wakeword_detector.reset()
+        detected_word = None
+
+        # ウェイクワードのフレームサイズ (80ms @ 16kHz = 1280 samples)
+        ww_frame_size = self.wakeword_detector.frame_size
+
+        def audio_callback(indata, frames, time_info, status):
+            nonlocal detected_word
+            if status:
+                pass
+            if detected_word is not None:
+                return  # 既に検知済み
+            frame = indata[:, 0].copy()
+            result = self.wakeword_detector.process_frame(frame)
+            if result is not None:
+                detected_word = result
+
+        stream = self.recorder.open_stream(
+            callback=audio_callback,
+            frame_size=ww_frame_size,
+        )
+
+        with stream:
+            while self._running and detected_word is None:
+                try:
+                    import time
+                    time.sleep(0.05)  # 50ms ポーリング
+                except KeyboardInterrupt:
+                    raise
+
+        return detected_word
+
     def run_interactive(self) -> None:
         """インタラクティブ音声対話ループ"""
         self._running = True
         print("\n" + "=" * 50)
-        print(" 🎙️  音声対話モード")
+
+        if self.enable_wakeword and self.wakeword_detector is not None:
+            models = self.wakeword_detector.loaded_models
+            print(f" 🎙️  ウェイクワードモード")
+            print(f"  ウェイクワード: {', '.join(models)}")
+            print(f"  閾値: {self.wakeword_detector.threshold}")
+        else:
+            print(" 🎙️  音声対話モード")
         print("  Ctrl+C で終了")
         print("=" * 50)
 
         try:
             while self._running:
+                if self.enable_wakeword and self.wakeword_detector is not None:
+                    # ウェイクワードモード: 検知まで待機
+                    print("\n👂 ウェイクワード待機中...")
+                    detected = self._wait_for_wakeword()
+                    if detected is None:
+                        continue
+                    print(f"\n✨ ウェイクワード検知: {detected}")
+
+                # 対話ターンを処理
                 self.process_voice_turn()
+
                 # Proactive: ユーザーアクティビティ通知
                 if self.proactive is not None:
                     self.proactive.notify_user_activity()
@@ -581,6 +675,8 @@ class VoicePipeline:
     def cleanup(self) -> None:
         """リソースの解放"""
         self._running = False
+        if self.wakeword_detector is not None:
+            self.wakeword_detector.cleanup()
         if self.proactive is not None:
             self.proactive.stop()
         if self.monitor_context is not None:

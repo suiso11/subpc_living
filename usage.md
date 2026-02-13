@@ -110,6 +110,16 @@ bash scripts/phase9_verify.sh
 
 > ℹ️ GPU 省電力サービスは sudo 権限が必要です。セットアップスクリプトの指示に従ってください。
 
+### Phase 10: ウェイクワード検知
+
+```bash
+# openwakeword インストール + モデル DL
+bash scripts/phase10_setup.sh
+
+# 検証
+bash scripts/phase10_verify.sh
+```
+
 
 ---
 
@@ -187,6 +197,9 @@ python src/audio/main.py --text-mode
 | `--camera-id` | `0` | カメラデバイスID |
 | `--no-monitor` | ― | Monitor (PCログ収集) を無効化 |
 | `--no-persona` | ― | Persona (パーソナライズ) を無効化 |
+| `--wakeword` | ― | ウェイクワードモードを有効化 (呼びかけで起動) |
+| `--wakeword-model` | `hey_jarvis` | ウェイクワードモデル名 |
+| `--wakeword-threshold` | `0.5` | ウェイクワード検知の閾値 (0.0〜1.0) |
 
 ### VAD 方式
 
@@ -235,6 +248,12 @@ python src/audio/main.py --camera-id 1
 
 # テキストモードで TTS テスト
 python src/audio/main.py --text-mode --tts-voice jf_nezumi
+
+# ウェイクワードモード (「Hey Jarvis」で起動)
+python src/audio/main.py --wakeword
+
+# ウェイクワードモード + 閾値調整
+python src/audio/main.py --wakeword --wakeword-threshold 0.3
 ```
 
 ---
@@ -686,6 +705,50 @@ ollama pull qwen2.5:14b-instruct-q4_K_M
 
 ---
 
+## 10. ウェイクワード検知 (Phase 10)
+
+特定の呼びかけ（「Hey Jarvis」等）を検知して音声対話モードを自動起動する。常時稼働時は低消費電力でウェイクワード待機。
+
+### 仕組み
+
+1. マイク音声を 80ms フレーム単位で OpenWakeWord モデルに入力
+2. スコアが閾値 (デフォルト: 0.5) を超えたらウェイクワード検知
+3. 検知後、VAD → STT → LLM → TTS の対話ターンを実行
+4. 対話終了後、再びウェイクワード待機に戻る
+
+### 利用可能なウェイクワード
+
+| モデル名 | フレーズ | 言語 |
+|-----------|------------|------|
+| `hey_jarvis` | "Hey Jarvis" | 英語 |
+| `alexa` | "Alexa" | 英語 |
+| `hey_mycroft` | "Hey Mycroft" | 英語 |
+
+> ℹ️ 現時点では英語プリトレインモデルのみ対応。日本語ウェイクワードはカスタムトレーニングで対応予定。
+
+### 使用例
+
+```bash
+# デフォルト (hey_jarvis, 閾値 0.5)
+python src/audio/main.py --wakeword
+
+# 閾値を低くして感度を上げる
+python src/audio/main.py --wakeword --wakeword-threshold 0.3
+
+# Alexa モデルを使用
+python src/audio/main.py --wakeword --wakeword-model alexa
+```
+
+### ウェイクワードなしで起動 (従来通り)
+
+```bash
+python src/audio/main.py
+```
+
+`--wakeword` を指定しない場合は従来通りの即時VADリスニングモード。
+
+---
+
 ## 設定ファイル
 
 ### config/chat_config.json
@@ -755,6 +818,7 @@ subpc_living/
 │   │   ├── stt.py             # faster-whisper STT
 │   │   ├── tts.py             # kokoro-onnx TTS
 │   │   ├── vad.py             # VAD (Energy + Silero)
+│   │   ├── wakeword.py        # ウェイクワード検知 (OpenWakeWord, Phase 10)
 │   │   └── audio_io.py        # マイク入力・スピーカー出力
 │   ├── chat/                  # Phase 2: テキスト対話
 │   │   ├── main.py            # CLI エントリポイント
