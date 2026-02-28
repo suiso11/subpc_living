@@ -713,23 +713,27 @@ async def websocket_chat(websocket: WebSocket):
             full_response = ""
 
             try:
-                # generate_stream は同期ジェネレータなので、スレッドで回す
-                def collect_tokens():
-                    tokens = []
-                    for token in llm.generate_stream(
-                        messages,
-                        temperature=config.temperature,
-                        top_p=config.top_p,
-                        top_k=config.top_k,
-                        num_ctx=config.num_ctx,
-                        repeat_penalty=config.repeat_penalty,
-                    ):
-                        tokens.append(token)
-                    return tokens
+                # queue ベースのリアルタイムストリーミング
+                token_queue = llm.generate_stream_queue(
+                    messages,
+                    temperature=config.temperature,
+                    num_ctx=config.num_ctx,
+                )
 
-                tokens = await loop.run_in_executor(None, collect_tokens)
+                while True:
+                    try:
+                        token = await asyncio.get_event_loop().run_in_executor(
+                            None, token_queue.get, True, 300.0
+                        )
+                    except Exception:
+                        break
 
-                for token in tokens:
+                    if token is None:
+                        # ストリーム終了
+                        break
+                    if isinstance(token, Exception):
+                        raise token
+
                     full_response += token
                     await websocket.send_json({"type": "token", "content": token})
 

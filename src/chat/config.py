@@ -17,10 +17,7 @@ class ChatConfig:
 
     # --- 生成パラメータ ---
     temperature: float = 0.7
-    top_p: float = 0.9
-    top_k: int = 40
-    num_ctx: int = 4096  # コンテキスト長（VRAM節約のため制限）
-    repeat_penalty: float = 1.1
+    num_ctx: int = 8192  # コンテキスト長
 
     # --- システムプロンプト ---
     system_prompt: str = (
