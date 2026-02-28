@@ -9,10 +9,15 @@ Phase 10: デュアルGPU対応 (P40 + RTX 2070 Super)
 - 単GPU: 従来のプロファイルで動作
 - GPUなし: 全てCPU
 """
+import os
 import subprocess
 import shutil
 from dataclasses import dataclass, field
 from typing import Optional
+
+# CUDAデバイス列挙順をPCIバス順に統一 (nvidia-smiと一致させる)
+# 必ずtorchインポート前に設定すること
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 
 
 @dataclass
@@ -164,10 +169,10 @@ def get_device_config(gpu: Optional[GpuInfo] = None) -> DeviceConfig:
 
             inf_gpu = gpus[inf_idx]
 
-            # STT: 推論GPU + float16 (Tensor Cores活用) + mediumモデル
+            # STT: 推論GPU + int8 (CTranslate2互換) + mediumモデル
             config.stt_device = "cuda"
             config.stt_device_index = inf_gpu.index
-            config.stt_compute_type = "float16"
+            config.stt_compute_type = "int8"
             config.stt_model_size = "medium"
 
             # Embedding: 推論GPU

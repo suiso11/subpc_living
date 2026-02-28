@@ -51,8 +51,24 @@ sudo tailscale serve --bg --https=443 http://localhost:${PORT}
 echo "  ✅ HTTPS プロキシ設定完了"
 echo ""
 
-# --- 3. Web UI サーバー起動 ---
-echo "[3/3] Web UI サーバー起動..."
+# --- 3. Web UI サーバー起動 (systemd サービス経由) ---
+echo "[3/3] Web UI サーバー確認..."
+
+# サービスが動いていなければ起動
+if ! systemctl --user is-active --quiet subpc-web; then
+    echo "  subpc-web サービスを起動中..."
+    systemctl --user start subpc-web
+    sleep 3
+fi
+
+if systemctl --user is-active --quiet subpc-web; then
+    echo "  ✅ subpc-web サービス稼働中"
+else
+    echo "  ❌ subpc-web サービスの起動に失敗"
+    echo "  手動確認: systemctl --user status subpc-web"
+    exit 1
+fi
+
 echo ""
 echo "=============================================="
 echo " ✅ 準備完了！"
@@ -65,9 +81,8 @@ echo "   http://localhost:${PORT}"
 echo ""
 echo " 🎤 音声入力: マイクボタンをタップして話しかける"
 echo " 🔊 読み上げ: TTS トグルをONにする"
-echo "=============================================="
 echo ""
-
-cd "$PROJECT_ROOT"
-source .venv/bin/activate
-python -m src.web.server --host 0.0.0.0 --port ${PORT}
+echo " 管理コマンド:"
+echo "   systemctl --user status subpc-web"
+echo "   systemctl --user restart subpc-web"
+echo "=============================================="
