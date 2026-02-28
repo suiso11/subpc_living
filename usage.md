@@ -279,14 +279,81 @@ python src/web/server.py
 - PC: http://localhost:8000
 - スマホ (LAN): http://<サブPCのIP>:8000
 
+### スマホから音声対話（Tailscale HTTPS経由）
+
+スマホのブラウザからマイク入力するには **HTTPS が必須**。Tailscale Serve で自動HTTPS化する。
+
+#### 前提条件
+
+- Tailscale がセットアップ済み（詳細は `usage_tailscale_ssh.md`）
+- スマホにも Tailscale アプリをインストールし、同じアカウントでログイン済み
+- ffmpeg がインストール済み（`sudo apt install ffmpeg`）
+
+#### 起動方法
+
+**一括起動スクリプト（推奨）:**
+
+```bash
+bash scripts/start_mobile.sh
+```
+
+このスクリプトは以下を自動で行う:
+1. Tailscale 接続確認
+2. `tailscale serve` で HTTPS プロキシ設定（443 → 8000）
+3. Web UI サーバー起動（STT/TTS 含む）
+
+**手動で起動する場合:**
+
+```bash
+# 1. HTTPS プロキシを設定
+sudo tailscale serve --bg --https=443 http://localhost:8000
+
+# 2. Web UI サーバー起動
+source .venv/bin/activate
+python -m src.web.server --host 0.0.0.0 --port 8000
+```
+
+#### スマホからのアクセス URL
+
+```
+https://haruka-hp-elitedesk-800-g4-twr.tail7f2f23.ts.net
+```
+
+> ℹ️ MagicDNS 名は `tailscale status --json | jq -r '.Self.DNSName'` で確認可能
+
+#### 操作方法
+
+1. **テキスト入力**: メッセージ欄にテキストを入力 → 送信ボタン
+2. **音声入力**: 🎤 マイクボタンをタップ → 話す → もう一度タップで停止 → 自動でSTT→LLM→TTS
+3. **読み上げ**: 🔊 トグルがONなら応答が自動で音声再生される
+
+#### 音声入力の流れ
+
+```
+スマホのマイク → 録音 → base64エンコード
+    → WebSocket で送信
+    → サーバー側 STT (Whisper medium, CUDA)
+    → 認識テキストをLLMに送信
+    → ストリーミング応答
+    → TTS音声合成 (kokoro-onnx)
+    → base64 WAV をスマホに返却 → 再生
+```
+
+#### Tailscale Serve の停止
+
+```bash
+sudo tailscale serve reset
+```
+
 ### Web API
 
 | エンドポイント | メソッド | 説明 |
 |---------------|---------|------|
 | `/api/health` | GET | ヘルスチェック (Ollama/ディスク/メモリ/モジュール状態) |
-| `/api/status` | GET | システム状態 (Ollama/TTS/RAG/Vision/Monitor の接続状況) |
+| `/api/status` | GET | システム状態 (Ollama/TTS/STT/RAG/Vision/Monitor の接続状況) |
 | `/api/tts` | POST | テキスト → WAV 音声合成 (`{"text": "..."}`) |
 | `/api/tts/voice` | POST | TTS ボイス変更 (`{"voice": "jm_kumo"}`) |
+| `/api/stt` | POST | 音声 → テキスト変換 (`{"audio": "base64..."}`). WAV形式 |
 | `/api/vision/status` | GET | 映像入力の状態 (在席/感情/カメラ情報) |
 | `/api/vision/snapshot` | GET | 現在のカメラ画像 (JPEG) |
 | `/api/vision/context` | GET | 映像コンテキストテキスト (デバッグ用) |
@@ -298,7 +365,26 @@ python src/web/server.py
 | `/api/persona/profile` | POST | プロフィール更新 (`{"name": "...", "note": "..."}`) |
 | `/api/persona/summaries?count=5` | GET | 直近の会話要約一覧 |
 | `/api/persona/context` | GET | プリロードコンテキスト (デバッグ用) |
-| `/ws/chat` | WebSocket | ストリーミングチャット (トークン単位) |
+| `/ws/chat` | WebSocket | ストリーミングチャット + 音声入力 (トークン単位) |
+
+### WebSocket メッセージ仕様
+
+#### クライアント → サーバー
+
+| type | フィールド | 説明 |
+|------|-----------|------|
+| `message` | `text`, `session_id`, `tts` | テキストメッセージ送信 |
+| `audio_message` | `data` (base64), `format` (webm/ogg/wav), `session_id`, `tts` | 音声メッセージ送信 |
+
+#### サーバー → クライアント
+
+| type | フィールド | 説明 |
+|------|-----------|------|
+| `token` | `content` | ストリーミングトークン (1文字〜数文字) |
+| `done` | `full_text` | 応答完了 + 全文テキスト |
+| `audio` | `data` (base64 WAV) | TTS音声データ |
+| `stt_result` | `text` | STT認識結果テキスト |
+| `error` | `message` | エラーメッセージ |
 
 ---
 

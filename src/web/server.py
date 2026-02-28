@@ -24,6 +24,7 @@ from src.chat.client import OllamaClient
 from src.chat.session import ChatSession
 from src.chat.config import ChatConfig
 from src.audio.tts import KokoroTTS
+from src.audio.stt import WhisperSTT
 from src.memory.vectorstore import VectorStore
 from src.memory.rag import RAGRetriever
 from src.vision.context import VisionContext
@@ -38,6 +39,7 @@ from src.service.healthcheck import HealthChecker
 config: ChatConfig = None
 llm: OllamaClient = None
 tts: KokoroTTS = None
+stt: WhisperSTT = None
 rag: RAGRetriever = None
 vision: VisionContext = None
 monitor: MonitorContext = None
@@ -62,7 +64,7 @@ def get_local_ip() -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """サーバー起動/終了時の処理"""
-    global config, llm, tts, rag, vision, monitor, profile, summarizer, preloader
+    global config, llm, tts, stt, rag, vision, monitor, profile, summarizer, preloader
 
     print("=" * 50)
     print(" Web UI サーバー起動中...")
@@ -80,8 +82,18 @@ async def lifespan(app: FastAPI):
     else:
         print(f"✅ Ollama OK (model: {config.model})")
 
+    # STT 初期化
+    print("[2/7] STT 初期化...")
+    try:
+        stt = WhisperSTT(model_size="auto", language="ja", device="auto")
+        stt.load()
+        print(f"✅ STT OK (model: {stt.model_size}, device: {stt.device})")
+    except Exception as e:
+        print(f"⚠️  STT ロード失敗: {e}")
+        stt = None
+
     # TTS 初期化
-    print("[2/6] TTS 初期化...")
+    print("[3/7] TTS 初期化...")
     tts = KokoroTTS(models_dir=PROJECT_ROOT / "models" / "tts" / "kokoro")
     try:
         tts.load()
@@ -91,7 +103,7 @@ async def lifespan(app: FastAPI):
         tts = None
 
     # RAG 初期化 (Phase 4)
-    print("[3/6] RAG (長期記憶) 初期化...")
+    print("[4/7] RAG (長期記憶) 初期化...")
     try:
         vector_store = VectorStore(
             persist_dir=str(PROJECT_ROOT / "data" / "vectordb"),
@@ -105,7 +117,7 @@ async def lifespan(app: FastAPI):
         rag = None
 
     # Vision 初期化 (Phase 5)
-    print("[4/6] Vision (映像入力) 初期化...")
+    print("[5/7] Vision (映像入力) 初期化...")
     try:
         emotion_model = str(PROJECT_ROOT / "models" / "vision" / "emotion-ferplus-8.onnx")
         vision = VisionContext(
@@ -127,7 +139,7 @@ async def lifespan(app: FastAPI):
         vision = None
 
     # Monitor 初期化 (Phase 6)
-    print("[5/6] Monitor (PCログ収集) 初期化...")
+    print("[6/7] Monitor (PCログ収集) 初期化...")
     try:
         monitor = MonitorContext(
             db_path=str(PROJECT_ROOT / "data" / "metrics" / "system_metrics.db"),
@@ -143,7 +155,7 @@ async def lifespan(app: FastAPI):
         monitor = None
 
     # Persona 初期化 (Phase 7)
-    print("[6/6] Persona (パーソナライズ) 初期化...")
+    print("[7/7] Persona (パーソナライズ) 初期化...")
     try:
         profile = UserProfile(
             profile_path=str(PROJECT_ROOT / "data" / "profile" / "user_profile.json"),
@@ -278,6 +290,7 @@ async def health():
     result["modules"] = {
         "ollama": llm is not None and llm.is_available() if llm else False,
         "tts": tts is not None and tts.is_loaded(),
+        "stt": stt is not None and stt.is_loaded(),
         "rag": rag is not None,
         "vision": vision is not None and vision.is_running,
         "monitor": monitor is not None and monitor.is_running,
@@ -297,6 +310,8 @@ async def status():
         "tts": tts is not None and tts.is_loaded(),
         "tts_voice": tts.voice if tts else None,
         "tts_voices": KokoroTTS.list_ja_voices(),
+        "stt": stt is not None and stt.is_loaded(),
+        "stt_model": stt.model_size if stt else None,
         "rag": rag is not None,
         "rag_stats": rag.get_stats() if rag else None,
         "vision": vision is not None and vision.is_running,
@@ -346,6 +361,102 @@ async def set_voice(request: Request):
 
 
 # --- Vision API ---
+
+
+@app.post("/api/stt")
+async def stt_transcribe(request: Request):
+    """音声データを受け取ってSTTでテキストに変換"""
+    if stt is None:
+        return JSONResponse({"error": "STT not available"}, status_code=503)
+
+    body = await request.json()
+    audio_b64 = body.get("audio", "")
+    if not audio_b64:
+        return JSONResponse({"error": "audio is required (base64 WAV)"}, status_code=400)
+
+    try:
+        import numpy as np
+        audio_bytes = base64.b64decode(audio_b64)
+        audio_array = _decode_wav_bytes(audio_bytes)
+
+        loop = asyncio.get_event_loop()
+        text = await loop.run_in_executor(None, stt.transcribe, audio_array, 16000)
+
+        return {"text": text}
+    except Exception as e:
+        return JSONResponse({"error": f"STT error: {e}"}, status_code=500)
+
+
+def _decode_wav_bytes(wav_bytes: bytes) -> "np.ndarray":
+    """生のWAVバイトをfloat32 numpy配列に変換 (16kHzモノラル)"""
+    import numpy as np
+    import wave
+    import io
+
+    buf = io.BytesIO(wav_bytes)
+    with wave.open(buf, "rb") as wf:
+        n_channels = wf.getnchannels()
+        sampwidth = wf.getsampwidth()
+        framerate = wf.getframerate()
+        n_frames = wf.getnframes()
+        raw = wf.readframes(n_frames)
+
+    # int16 で読み込み
+    if sampwidth == 2:
+        audio = np.frombuffer(raw, dtype=np.int16)
+    elif sampwidth == 4:
+        audio = np.frombuffer(raw, dtype=np.int32).astype(np.int16)
+    else:
+        audio = np.frombuffer(raw, dtype=np.int16)
+
+    # ステレオ→モノラル
+    if n_channels > 1:
+        audio = audio.reshape(-1, n_channels)[:, 0]
+
+    # float32に変換
+    audio = audio.astype(np.float32) / 32768.0
+
+    # 16kHzにリサンプリング
+    if framerate != 16000:
+        duration = len(audio) / framerate
+        target_len = int(duration * 16000)
+        indices = np.linspace(0, len(audio) - 1, target_len).astype(int)
+        audio = audio[indices]
+
+    return audio
+
+
+def _decode_webm_bytes(webm_bytes: bytes) -> "np.ndarray":
+    """WebM/Oggバイトをfloat32 numpy配列に変換 (16kHzモノラル) — ffmpeg使用"""
+    import numpy as np
+    import subprocess
+    import tempfile
+    import os
+
+    # 一時ファイルに書き出し
+    with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
+        tmp.write(webm_bytes)
+        tmp_path = tmp.name
+
+    try:
+        # ffmpegで 16kHz, mono, s16le PCM に変換
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", tmp_path,
+                "-ar", "16000", "-ac", "1", "-f", "s16le",
+                "-acodec", "pcm_s16le", "-"
+            ],
+            capture_output=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg error: {result.stderr.decode()[:200]}")
+
+        audio = np.frombuffer(result.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+        return audio
+    finally:
+        os.unlink(tmp_path)
+
 
 @app.get("/api/vision/status")
 async def vision_status():
@@ -497,11 +608,13 @@ async def websocket_chat(websocket: WebSocket):
 
     クライアント → サーバー:
         {"type": "message", "text": "...", "session_id": "...", "tts": true/false}
+        {"type": "audio_message", "data": "base64...", "format": "webm", "session_id": "...", "tts": true/false}
 
     サーバー → クライアント:
         {"type": "token", "content": "..."}       # ストリーミングトークン
         {"type": "done", "full_text": "..."}       # 応答完了
         {"type": "audio", "data": "base64..."}     # TTS音声 (base64 WAV)
+        {"type": "stt_result", "text": "..."}      # STT認識結果
         {"type": "error", "message": "..."}        # エラー
     """
     await websocket.accept()
@@ -511,12 +624,69 @@ async def websocket_chat(websocket: WebSocket):
             raw = await websocket.receive_text()
             data = json.loads(raw)
 
-            if data.get("type") != "message":
+            msg_type = data.get("type", "")
+            if msg_type not in ("message", "audio_message"):
                 continue
 
             user_text = data.get("text", "").strip()
             session_id = data.get("session_id", "default")
             want_tts = data.get("tts", False)
+
+            # --- 音声メッセージ処理 ---
+            if msg_type == "audio_message":
+                audio_b64 = data.get("data", "")
+                audio_format = data.get("format", "wav")
+                if not audio_b64 or stt is None:
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "STT not available" if stt is None else "No audio data",
+                    })
+                    continue
+
+                try:
+                    import numpy as np
+                    audio_bytes = base64.b64decode(audio_b64)
+
+                    # フォーマットに応じてデコード
+                    loop = asyncio.get_event_loop()
+                    if audio_format in ("webm", "ogg", "mp4", "m4a"):
+                        audio_array = await loop.run_in_executor(
+                            None, _decode_webm_bytes, audio_bytes
+                        )
+                    else:
+                        audio_array = await loop.run_in_executor(
+                            None, _decode_wav_bytes, audio_bytes
+                        )
+
+                    # STT実行
+                    text = await loop.run_in_executor(
+                        None, stt.transcribe, audio_array, 16000
+                    )
+
+                    if not text:
+                        await websocket.send_json({
+                            "type": "stt_result",
+                            "text": "",
+                            "message": "音声を認識できませんでした",
+                        })
+                        continue
+
+                    # 認識テキストをクライアントに通知
+                    await websocket.send_json({
+                        "type": "stt_result",
+                        "text": text,
+                    })
+
+                    # 認識テキストをそのままLLMに流す
+                    user_text = text
+                    # 以下のチャット処理にフォールスルー
+
+                except Exception as e:
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": f"STT error: {e}",
+                    })
+                    continue
 
             if not user_text:
                 continue
