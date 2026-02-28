@@ -3,6 +3,7 @@
 - 顔検出: OpenCV Haar Cascade (軽量、CPU向け)
 - 感情推定: emotion-ferplus ONNX モデル (onnxruntime)
 - Phase 9: onnxruntime-gpu 利用時は CUDAExecutionProvider を自動選択
+- Phase 10: デュアルGPU対応 — device_id で推論GPU (2070S) を指定
 """
 import numpy as np
 from pathlib import Path
@@ -116,8 +117,15 @@ class FaceDetector:
 
 # --- 感情推定 ---
 
-def _detect_onnx_providers() -> list[str]:
-    """利用可能な ONNX Runtime プロバイダーを検出する (Phase 9)"""
+def _detect_onnx_providers() -> list:
+    """利用可能な ONNX Runtime プロバイダーを検出する (Phase 10: デュアルGPU対応)"""
+    # gpu_config が利用可能な場合はそちらのデバイス割り当てに従う
+    try:
+        from src.service.gpu_config import resolve_onnx_providers
+        return resolve_onnx_providers()
+    except ImportError:
+        pass
+
     if not HAS_ORT:
         return ["CPUExecutionProvider"]
     available = ort.get_available_providers()

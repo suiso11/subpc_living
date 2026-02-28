@@ -1,6 +1,7 @@
 """
 システムメトリクス収集
 psutil を使用して CPU / メモリ / ディスク / ネットワーク / GPU 等のメトリクスを収集
+Phase 10: マルチGPUメトリクス収集対応 (P40 + RTX 2070 Super)
 """
 import time
 import threading
@@ -51,6 +52,9 @@ class SystemMetrics:
     gpu_mem_used_mb: Optional[float] = None
     gpu_mem_total_mb: Optional[float] = None
     gpu_power_w: Optional[float] = None
+
+    # マルチGPUメトリクス (Phase 10)
+    gpus: list[dict] = field(default_factory=list)  # [{index, name, util, mem_used, mem_total, temp, power}]
 
     # プロセス
     process_count: int = 0
@@ -231,28 +235,46 @@ class SystemCollector:
         return metrics
 
     def _collect_gpu(self, metrics: SystemMetrics) -> SystemMetrics:
-        """nvidia-smi でGPU情報を収集"""
+        """全GPUの情報をnvidia-smiで収集 (Phase 10: マルチGPU対応)"""
         try:
             import subprocess
             result = subprocess.run(
                 [
                     "nvidia-smi",
-                    "--query-gpu=utilization.gpu,memory.used,memory.total,power.draw,temperature.gpu",
+                    "--query-gpu=index,name,utilization.gpu,memory.used,memory.total,power.draw,temperature.gpu",
                     "--format=csv,noheader,nounits",
                 ],
                 capture_output=True, text=True, timeout=5,
             )
             if result.returncode == 0:
-                parts = result.stdout.strip().split(",")
-                if len(parts) >= 5:
-                    metrics.gpu_util_percent = float(parts[0].strip())
-                    metrics.gpu_mem_used_mb = float(parts[1].strip())
-                    metrics.gpu_mem_total_mb = float(parts[2].strip())
-                    try:
-                        metrics.gpu_power_w = float(parts[3].strip())
-                    except ValueError:
-                        pass  # "[Not Supported]" の場合
-                    metrics.gpu_temp_c = float(parts[4].strip())
+                gpu_list = []
+                for line in result.stdout.strip().splitlines():
+                    parts = [p.strip() for p in line.split(",")]
+                    if len(parts) >= 7:
+                        gpu_data = {
+                            "index": int(parts[0]),
+                            "name": parts[1],
+                            "util_percent": float(parts[2]),
+                            "mem_used_mb": float(parts[3]),
+                            "mem_total_mb": float(parts[4]),
+                            "temp_c": float(parts[6]),
+                        }
+                        try:
+                            gpu_data["power_w"] = float(parts[5])
+                        except ValueError:
+                            gpu_data["power_w"] = None
+                        gpu_list.append(gpu_data)
+
+                metrics.gpus = gpu_list
+
+                # 後方互換: 最初のGPUデータを単一フィールドにもセット
+                if gpu_list:
+                    g0 = gpu_list[0]
+                    metrics.gpu_util_percent = g0["util_percent"]
+                    metrics.gpu_mem_used_mb = g0["mem_used_mb"]
+                    metrics.gpu_mem_total_mb = g0["mem_total_mb"]
+                    metrics.gpu_power_w = g0.get("power_w")
+                    metrics.gpu_temp_c = g0["temp_c"]
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass  # nvidia-smi なし
         except Exception:

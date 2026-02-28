@@ -3,6 +3,7 @@ GPU 省電力制御モジュール
 nvidia-smi を使って GPU の電力制限を動的に変更する。
 常時稼働時のアイドル消費電力を抑え、推論時にフルパワーへ復帰させる。
 Phase 9: GPU名を検出して適切なデフォルト値を自動設定。
+Phase 10: マルチGPU対応 (P40 + RTX 2070 Super)
 """
 import subprocess
 import shutil
@@ -11,19 +12,21 @@ from typing import Optional
 
 # GPU別の電力プリセット (idle_watts, active_watts)
 GPU_POWER_PRESETS: dict[str, tuple[int, int]] = {
-    "P40":       (100, 250),   # TDP 250W
-    "P100":      (100, 250),   # TDP 250W
-    "V100":      (100, 300),   # TDP 300W
-    "GTX 1060":  (80, 120),    # TDP 120W
-    "GTX 1070":  (80, 150),    # TDP 150W
-    "GTX 1080":  (80, 180),    # TDP 180W
-    "RTX 2080":  (80, 215),    # TDP 215W
-    "RTX 3080":  (100, 320),   # TDP 320W
-    "RTX 4090":  (100, 450),   # TDP 450W
+    "P40":             (125, 250),   # TDP 250W, min 125W
+    "P100":            (125, 250),   # TDP 250W
+    "V100":            (125, 300),   # TDP 300W
+    "GTX 1060":        (80, 120),    # TDP 120W
+    "GTX 1070":        (80, 150),    # TDP 150W
+    "GTX 1080":        (80, 180),    # TDP 180W
+    "RTX 2070":        (125, 215),   # TDP 215W, min 125W
+    "RTX 2070 SUPER":  (125, 215),   # TDP 215W, min 125W
+    "RTX 2080":        (125, 215),   # TDP 215W
+    "RTX 3080":        (100, 320),   # TDP 320W
+    "RTX 4090":        (100, 450),   # TDP 450W
 }
 
 
-def _detect_gpu_preset() -> tuple[int, int]:
+def _detect_gpu_preset(gpu_id: int = 0) -> tuple[int, int]:
     """nvidia-smi からGPU名を取得し、適切なプリセットを返す"""
     nvidia_smi = shutil.which("nvidia-smi")
     if not nvidia_smi:
@@ -31,7 +34,8 @@ def _detect_gpu_preset() -> tuple[int, int]:
 
     try:
         result = subprocess.run(
-            [nvidia_smi, "--query-gpu=gpu_name", "--format=csv,noheader"],
+            [nvidia_smi, f"--id={gpu_id}",
+             "--query-gpu=gpu_name", "--format=csv,noheader"],
             capture_output=True, text=True, timeout=10,
         )
         if result.returncode == 0:
@@ -45,8 +49,27 @@ def _detect_gpu_preset() -> tuple[int, int]:
     return (100, 250)  # デフォルト
 
 
+def _detect_gpu_count() -> int:
+    """nvidia-smi で搭載GPU数を取得"""
+    nvidia_smi = shutil.which("nvidia-smi")
+    if not nvidia_smi:
+        return 0
+    try:
+        result = subprocess.run(
+            [nvidia_smi, "--query-gpu=index", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            return len(result.stdout.strip().splitlines())
+    except Exception:
+        pass
+    return 0
+
+
 class GpuPowerManager:
     """nvidia-smi を使った GPU 電力制限管理
+
+    Phase 10: マルチGPU対応。各GPUごとに個別管理可能。
 
     Args:
         idle_watts: アイドル時の電力制限 (W)。None で自動検出。
@@ -61,7 +84,7 @@ class GpuPowerManager:
         gpu_id: int = 0,
     ):
         # GPU名からデフォルト値を決定
-        default_idle, default_active = _detect_gpu_preset()
+        default_idle, default_active = _detect_gpu_preset(gpu_id)
         self.idle_watts = idle_watts if idle_watts is not None else default_idle
         self.active_watts = active_watts if active_watts is not None else default_active
         self.gpu_id = gpu_id
@@ -187,18 +210,28 @@ class GpuPowerManager:
         }
 
 
+def create_all_managers() -> list['GpuPowerManager']:
+    """全GPUの電力マネージャーをまとめて生成する"""
+    count = _detect_gpu_count()
+    if count == 0:
+        return []
+    return [GpuPowerManager(gpu_id=i) for i in range(count)]
+
+
 def main():
-    """CLI エントリポイント。GPU 情報を表示する。"""
+    """CLI エントリポイント。全GPU情報を表示する。"""
     import json
 
-    mgr = GpuPowerManager()
-
-    if not mgr.available:
+    managers = create_all_managers()
+    if not managers:
         print("nvidia-smi が見つかりません。GPU 省電力制御は利用できません。")
         return
 
-    info = mgr.get_gpu_info()
-    print(json.dumps(info, ensure_ascii=False, indent=2))
+    for mgr in managers:
+        print(f"--- GPU {mgr.gpu_id} ---")
+        info = mgr.get_gpu_info()
+        print(json.dumps(info, ensure_ascii=False, indent=2))
+        print()
 
 
 if __name__ == "__main__":

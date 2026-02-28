@@ -10,6 +10,9 @@ WorkingDirectory=%h/ドキュメント/subpc_living
 Environment=PATH=%h/ドキュメント/subpc_living/.venv/bin:/usr/local/bin:/usr/bin:/bin
 Environment=PYTHONUNBUFFERED=1
 
+# Ollama は GPU 0 (P40) を使用、Python推論は GPU 1 (2070S) を使用
+# CUDA_VISIBLE_DEVICES は設定しない (gpu_config.py が device_index で制御)
+
 # 起動前にヘルスチェック (Ollama 接続確認)
 ExecStartPre=%h/ドキュメント/subpc_living/.venv/bin/python -m src.service.healthcheck
 

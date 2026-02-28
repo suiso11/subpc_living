@@ -1,17 +1,22 @@
 [Unit]
-Description=subpc_living GPU 省電力制御 (起動時)
+Description=subpc_living GPU 省電力制御 (起動時) - デュアルGPU対応
 After=nvidia-persistenced.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 
-# Persistence Mode 有効化 + 電力制限設定
+# Persistence Mode 有効化 (全GPU)
 ExecStart=/usr/bin/nvidia-smi --persistence-mode=1
-ExecStart=/usr/bin/nvidia-smi --power-limit=100
+
+# GPU 0 (P40): LLM専用 — アイドル時125W (最小値)
+ExecStart=/usr/bin/nvidia-smi --id=0 --power-limit=125
+# GPU 1 (RTX 2070 Super): 推論用 — アイドル時125W (最小値)
+ExecStart=/usr/bin/nvidia-smi --id=1 --power-limit=125
 
 # 停止時にデフォルトに戻す
-ExecStop=/usr/bin/nvidia-smi --power-limit=250
+ExecStop=/usr/bin/nvidia-smi --id=0 --power-limit=250
+ExecStop=/usr/bin/nvidia-smi --id=1 --power-limit=215
 
 [Install]
 WantedBy=multi-user.target

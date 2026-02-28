@@ -70,6 +70,19 @@ async def lifespan(app: FastAPI):
     print(" Web UI サーバー起動中...")
     print("=" * 50)
 
+    # GPU構成表示 (Phase 10)
+    try:
+        from src.service.gpu_config import get_device_config
+        gpu_cfg = get_device_config()
+        if gpu_cfg.gpus:
+            print(f"  GPU構成: {gpu_cfg.profile}")
+            for g in gpu_cfg.gpus:
+                print(f"    GPU{g.index}: {g.name} ({g.vram_gb}GB)")
+            if gpu_cfg.profile == "dual_gpu":
+                print(f"    LLM → GPU{gpu_cfg.llm_gpu_index} / 推論 → GPU{gpu_cfg.inference_gpu_index}")
+    except Exception:
+        pass
+
     # 設定ロード
     config_path = PROJECT_ROOT / "config" / "chat_config.json"
     config = ChatConfig.load(config_path)

@@ -783,10 +783,10 @@ ollama pull qwen2.5:14b-instruct-q4_K_M
 ### P40 換装手順
 
 1. P40 を物理的に取り付け
-2. 電源 500W → 650W への換装を推奨 (P40 TDP: 250W)
+2. 電源 750W 換装済み ✅
 3. BIOS で iGPU を映像出力に設定 (P40 は映像出力なし)
-4. Ubuntu 起動後 `nvidia-smi` で認識確認
-5. `bash scripts/phase9_setup.sh` を実行
+4. RTX 2070 Super を追加搭載 (推論専用、GPU 1)
+5. Ubuntu 起動後 `nvidia-smi` で両GPU認識確認
 6. `config/chat_config.json` の model を 14b に変更
 
 ---
