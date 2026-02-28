@@ -78,11 +78,20 @@ class VectorStore:
         """ChromaDB 用の埋め込み関数を作成"""
         from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 
-        print(f"[VectorStore] 埋め込みモデル '{self.embedding_model_name}' をロード中...")
+        # "auto" を実デバイスに解決
+        device = self.embedding_device
+        if device == "auto":
+            try:
+                from src.service.gpu_config import resolve_device
+                device = resolve_device("auto", module="embedding")
+            except ImportError:
+                device = "cpu"
+
+        print(f"[VectorStore] 埋め込みモデル '{self.embedding_model_name}' をロード中 (device={device})...")
         start = time.time()
         fn = SentenceTransformerEmbeddingFunction(
             model_name=self.embedding_model_name,
-            device=self.embedding_device,
+            device=device,
         )
         elapsed = time.time() - start
         print(f"[VectorStore] 埋め込みモデルロード完了 ({elapsed:.1f}秒)")

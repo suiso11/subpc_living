@@ -5,10 +5,48 @@ CPU実行、日本語対応（Kokoro 82Mモデル）
 """
 import wave
 import io
+import re
 import time
 import numpy as np
 from pathlib import Path
 from typing import Optional
+
+# kokoro-onnx の音素上限 (510) を超えないよう、テキストを文単位で分割する。
+# 日本語1文字 ≒ 3〜8音素に展開されるため、安全マージンを取って50文字以下に。
+_MAX_CHUNK_CHARS = 50
+_SENTENCE_SPLIT = re.compile(r'(?<=[。！？、\n.!?,])')
+
+
+def _split_text(text: str, max_chars: int = _MAX_CHUNK_CHARS) -> list[str]:
+    """テキストを文単位で分割し、音素上限を超えないチャンクにまとめる"""
+    sentences = _SENTENCE_SPLIT.split(text)
+    sentences = [s.strip() for s in sentences if s.strip()]
+
+    if not sentences:
+        return [text] if text.strip() else []
+
+    chunks = []
+    current = ""
+    for sent in sentences:
+        if len(current) + len(sent) > max_chars and current:
+            chunks.append(current)
+            current = sent
+        else:
+            current += sent
+
+    if current:
+        chunks.append(current)
+
+    # 単一チャンクが長すぎる場合はさらに強制分割
+    result = []
+    for chunk in chunks:
+        while len(chunk) > max_chars:
+            result.append(chunk[:max_chars])
+            chunk = chunk[max_chars:]
+        if chunk:
+            result.append(chunk)
+
+    return result
 
 
 class KokoroTTS:
@@ -85,7 +123,10 @@ class KokoroTTS:
 
     def synthesize(self, text: str) -> bytes:
         """
-        テキストを音声に変換し、WAVバイトデータを返す
+        テキストを音声に変換し、WAVバイトデータを返す。
+
+        kokoro-onnx の音素上限 (510) を超えないよう、
+        テキストを文単位でチャンク分割して合成・結合する。
 
         Args:
             text: 合成するテキスト
@@ -96,17 +137,39 @@ class KokoroTTS:
         self.load()
 
         start = time.time()
-        samples, sr = self._kokoro.create(
-            text,
-            voice=self.voice,
-            speed=self.speed,
-            lang=self.lang,
-        )
-        elapsed = time.time() - start
+        chunks = _split_text(text)
+
+        if not chunks:
+            # 空テキスト → 無音WAV
+            return self._empty_wav()
+
+        all_samples = []
+        sr = self.sample_rate
+
+        for chunk in chunks:
+            try:
+                samples, sr = self._kokoro.create(
+                    chunk,
+                    voice=self.voice,
+                    speed=self.speed,
+                    lang=self.lang,
+                )
+                all_samples.append(samples)
+            except (IndexError, Exception) as e:
+                # 音素変換エラー時はスキップして続行
+                print(f"[TTS] チャンク合成スキップ: {e} ({chunk[:20]}...)")
+                continue
+
+        if not all_samples:
+            print("[TTS] 全チャンク失敗")
+            return self._empty_wav()
+
+        combined = np.concatenate(all_samples)
         self.sample_rate = sr
+        elapsed = time.time() - start
 
         # float32 → int16 → WAV
-        audio_int16 = (samples * 32767).astype(np.int16)
+        audio_int16 = (combined * 32767).astype(np.int16)
         wav_buffer = io.BytesIO()
         with wave.open(wav_buffer, "wb") as wf:
             wf.setnchannels(1)
@@ -115,10 +178,20 @@ class KokoroTTS:
             wf.writeframes(audio_int16.tobytes())
 
         wav_data = wav_buffer.getvalue()
-        duration = len(samples) / sr
-        print(f"[TTS] 合成完了 ({elapsed:.2f}秒, 音声{duration:.1f}秒): {text[:30]}{'...' if len(text) > 30 else ''}")
+        duration = len(combined) / sr
+        print(f"[TTS] 合成完了 ({elapsed:.2f}秒, 音声{duration:.1f}秒, {len(chunks)}チャンク): {text[:30]}{'...' if len(text) > 30 else ''}")
 
         return wav_data
+
+    def _empty_wav(self) -> bytes:
+        """無音のWAVデータを返す"""
+        wav_buffer = io.BytesIO()
+        with wave.open(wav_buffer, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(self.sample_rate)
+            wf.writeframes(b"\x00\x00" * self.sample_rate)  # 1秒無音
+        return wav_buffer.getvalue()
 
     def synthesize_to_file(self, text: str, filepath: str | Path) -> Path:
         """テキストを音声に変換し、WAVファイルに保存"""
