@@ -4,3 +4,4 @@ systemd 管理・ヘルスチェック・省電力制御
 """
 from src.service.healthcheck import HealthChecker
 from src.service.power import GpuPowerManager
+from src.service.idle import IdleManager

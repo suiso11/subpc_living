@@ -32,6 +32,7 @@ from src.persona.profile import UserProfile
 from src.persona.summarizer import ConversationSummarizer
 from src.persona.preloader import SessionPreloader
 from src.persona.proactive import ProactiveEngine
+from src.service.idle import IdleManager
 
 
 class VoicePipeline:
@@ -183,6 +184,9 @@ class VoicePipeline:
                 model_names=wakeword_models,
                 threshold=wakeword_threshold,
             )
+
+        # アイドル管理
+        self.idle_manager = IdleManager()
 
         # 状態
         self._state = self.STATE_IDLE
@@ -351,6 +355,17 @@ class VoicePipeline:
         elif self.enable_wakeword:
             print(f"\n[10/{total_steps}] WakeWord (ウェイクワード検知) スキップ")
 
+        # IdleManager 起動
+        print(f"\n[{total_steps + 1}/{total_steps + 1}] IdleManager (アイドル電力管理) 初期化...")
+        try:
+            self.idle_manager.start(
+                monitor_context=self.monitor_context,
+                vision_context=self.vision_context,
+            )
+            print("✅ IdleManager OK (GPU電力の動的切替有効)")
+        except Exception as e:
+            print(f"⚠️  IdleManager 初期化失敗 (続行): {e}")
+
         print("\n" + "=" * 50)
         print(" ✅ 初期化完了！")
         print("=" * 50)
@@ -420,6 +435,7 @@ class VoicePipeline:
 
         # --- LLM → TTS (ストリーミング) ---
         print("\n🤖 考え中...")
+        self.idle_manager.notify_inference_start()
         self.session.add_user_message(user_text)
         messages = self.session.build_messages()
 
@@ -439,6 +455,8 @@ class VoicePipeline:
             if self.session._messages and self.session._messages[-1]["role"] == "user":
                 self.session._messages.pop()
             return None
+        finally:
+            self.idle_manager.notify_inference_end()
 
         self._state = self.STATE_IDLE
         return response_text
@@ -675,6 +693,7 @@ class VoicePipeline:
     def cleanup(self) -> None:
         """リソースの解放"""
         self._running = False
+        self.idle_manager.stop()
         if self.wakeword_detector is not None:
             self.wakeword_detector.cleanup()
         if self.proactive is not None:

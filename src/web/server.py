@@ -33,6 +33,7 @@ from src.persona.profile import UserProfile
 from src.persona.summarizer import ConversationSummarizer
 from src.persona.preloader import SessionPreloader
 from src.service.healthcheck import HealthChecker
+from src.service.idle import IdleManager
 
 
 # --- グローバル状態 ---
@@ -47,6 +48,7 @@ profile: UserProfile = None
 summarizer: ConversationSummarizer = None
 preloader: SessionPreloader = None
 sessions: dict[str, ChatSession] = {}
+idle_manager: Optional[IdleManager] = None
 
 
 def get_local_ip() -> str:
@@ -64,7 +66,7 @@ def get_local_ip() -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """サーバー起動/終了時の処理"""
-    global config, llm, tts, stt, rag, vision, monitor, profile, summarizer, preloader
+    global config, llm, tts, stt, rag, vision, monitor, profile, summarizer, preloader, idle_manager
 
     print("=" * 50)
     print(" Web UI サーバー起動中...")
@@ -191,6 +193,11 @@ async def lifespan(app: FastAPI):
         summarizer = None
         preloader = None
 
+    # IdleManager 初期化
+    idle_manager = IdleManager()
+    idle_manager.start(monitor_context=monitor, vision_context=vision)
+    print("✅ IdleManager OK (GPU電力の動的切替有効)")
+
     local_ip = get_local_ip()
     print()
     print("=" * 50)
@@ -216,6 +223,9 @@ async def lifespan(app: FastAPI):
         pass
 
     # 終了処理
+    # IdleManager 停止
+    if idle_manager is not None:
+        idle_manager.stop()
     # セッション要約 (Phase 7)
     if summarizer is not None and llm is not None:
         for sid, sess in sessions.items():
@@ -308,6 +318,7 @@ async def health():
         "vision": vision is not None and vision.is_running,
         "monitor": monitor is not None and monitor.is_running,
         "persona": profile is not None,
+        "idle_manager": idle_manager is not None and idle_manager.is_running,
     }
 
     status_code = 200 if result["status"] == "ok" else 503
@@ -333,6 +344,7 @@ async def status():
         "monitor_status": monitor.get_status() if monitor else None,
         "persona": profile is not None,
         "persona_status": preloader.get_status() if preloader else None,
+        "idle_manager": idle_manager.get_status() if idle_manager else None,
     }
 
 
@@ -597,6 +609,16 @@ async def persona_context():
     return {"context": preloader.build_preload_context(), "enabled": True}
 
 
+# --- Idle API ---
+
+@app.get("/api/idle/status")
+async def idle_status():
+    """アイドル管理の状態"""
+    if idle_manager is None:
+        return {"enabled": False}
+    return {"enabled": True, **idle_manager.get_status()}
+
+
 # --- WebSocket チャット ---
 
 def get_or_create_session(session_id: str) -> ChatSession:
@@ -704,6 +726,10 @@ async def websocket_chat(websocket: WebSocket):
             if not user_text:
                 continue
 
+            # アイドル管理: ユーザー操作通知
+            if idle_manager is not None:
+                idle_manager.notify_inference_start()
+
             session = get_or_create_session(session_id)
             session.add_user_message(user_text)
             messages = session.build_messages()
@@ -739,6 +765,10 @@ async def websocket_chat(websocket: WebSocket):
 
                 session.add_assistant_message(full_response)
 
+                # アイドル管理: 推論完了通知
+                if idle_manager is not None:
+                    idle_manager.notify_inference_end()
+
                 await websocket.send_json({
                     "type": "done",
                     "full_text": full_response,
@@ -762,6 +792,9 @@ async def websocket_chat(websocket: WebSocket):
                         })
 
             except Exception as e:
+                # アイドル管理: エラー時も推論完了
+                if idle_manager is not None:
+                    idle_manager.notify_inference_end()
                 await websocket.send_json({
                     "type": "error",
                     "message": str(e),

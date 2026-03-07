@@ -54,6 +54,10 @@ echo ""
 # --- 3. Web UI サーバー起動 (systemd サービス経由) ---
 echo "[3/3] Web UI サーバー確認..."
 
+# SSH/sudo 経由だと D-Bus セッションバスが見つからないため、明示的に設定
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
+
 # サービスが動いていなければ起動
 if ! systemctl --user is-active --quiet subpc-web; then
     echo "  subpc-web サービスを起動中..."

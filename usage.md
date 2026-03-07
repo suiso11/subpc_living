@@ -365,6 +365,7 @@ sudo tailscale serve reset
 | `/api/persona/profile` | POST | プロフィール更新 (`{"name": "...", "note": "..."}`) |
 | `/api/persona/summaries?count=5` | GET | 直近の会話要約一覧 |
 | `/api/persona/context` | GET | プリロードコンテキスト (デバッグ用) |
+| `/api/idle/status` | GET | アイドル管理状態 (state/idle_seconds/gpu_count) |
 | `/ws/chat` | WebSocket | ストリーミングチャット + 音声入力 (トークン単位) |
 
 ### WebSocket メッセージ仕様
@@ -735,6 +736,35 @@ sudo systemctl start subpc-gpu-powersave
 | idle | 100W | アイドル時 (デフォルト) |
 | active | 250W | LLM推論時 (P40 TDP) |
 
+### アイドル管理 (自動省電力)
+
+`IdleManager` がユーザーの操作を追跡し、GPU 電力・Monitor 収集間隔・Vision 解析を自動で動的制御する。音声パイプライン・Web UI サーバーの両方で自動起動される。
+
+#### 状態遷移
+
+| 状態 | 条件 | GPU電力 | 動作 |
+|------|------|---------|------|
+| `active` | 対話中・操作あり | 250W (フルパワー) | 通常動作 |
+| `idle` | 5分間無操作 | 100W (省電力) | GPU電力制限のみ |
+| `deep_idle` | 30分間無操作 | 100W (省電力) | Monitor間隔延長 (120秒)、Vision解析一時停止 |
+
+#### 自動復帰
+
+以下のいずれかが発生すると即座に `active` に復帰:
+
+- **音声パイプライン**: マイク入力検知 (VAD)、ウェイクワード検知
+- **Web UI**: WebSocket メッセージ受信 (テキスト/音声)
+
+LLM 推論開始時に GPU をアクティブモードに自動切替し、推論終了後にアクティビティタイマーをリセットする。
+
+#### API
+
+| エンドポイント | メソッド | 説明 |
+|---------------|---------|------|
+| `/api/idle/status` | GET | アイドル管理状態 (`state`, `idle_seconds`, `gpu_count` 等) |
+
+`/api/health` と `/api/status` にも `idle_manager` フィールドが含まれる。
+
 ### systemd サービス一覧
 
 | サービス名 | 種類 | 説明 |
@@ -930,6 +960,7 @@ subpc_living/
 │   │   └── proactive.py       # プロアクティブ発話エンジン
 │   ├── service/               # Phase 8-9: 常時稼働化 + GPU換装
 │   │   ├── healthcheck.py     # ヘルスチェック (Ollama/ディスク/メモリ)
+│   │   ├── idle.py            # アイドル管理コントローラー (GPU電力/Monitor/Vision自動制御)
 │   │   ├── power.py           # GPU省電力制御 (GPU別プリセット)
 │   │   └── gpu_config.py      # GPU自動検出・デバイス設定 (Phase 9)
 │   └── web/                   # Web UI

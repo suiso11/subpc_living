@@ -69,6 +69,7 @@ class VisionContext:
         self._state_lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self._running = False
+        self._paused = False
         self._last_result: Optional[VisionResult] = None
 
     def start(self) -> bool:
@@ -92,6 +93,14 @@ class VisionContext:
     @property
     def is_running(self) -> bool:
         return self._running and self.camera.is_running
+
+    def pause(self) -> None:
+        """解析を一時停止（カメラは維持）"""
+        self._paused = True
+
+    def resume(self) -> None:
+        """解析を再開"""
+        self._paused = False
 
     def get_state(self) -> VisionState:
         """現在の映像状態を取得 (thread-safe)"""
@@ -173,6 +182,10 @@ class VisionContext:
         time.sleep(0.5)
 
         while self._running:
+            if self._paused:
+                time.sleep(self.analysis_interval)
+                continue
+
             frame = self.camera.get_frame()
             if frame is not None:
                 try:
