@@ -169,10 +169,10 @@ def get_device_config(gpu: Optional[GpuInfo] = None) -> DeviceConfig:
 
             inf_gpu = gpus[inf_idx]
 
-            # STT: 推論GPU + int8 (CTranslate2互換) + mediumモデル
+            # STT: 推論GPU + float16 (Tensor Core活用) + mediumモデル
             config.stt_device = "cuda"
             config.stt_device_index = inf_gpu.index
-            config.stt_compute_type = "int8"
+            config.stt_compute_type = "float16"
             config.stt_model_size = "medium"
 
             # Embedding: 推論GPU

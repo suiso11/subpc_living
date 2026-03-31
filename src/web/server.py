@@ -658,6 +658,7 @@ async def websocket_chat(websocket: WebSocket):
         while True:
             raw = await websocket.receive_text()
             data = json.loads(raw)
+            inference_started = False
 
             msg_type = data.get("type", "")
             if msg_type not in ("message", "audio_message"):
@@ -693,12 +694,20 @@ async def websocket_chat(websocket: WebSocket):
                             None, _decode_wav_bytes, audio_bytes
                         )
 
+                    # アイドル管理: STT前にGPUをアクティブ化
+                    if idle_manager is not None and not inference_started:
+                        idle_manager.notify_inference_start()
+                        inference_started = True
+
                     # STT実行
                     text = await loop.run_in_executor(
                         None, stt.transcribe, audio_array, 16000
                     )
 
                     if not text:
+                        if idle_manager is not None and inference_started:
+                            idle_manager.notify_inference_end()
+                            inference_started = False
                         await websocket.send_json({
                             "type": "stt_result",
                             "text": "",
@@ -717,6 +726,9 @@ async def websocket_chat(websocket: WebSocket):
                     # 以下のチャット処理にフォールスルー
 
                 except Exception as e:
+                    if idle_manager is not None and inference_started:
+                        idle_manager.notify_inference_end()
+                        inference_started = False
                     await websocket.send_json({
                         "type": "error",
                         "message": f"STT error: {e}",
@@ -727,8 +739,9 @@ async def websocket_chat(websocket: WebSocket):
                 continue
 
             # アイドル管理: ユーザー操作通知
-            if idle_manager is not None:
+            if idle_manager is not None and not inference_started:
                 idle_manager.notify_inference_start()
+                inference_started = True
 
             session = get_or_create_session(session_id)
             session.add_user_message(user_text)
@@ -765,10 +778,6 @@ async def websocket_chat(websocket: WebSocket):
 
                 session.add_assistant_message(full_response)
 
-                # アイドル管理: 推論完了通知
-                if idle_manager is not None:
-                    idle_manager.notify_inference_end()
-
                 await websocket.send_json({
                     "type": "done",
                     "full_text": full_response,
@@ -792,9 +801,6 @@ async def websocket_chat(websocket: WebSocket):
                         })
 
             except Exception as e:
-                # アイドル管理: エラー時も推論完了
-                if idle_manager is not None:
-                    idle_manager.notify_inference_end()
                 await websocket.send_json({
                     "type": "error",
                     "message": str(e),
@@ -802,6 +808,10 @@ async def websocket_chat(websocket: WebSocket):
                 # ユーザーメッセージを巻き戻す
                 if session._messages and session._messages[-1]["role"] == "user":
                     session._messages.pop()
+            finally:
+                if idle_manager is not None and inference_started:
+                    idle_manager.notify_inference_end()
+                    inference_started = False
 
     except WebSocketDisconnect:
         pass

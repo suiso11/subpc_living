@@ -425,17 +425,22 @@ class VoicePipeline:
         # --- STT ---
         self._state = self.STATE_PROCESSING
         print("\n🔄 音声認識中...")
-        user_text = self.stt.transcribe(speech_audio)
+        self.idle_manager.notify_inference_start()
+        try:
+            user_text = self.stt.transcribe(speech_audio)
+        except Exception:
+            self.idle_manager.notify_inference_end()
+            raise
 
         if not user_text:
             print("  (音声を認識できませんでした)")
+            self.idle_manager.notify_inference_end()
             return None
 
         print(f"\n👤 あなた: {user_text}")
 
         # --- LLM → TTS (ストリーミング) ---
         print("\n🤖 考え中...")
-        self.idle_manager.notify_inference_start()
         self.session.add_user_message(user_text)
         messages = self.session.build_messages()
 
