@@ -5,6 +5,10 @@ nvidia-smi を使って GPU の電力制限を動的に変更する。
 Phase 9: GPU名を検出して適切なデフォルト値を自動設定。
 Phase 10: マルチGPU対応 (P40 + RTX 2070 Super)
 """
+import json
+import os
+import socket
+import stat
 import subprocess
 import shutil
 from typing import Optional
@@ -24,6 +28,21 @@ GPU_POWER_PRESETS: dict[str, tuple[int, int]] = {
     "RTX 3080":        (100, 320),   # TDP 320W
     "RTX 4090":        (100, 450),   # TDP 450W
 }
+
+DEFAULT_POWERD_SOCKET = os.environ.get("SUBPC_GPU_POWER_SOCKET", "/run/subpc-gpu-powerd.sock")
+
+
+def _is_root() -> bool:
+    """root 権限で動作中か"""
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def _socket_exists(path: str) -> bool:
+    """UNIX ソケットが存在するか"""
+    try:
+        return stat.S_ISSOCK(os.stat(path).st_mode)
+    except OSError:
+        return False
 
 
 def _detect_gpu_preset(gpu_id: int = 0) -> tuple[int, int]:
@@ -89,11 +108,34 @@ class GpuPowerManager:
         self.active_watts = active_watts if active_watts is not None else default_active
         self.gpu_id = gpu_id
         self._nvidia_smi = shutil.which("nvidia-smi")
+        self._power_socket = DEFAULT_POWERD_SOCKET
+        self._power_control_blocked = False
+        self._power_control_message = "ok"
 
     @property
     def available(self) -> bool:
         """nvidia-smi が利用可能か"""
         return self._nvidia_smi is not None
+
+    @property
+    def power_control_available(self) -> bool:
+        """GPU の電力制御を実行できるか"""
+        if not self.available or self._power_control_blocked:
+            return False
+        return _is_root() or _socket_exists(self._power_socket)
+
+    @property
+    def power_control_message(self) -> str:
+        """電力制御不可時の理由"""
+        if not self.available:
+            return "nvidia-smi not found"
+        if self._power_control_blocked:
+            return self._power_control_message
+        if _is_root():
+            return "ok"
+        if _socket_exists(self._power_socket):
+            return f"GPU power daemon 経由 ({self._power_socket})"
+        return f"root/sudo 権限が必要です (または {self._power_socket} を起動)"
 
     def _run_smi(self, args: list[str]) -> tuple[bool, str]:
         """nvidia-smi コマンドを実行する
@@ -117,6 +159,49 @@ class GpuPowerManager:
             return False, "nvidia-smi timeout"
         except Exception as e:
             return False, str(e)
+
+    def _run_powerd(self, payload: dict) -> tuple[bool, str]:
+        """root 側 GPU power daemon に制御要求を送る"""
+        if not _socket_exists(self._power_socket):
+            return False, f"GPU power daemon 未起動 ({self._power_socket})"
+
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(5)
+                sock.connect(self._power_socket)
+                sock.sendall((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
+
+                chunks: list[bytes] = []
+                while True:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    if b"\n" in chunk:
+                        break
+
+            if not chunks:
+                return False, "GPU power daemon から応答がありません"
+
+            raw = b"".join(chunks).decode("utf-8").strip()
+            data = json.loads(raw)
+            ok = bool(data.get("ok"))
+            message = str(data.get("message", ""))
+            return ok, message
+        except Exception as e:
+            self._power_control_blocked = True
+            self._power_control_message = f"GPU power daemon 接続失敗: {e}"
+            return False, self._power_control_message
+
+    def probe_power_control(self) -> tuple[bool, str]:
+        """GPU 電力制御が利用可能かを確認"""
+        if not self.available:
+            return False, "nvidia-smi not found"
+        if _is_root():
+            return True, "ok"
+        if not _socket_exists(self._power_socket):
+            return False, f"GPU power daemon 未起動 ({self._power_socket})"
+        return self._run_powerd({"command": "ping"})
 
     def get_gpu_info(self) -> dict:
         """GPU の現在の情報を取得する
@@ -164,6 +249,15 @@ class GpuPowerManager:
         """
         if not self.available:
             return False, "nvidia-smi not found"
+        if not self.power_control_available:
+            return False, self.power_control_message
+
+        if not _is_root():
+            return self._run_powerd({
+                "command": "set_power_limit",
+                "gpu_id": self.gpu_id,
+                "watts": int(watts),
+            })
 
         ok, output = self._run_smi([
             f"--id={self.gpu_id}",
@@ -172,6 +266,9 @@ class GpuPowerManager:
 
         if ok:
             return True, f"GPU power limit set to {watts}W"
+        if "Insufficient Permissions" in output or "permission" in output.lower():
+            self._power_control_message = "root/sudo 権限が必要です"
+            self._power_control_blocked = True
         return False, output
 
     def set_persistence_mode(self, enable: bool = True) -> tuple[bool, str]:
@@ -182,6 +279,14 @@ class GpuPowerManager:
         """
         if not self.available:
             return False, "nvidia-smi not found"
+        if not self.power_control_available:
+            return False, self.power_control_message
+
+        if not _is_root():
+            return self._run_powerd({
+                "command": "set_persistence_mode",
+                "enable": bool(enable),
+            })
 
         mode = "1" if enable else "0"
         ok, output = self._run_smi([f"--persistence-mode={mode}"])
@@ -204,6 +309,9 @@ class GpuPowerManager:
         info = self.get_gpu_info()
         return {
             "available": self.available,
+            "power_control_available": self.power_control_available,
+            "power_control_message": self.power_control_message,
+            "power_socket": self._power_socket,
             "idle_watts": self.idle_watts,
             "active_watts": self.active_watts,
             "gpu_info": info,

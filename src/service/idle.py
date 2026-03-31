@@ -53,6 +53,8 @@ class IdleManager:
 
         # GPU 電力マネージャー
         self._gpu_managers: list[GpuPowerManager] = []
+        self._gpu_power_control_enabled = False
+        self._gpu_power_control_reason = "GPU なし"
 
         # 外部コンポーネント参照 (任意で設定)
         self._monitor_context = None
@@ -83,6 +85,17 @@ class IdleManager:
         if self._gpu_managers:
             names = [m.get_gpu_info().get("name", f"GPU{m.gpu_id}") for m in self._gpu_managers]
             logger.info(f"IdleManager: GPU電力管理対象: {', '.join(names)}")
+            ok, msg = self._gpu_managers[0].probe_power_control()
+            if ok:
+                self._gpu_power_control_enabled = True
+                self._gpu_power_control_reason = "ok"
+            else:
+                self._gpu_power_control_enabled = False
+                self._gpu_power_control_reason = msg
+                logger.info("IdleManager: GPU電力制御は無効 (%s)", self._gpu_power_control_reason)
+        else:
+            self._gpu_power_control_enabled = False
+            self._gpu_power_control_reason = "nvidia-smi 未検出"
 
         self._running = True
         self._thread = threading.Thread(target=self._check_loop, daemon=True)
@@ -105,6 +118,14 @@ class IdleManager:
     @property
     def is_running(self) -> bool:
         return self._running
+
+    @property
+    def gpu_power_control_enabled(self) -> bool:
+        return self._gpu_power_control_enabled
+
+    @property
+    def gpu_power_control_reason(self) -> str:
+        return self._gpu_power_control_reason
 
     @property
     def idle_seconds(self) -> float:
@@ -205,21 +226,41 @@ class IdleManager:
 
     def _set_gpu_idle(self) -> None:
         """全 GPU をアイドルモードに設定"""
+        if not self._gpu_power_control_enabled:
+            return
         for mgr in self._gpu_managers:
+            if not mgr.power_control_available:
+                continue
             ok, msg = mgr.set_idle_mode()
             if ok:
                 logger.info(f"  GPU{mgr.gpu_id}: idle ({mgr.idle_watts}W)")
             else:
                 logger.warning(f"  GPU{mgr.gpu_id}: idle設定失敗 ({msg})")
+                if (not mgr.power_control_available
+                        or "権限" in msg or "permission" in msg.lower()):
+                    self._gpu_power_control_enabled = False
+                    self._gpu_power_control_reason = msg
+                    logger.info("IdleManager: GPU電力制御を無効化 (%s)", msg)
+                    return
 
     def _set_gpu_active(self) -> None:
         """全 GPU をアクティブモードに設定"""
+        if not self._gpu_power_control_enabled:
+            return
         for mgr in self._gpu_managers:
+            if not mgr.power_control_available:
+                continue
             ok, msg = mgr.set_active_mode()
             if ok:
                 logger.info(f"  GPU{mgr.gpu_id}: active ({mgr.active_watts}W)")
             else:
                 logger.warning(f"  GPU{mgr.gpu_id}: active設定失敗 ({msg})")
+                if (not mgr.power_control_available
+                        or "権限" in msg or "permission" in msg.lower()):
+                    self._gpu_power_control_enabled = False
+                    self._gpu_power_control_reason = msg
+                    logger.info("IdleManager: GPU電力制御を無効化 (%s)", msg)
+                    return
 
     def get_status(self) -> dict:
         """APIレスポンス用の状態辞書"""
@@ -230,4 +271,6 @@ class IdleManager:
             "idle_timeout": self.idle_timeout,
             "deep_idle_timeout": self.deep_idle_timeout,
             "gpu_count": len(self._gpu_managers),
+            "gpu_power_control_enabled": self._gpu_power_control_enabled,
+            "gpu_power_control_reason": self._gpu_power_control_reason,
         }

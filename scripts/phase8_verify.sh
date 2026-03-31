@@ -45,9 +45,11 @@ echo "[プロジェクト構成]"
 check "src/service/__init__.py" "[ -f '${PROJECT_ROOT}/src/service/__init__.py' ]"
 check "src/service/healthcheck.py" "[ -f '${PROJECT_ROOT}/src/service/healthcheck.py' ]"
 check "src/service/power.py" "[ -f '${PROJECT_ROOT}/src/service/power.py' ]"
+check "src/service/gpu_power_daemon.py" "[ -f '${PROJECT_ROOT}/src/service/gpu_power_daemon.py' ]"
 check "scripts/systemd/subpc-web.service" "[ -f '${SCRIPT_DIR}/systemd/subpc-web.service' ]"
 check "scripts/systemd/subpc-voice.service" "[ -f '${SCRIPT_DIR}/systemd/subpc-voice.service' ]"
 check "scripts/systemd/subpc-gpu-powersave.service" "[ -f '${SCRIPT_DIR}/systemd/subpc-gpu-powersave.service' ]"
+check "scripts/systemd/subpc-gpu-powerd@.service" "[ -f '${SCRIPT_DIR}/systemd/subpc-gpu-powerd@.service' ]"
 check "scripts/service_ctl.sh" "[ -f '${SCRIPT_DIR}/service_ctl.sh' ]"
 
 # --- モジュールインポート ---
@@ -55,6 +57,7 @@ echo ""
 echo "[モジュールインポート]"
 check "HealthChecker" "python3 -c \"import sys; sys.path.insert(0, '${PROJECT_ROOT}'); from src.service.healthcheck import HealthChecker\""
 check "GpuPowerManager" "python3 -c \"import sys; sys.path.insert(0, '${PROJECT_ROOT}'); from src.service.power import GpuPowerManager\""
+check "GpuPowerDaemon" "python3 -c \"import sys; sys.path.insert(0, '${PROJECT_ROOT}'); from src.service.gpu_power_daemon import GpuPowerDaemon\""
 check "__init__.py エクスポート" "python3 -c \"import sys; sys.path.insert(0, '${PROJECT_ROOT}'); from src.service import HealthChecker, GpuPowerManager\""
 
 # --- HealthChecker テスト ---
@@ -239,7 +242,7 @@ fi
 echo ""
 echo "[systemd ユニットファイル]"
 
-for SVC_FILE in subpc-web.service subpc-voice.service subpc-gpu-powersave.service; do
+for SVC_FILE in subpc-web.service subpc-voice.service subpc-gpu-powersave.service subpc-gpu-powerd@.service; do
     SVC_PATH="${SCRIPT_DIR}/systemd/${SVC_FILE}"
     echo -n "  ${SVC_FILE} 構文チェック... "
     if systemd-analyze verify --user "$SVC_PATH" > /dev/null 2>&1; then

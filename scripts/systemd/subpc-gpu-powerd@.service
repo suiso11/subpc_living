@@ -1,0 +1,23 @@
+[Unit]
+Description=subpc_living GPU power daemon for %i
+After=nvidia-persistenced.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/%i/ドキュメント/subpc_living
+Environment=PYTHONUNBUFFERED=1
+Environment=SUBPC_GPU_POWER_SOCKET=/run/subpc-gpu-powerd.sock
+
+# root 側で GPU 電力制御を代理実行し、ユーザープロセスは UNIX socket 経由で利用する
+ExecStart=/home/%i/ドキュメント/subpc_living/.venv/bin/python -m src.service.gpu_power_daemon --socket-path /run/subpc-gpu-powerd.sock --socket-group %i --socket-mode 0660 --enable-persistence --initial-mode idle
+
+Restart=on-failure
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=subpc-gpu-powerd
+
+[Install]
+WantedBy=multi-user.target

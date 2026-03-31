@@ -362,7 +362,10 @@ class VoicePipeline:
                 monitor_context=self.monitor_context,
                 vision_context=self.vision_context,
             )
-            print("✅ IdleManager OK (GPU電力の動的切替有効)")
+            if self.idle_manager.gpu_power_control_enabled:
+                print("✅ IdleManager OK (GPU電力の動的切替有効)")
+            else:
+                print(f"✅ IdleManager OK (GPU電力制御は無効: {self.idle_manager.gpu_power_control_reason})")
         except Exception as e:
             print(f"⚠️  IdleManager 初期化失敗 (続行): {e}")
 

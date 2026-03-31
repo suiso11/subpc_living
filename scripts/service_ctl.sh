@@ -10,7 +10,7 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 # ユーザーサービス一覧
 USER_SERVICES=("subpc-web" "subpc-voice")
 # システムサービス一覧
-SYSTEM_SERVICES=("subpc-gpu-powersave")
+SYSTEM_SERVICES=("subpc-gpu-powersave" "subpc-gpu-powerd@${USER}")
 
 COLOR_GREEN="\033[92m"
 COLOR_RED="\033[91m"
@@ -42,6 +42,7 @@ usage() {
     echo "  web        Web UI サーバー (subpc-web)"
     echo "  voice      音声対話パイプライン (subpc-voice)"
     echo "  gpu        GPU 省電力制御 (subpc-gpu-powersave, 要 sudo)"
+    echo "  powerd     GPU 動的電力制御デーモン (subpc-gpu-powerd@${USER}, 要 sudo)"
     echo "  all        全サービス"
     echo ""
     echo "例:"
@@ -57,6 +58,7 @@ resolve_service() {
         web)   echo "subpc-web" ;;
         voice) echo "subpc-voice" ;;
         gpu)   echo "subpc-gpu-powersave" ;;
+        powerd) echo "subpc-gpu-powerd@${USER}" ;;
         *)     echo "$1" ;;
     esac
 }
@@ -134,6 +136,10 @@ cmd_start() {
             echo -e "Starting ${COLOR_CYAN}${svc}${COLOR_RESET}..."
             svc_ctl "$svc" start
         done
+        for svc in "${SYSTEM_SERVICES[@]}"; do
+            echo -e "Starting ${COLOR_CYAN}${svc}${COLOR_RESET}..."
+            svc_ctl "$svc" start
+        done
     else
         local svc
         svc=$(resolve_service "$target")
@@ -146,6 +152,10 @@ cmd_stop() {
     local target="${1:-web}"
     if [ "$target" = "all" ]; then
         for svc in "${USER_SERVICES[@]}"; do
+            echo -e "Stopping ${COLOR_CYAN}${svc}${COLOR_RESET}..."
+            svc_ctl "$svc" stop
+        done
+        for svc in "${SYSTEM_SERVICES[@]}"; do
             echo -e "Stopping ${COLOR_CYAN}${svc}${COLOR_RESET}..."
             svc_ctl "$svc" stop
         done
@@ -164,6 +174,10 @@ cmd_restart() {
             echo -e "Restarting ${COLOR_CYAN}${svc}${COLOR_RESET}..."
             svc_ctl "$svc" restart
         done
+        for svc in "${SYSTEM_SERVICES[@]}"; do
+            echo -e "Restarting ${COLOR_CYAN}${svc}${COLOR_RESET}..."
+            svc_ctl "$svc" restart
+        done
     else
         local svc
         svc=$(resolve_service "$target")
@@ -176,6 +190,10 @@ cmd_enable() {
     local target="${1:-web}"
     if [ "$target" = "all" ]; then
         for svc in "${USER_SERVICES[@]}"; do
+            echo -e "Enabling ${COLOR_CYAN}${svc}${COLOR_RESET}..."
+            svc_ctl "$svc" enable
+        done
+        for svc in "${SYSTEM_SERVICES[@]}"; do
             echo -e "Enabling ${COLOR_CYAN}${svc}${COLOR_RESET}..."
             svc_ctl "$svc" enable
         done
@@ -194,6 +212,10 @@ cmd_disable() {
             echo -e "Disabling ${COLOR_CYAN}${svc}${COLOR_RESET}..."
             svc_ctl "$svc" disable
         done
+        for svc in "${SYSTEM_SERVICES[@]}"; do
+            echo -e "Disabling ${COLOR_CYAN}${svc}${COLOR_RESET}..."
+            svc_ctl "$svc" disable
+        done
     else
         local svc
         svc=$(resolve_service "$target")
@@ -204,7 +226,7 @@ cmd_disable() {
 
 cmd_logs() {
     local target="${1:-web}"
-    shift 2>/dev/null || true
+    shift 1 2>/dev/null || true
     local svc
     svc=$(resolve_service "$target")
 
@@ -227,7 +249,7 @@ cmd_gpu() {
 
 # --- メイン ---
 CMD="${1:-}"
-shift 2>/dev/null || true
+shift 1 2>/dev/null || true
 
 case "$CMD" in
     status)  show_status ;;

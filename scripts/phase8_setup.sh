@@ -107,9 +107,12 @@ if command -v nvidia-smi &>/dev/null; then
     echo "GPU 省電力サービスをインストールするには:"
     echo ""
     echo "  sudo cp ${SCRIPT_DIR}/systemd/subpc-gpu-powersave.service /etc/systemd/system/"
+    echo "  sudo cp ${SCRIPT_DIR}/systemd/subpc-gpu-powerd@.service /etc/systemd/system/"
     echo "  sudo systemctl daemon-reload"
     echo "  sudo systemctl enable subpc-gpu-powersave"
     echo "  sudo systemctl start subpc-gpu-powersave"
+    echo "  sudo systemctl enable subpc-gpu-powerd@${USER}"
+    echo "  sudo systemctl start subpc-gpu-powerd@${USER}"
     echo ""
 else
     echo "nvidia-smi が見つかりません。GPU 省電力は不要です。"

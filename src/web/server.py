@@ -196,7 +196,10 @@ async def lifespan(app: FastAPI):
     # IdleManager 初期化
     idle_manager = IdleManager()
     idle_manager.start(monitor_context=monitor, vision_context=vision)
-    print("✅ IdleManager OK (GPU電力の動的切替有効)")
+    if idle_manager.gpu_power_control_enabled:
+        print("✅ IdleManager OK (GPU電力の動的切替有効)")
+    else:
+        print(f"✅ IdleManager OK (GPU電力制御は無効: {idle_manager.gpu_power_control_reason})")
 
     local_ip = get_local_ip()
     print()

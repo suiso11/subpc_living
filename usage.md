@@ -710,12 +710,12 @@ bash scripts/service_ctl.sh disable web
 | コマンド | 説明 |
 |---------|------|
 | `status` | 全サービスの状態を表示 |
-| `start [web│voice│all]` | サービスを開始 |
-| `stop [web│voice│all]` | サービスを停止 |
-| `restart [web│voice│all]` | サービスを再起動 |
-| `enable [web│voice│all]` | 自動起動を有効化 |
-| `disable [web│voice│all]` | 自動起動を無効化 |
-| `logs [web│voice] [-f]` | ログを表示 |
+| `start [web│voice│powerd│all]` | サービスを開始 |
+| `stop [web│voice│powerd│all]` | サービスを停止 |
+| `restart [web│voice│powerd│all]` | サービスを再起動 |
+| `enable [web│voice│powerd│all]` | 自動起動を有効化 |
+| `disable [web│voice│powerd│all]` | 自動起動を無効化 |
+| `logs [web│voice│powerd] [-f]` | ログを表示 |
 | `health` | ヘルスチェック実行 |
 | `gpu` | GPU 情報表示 |
 
@@ -724,11 +724,17 @@ bash scripts/service_ctl.sh disable web
 nvidia-smi で GPU 電力制限を制御。常時稼働時のアイドル消費電力を抑える。
 
 ```bash
-# システムサービスとしてインストール (root 権限必要)
+# 起動時に idle 電力へ設定する静的サービス (root 権限必要)
 sudo cp scripts/systemd/subpc-gpu-powersave.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable subpc-gpu-powersave
 sudo systemctl start subpc-gpu-powersave
+
+# IdleManager から active / idle を動的切替する root デーモン (推奨)
+sudo cp scripts/systemd/subpc-gpu-powerd@.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable subpc-gpu-powerd@$USER
+sudo systemctl start subpc-gpu-powerd@$USER
 ```
 
 | モード | 電力制限 | 用途 |
@@ -739,6 +745,10 @@ sudo systemctl start subpc-gpu-powersave
 ### アイドル管理 (自動省電力)
 
 `IdleManager` がユーザーの操作を追跡し、GPU 電力・Monitor 収集間隔・Vision 解析を自動で動的制御する。音声パイプライン・Web UI サーバーの両方で自動起動される。
+
+> ℹ️ `active` / `idle` の GPU 電力切替を実際に有効にするには、
+> root 権限で `subpc-gpu-powerd@$USER` を起動する必要があります。
+> 未導入でも Web UI / 音声対話は継続動作し、電力制御のみ無効になります。
 
 #### 状態遷移
 
@@ -771,7 +781,8 @@ LLM 推論開始時に GPU をアクティブモードに自動切替し、推�
 |-------------|------|------|
 | `subpc-web` | ユーザー | Web UI サーバー (Type=notify, Watchdog付き) |
 | `subpc-voice` | ユーザー | 音声対話パイプライン |
-| `subpc-gpu-powersave` | システム | GPU 省電力制御 (oneshot, 要sudo) |
+| `subpc-gpu-powersave` | システム | GPU 省電力制御 (起動時に idle を適用, oneshot, 要sudo) |
+| `subpc-gpu-powerd@$USER` | システム | GPU 動的電力制御デーモン (`IdleManager` 用, 要sudo) |
 
 ---
 
