@@ -9,14 +9,14 @@ import json
 import queue
 import threading
 
-# Qwen3.5 の <think>...</think> 思考ブロックを除去するパターン
+# モデルが返す <think>...</think> 思考ブロックを除去するパターン
 _THINK_PATTERN = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
 
 
 class OllamaClient:
     """Ollama APIクライアント"""
 
-    def __init__(self, base_url: str = "http://localhost:11434", model: str = "qwen3.5:27b"):
+    def __init__(self, base_url: str = "http://localhost:11434", model: str = "qwen2.5:7b-instruct-q4_K_M"):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self._client = httpx.Client(base_url=self.base_url, timeout=300.0)
@@ -42,18 +42,49 @@ class OllamaClient:
         """指定モデルが存在するか確認"""
         model = model or self.model
         models = self.list_models()
-        return any(model in m or m in model for m in models)
+        if not models:
+            return False
+
+        if model in models:
+            return True
+
+        # タグ省略時のみ、同名ベースモデルの :latest を許可する。
+        if ":" not in model:
+            return f"{model}:latest" in models
+
+        return False
 
     @staticmethod
     def _strip_think(text: str) -> str:
-        """Qwen3.5 の思考トークン <think>...</think> を除去"""
+        """思考トークン <think>...</think> を除去"""
         return _THINK_PATTERN.sub("", text).strip()
+
+    @staticmethod
+    def _build_options(
+        *,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        repeat_penalty: float,
+        num_ctx: int,
+    ) -> dict:
+        """Ollama options を統一的に組み立てる"""
+        return {
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "repeat_penalty": repeat_penalty,
+            "num_ctx": num_ctx,
+        }
 
     def generate(
         self,
         messages: list[dict],
         *,
         temperature: float = 0.7,
+        top_p: float = 0.9,
+        top_k: int = 40,
+        repeat_penalty: float = 1.1,
         num_ctx: int = 8192,
     ) -> str:
         """非ストリーミングでチャット応答を生成"""
@@ -63,10 +94,13 @@ class OllamaClient:
             "stream": False,
             "keep_alive": -1,
             "think": False,
-            "options": {
-                "temperature": temperature,
-                "num_ctx": num_ctx,
-            },
+            "options": self._build_options(
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                repeat_penalty=repeat_penalty,
+                num_ctx=num_ctx,
+            ),
         }
         resp = self._client.post("/api/chat", json=payload)
         resp.raise_for_status()
@@ -78,6 +112,9 @@ class OllamaClient:
         messages: list[dict],
         *,
         temperature: float = 0.7,
+        top_p: float = 0.9,
+        top_k: int = 40,
+        repeat_penalty: float = 1.1,
         num_ctx: int = 8192,
     ) -> Generator[str, None, None]:
         """ストリーミングでチャット応答を生成（トークン単位で返す）
@@ -90,10 +127,13 @@ class OllamaClient:
             "stream": True,
             "keep_alive": -1,
             "think": False,
-            "options": {
-                "temperature": temperature,
-                "num_ctx": num_ctx,
-            },
+            "options": self._build_options(
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                repeat_penalty=repeat_penalty,
+                num_ctx=num_ctx,
+            ),
         }
 
         in_think = False
@@ -147,6 +187,9 @@ class OllamaClient:
         messages: list[dict],
         *,
         temperature: float = 0.7,
+        top_p: float = 0.9,
+        top_k: int = 40,
+        repeat_penalty: float = 1.1,
         num_ctx: int = 8192,
     ) -> queue.Queue:
         """スレッドセーフなキューベースのストリーミング。
@@ -161,7 +204,12 @@ class OllamaClient:
         def _worker():
             try:
                 for token in self.generate_stream(
-                    messages, temperature=temperature, num_ctx=num_ctx,
+                    messages,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    repeat_penalty=repeat_penalty,
+                    num_ctx=num_ctx,
                 ):
                     q.put(token)
             except Exception as e:

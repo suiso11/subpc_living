@@ -51,6 +51,7 @@ class ChatSession:
     def add_assistant_message(self, content: str) -> None:
         """アシスタントの応答を追加（RAG有効時はベクトルDBにも保存）"""
         self._messages.append({"role": "assistant", "content": content})
+        self._trim_history()
 
         # RAG: 直前のuser+assistantをベクトルDBに保存
         if self.rag is not None and len(self._messages) >= 2:
@@ -111,11 +112,24 @@ class ChatSession:
         return messages
 
     def _trim_history(self) -> None:
-        """履歴をmax_history_turnsに収める（古いものから削除）"""
-        # 1ターン = user + assistant の2メッセージ
-        max_messages = self.max_history_turns * 2
-        if len(self._messages) > max_messages:
-            self._messages = self._messages[-max_messages:]
+        """履歴をターン単位で max_history_turns に収める"""
+        if self.max_history_turns <= 0:
+            self._messages.clear()
+            return
+
+        # 以前の不整合で先頭に assistant が来ている履歴を補正する。
+        while self._messages and self._messages[0]["role"] != "user":
+            self._messages.pop(0)
+
+        while sum(1 for m in self._messages if m["role"] == "user") > self.max_history_turns:
+            if not self._messages:
+                break
+
+            if self._messages[0]["role"] == "user":
+                self._messages.pop(0)
+
+            if self._messages and self._messages[0]["role"] == "assistant":
+                self._messages.pop(0)
 
     @property
     def turn_count(self) -> int:

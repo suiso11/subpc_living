@@ -759,6 +759,9 @@ async def websocket_chat(websocket: WebSocket):
                 token_queue = llm.generate_stream_queue(
                     messages,
                     temperature=config.temperature,
+                    top_p=config.top_p,
+                    top_k=config.top_k,
+                    repeat_penalty=config.repeat_penalty,
                     num_ctx=config.num_ctx,
                 )
 
