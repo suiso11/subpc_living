@@ -65,7 +65,15 @@ class EmbeddingModel:
         kwargs = {"device": self.device}
         if self.cache_dir:
             kwargs["cache_folder"] = self.cache_dir
-        self._model = SentenceTransformer(self.model_name, **kwargs)
+        try:
+            self._model = SentenceTransformer(self.model_name, **kwargs)
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
+                print(f"[Embedding] ⚠️  GPU ロード失敗 (OOM)、CPU にフォールバック: {e}")
+                self._model = SentenceTransformer(self.model_name, device="cpu")
+                self.device = "cpu"
+            else:
+                raise
         elapsed = time.time() - start
         dim = self._model.get_sentence_embedding_dimension()
         print(f"[Embedding] モデルロード完了 ({elapsed:.1f}秒, {dim}次元)")

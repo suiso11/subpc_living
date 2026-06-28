@@ -31,6 +31,7 @@ class GpuInfo:
     driver_version: str = ""
     index: int = 0
     compute_capability: str = ""
+    torch_compatible: bool = True
 
 
 @dataclass
@@ -85,17 +86,37 @@ def detect_all_gpus() -> list[GpuInfo]:
             return []
 
         gpus = []
-        # CUDA利用可能かチェック (1回だけ)
         cuda_available = False
+        torch_supported_caps: list[tuple[int, int]] = []
         try:
             import torch
             cuda_available = torch.cuda.is_available()
+            if cuda_available and hasattr(torch.cuda, 'get_arch_list'):
+                for arch in torch.cuda.get_arch_list():
+                    if arch.startswith("sm_"):
+                        try:
+                            num = int(arch[3:])
+                            torch_supported_caps.append((num // 10, num % 10))
+                        except ValueError:
+                            pass
         except ImportError:
-            cuda_available = True  # nvidia-smiがあればCUDA利用可能と推定
+            cuda_available = True
+        except Exception:
+            pass
 
         for line in result.stdout.strip().splitlines():
             parts = [p.strip() for p in line.split(",")]
             if len(parts) >= 4:
+                compute_cap = parts[4] if len(parts) >= 5 else ""
+                torch_ok = True
+                if compute_cap and cuda_available and torch_supported_caps:
+                    try:
+                        major, minor = map(int, compute_cap.split("."))
+                        if (major, minor) not in torch_supported_caps:
+                            torch_ok = False
+                    except (ValueError, TypeError):
+                        pass
+
                 info = GpuInfo(
                     available=True,
                     index=int(parts[0]),
@@ -103,8 +124,9 @@ def detect_all_gpus() -> list[GpuInfo]:
                     vram_mb=int(float(parts[2])),
                     vram_gb=round(int(float(parts[2])) / 1024, 1),
                     driver_version=parts[3],
-                    compute_capability=parts[4] if len(parts) >= 5 else "",
+                    compute_capability=compute_cap,
                     cuda_available=cuda_available,
+                    torch_compatible=torch_ok,
                 )
                 gpus.append(info)
 
@@ -146,6 +168,8 @@ def get_device_config(gpu: Optional[GpuInfo] = None) -> DeviceConfig:
     if not gpus or not any(g.cuda_available for g in gpus):
         return DeviceConfig(profile="cpu")
 
+    torch_gpus = [g for g in gpus if g.torch_compatible]
+
     config = DeviceConfig(
         gpu=gpus[0],
         gpus=gpus,
@@ -175,8 +199,8 @@ def get_device_config(gpu: Optional[GpuInfo] = None) -> DeviceConfig:
             config.stt_compute_type = "float16"
             config.stt_model_size = "medium"
 
-            # Embedding: 推論GPU
-            config.embedding_device = f"cuda:{inf_gpu.index}"
+            # Embedding: 推論GPU (PyTorch非対応ならCPU)
+            config.embedding_device = f"cuda:{inf_gpu.index}" if inf_gpu.torch_compatible else "cpu"
 
             # Vision ONNX: 推論GPU (device_id指定)
             config.onnx_providers = [
@@ -209,7 +233,7 @@ def get_device_config(gpu: Optional[GpuInfo] = None) -> DeviceConfig:
         config.stt_compute_type = "float16"
         config.stt_model_size = "medium"
 
-        config.embedding_device = f"cuda:{inf_gpu.index}"
+        config.embedding_device = f"cuda:{inf_gpu.index}" if inf_gpu.torch_compatible else "cpu"
 
         config.onnx_providers = [
             ("CUDAExecutionProvider", {"device_id": str(inf_gpu.index)}),
@@ -235,7 +259,7 @@ def get_device_config(gpu: Optional[GpuInfo] = None) -> DeviceConfig:
         config.stt_compute_type = "float16"
         config.stt_model_size = "medium"
 
-        config.embedding_device = f"cuda:{gpu.index}"
+        config.embedding_device = f"cuda:{gpu.index}" if gpu.torch_compatible else "cpu"
 
         config.onnx_providers = [
             ("CUDAExecutionProvider", {"device_id": str(gpu.index)}),

@@ -16,15 +16,54 @@ from typing import Optional
 _MAX_CHUNK_CHARS = 50
 _SENTENCE_SPLIT = re.compile(r'(?<=[。！？、\n.!?,])')
 
+# 絵文字・特殊文字のパターン
+_EMOJI_PATTERN = re.compile(
+    r'[\U0001F600-\U0001F64F'  # Emoticons
+    r'\U0001F300-\U0001F5FF'   # Misc Symbols and Pictographs
+    r'\U0001F680-\U0001F6FF'   # Transport and Map
+    r'\U0001F1E0-\U0001F1FF'   # Flags
+    r'\U00002702-\U000027B0'   # Dingbats
+    r'\U0001F900-\U0001F9FF'   # Supplemental Symbols and Pictographs
+    r'\U0001FA00-\U0001FA6F'   # Chess Symbols
+    r'\U0001FA70-\U0001FAFF'   # Symbols and Pictographs Extended-A
+    r'\U00002600-\U000026FF'   # Misc symbols
+    r'\U0000FE00-\U0000FE0F'   # Variation Selectors
+    r'\U0000200D'              # Zero Width Joiner
+    r'\U000020E3'              # Combining Enclosing Keycap
+    r']+'
+)
+
+# 一般的な絵文字（頻出するもの）
+_COMMON_EMOJI = re.compile(r'[✅❌⚠️🔊🎤🔄👤🤖💬✨🎙️ℹ️🔥💡🎯🚀⭐🌟💫🎵🎶🎨📚💻🔧⚙️🛠️📱📞☎️📧✉️🔔🔕🔈🔉🔊🔇🎵🎶]+')
+
+
+def _clean_text(text: str) -> str:
+    """TTS用にテキストをクリーニング（絵文字・特殊文字除去）"""
+    # 絵文字を除去
+    text = _EMOJI_PATTERN.sub('', text)
+    text = _COMMON_EMOJI.sub('', text)
+    # 特殊記号を除去
+    text = re.sub(r'[★☆◆◇●○▲△▼▽■□□■♦♢♣♠♥]', '', text)
+    # 空白を正規化
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
 
 def _split_text(text: str, max_chars: int = _MAX_CHUNK_CHARS) -> list[str]:
     """テキストを文単位で分割し、音素上限を超えないチャンクにまとめる"""
+    # テキストをクリーニング（絵文字除去）
+    text = _clean_text(text)
+
+    if not text:
+        return []
+
     sentences = _SENTENCE_SPLIT.split(text)
     sentences = [s.strip() for s in sentences if s.strip()]
 
     if not sentences:
         return [text] if text.strip() else []
 
+    # 短い文は max_chars まで結合して、kokoro-onnx の呼び出し回数を抑える。
     chunks = []
     current = ""
     for sent in sentences:

@@ -119,19 +119,30 @@ class FaceDetector:
 
 def _detect_onnx_providers() -> list:
     """利用可能な ONNX Runtime プロバイダーを検出する (Phase 10: デュアルGPU対応)"""
-    # gpu_config が利用可能な場合はそちらのデバイス割り当てに従う
-    try:
-        from src.service.gpu_config import resolve_onnx_providers
-        return resolve_onnx_providers()
-    except ImportError:
-        pass
-
     if not HAS_ORT:
         return ["CPUExecutionProvider"]
+
     available = ort.get_available_providers()
-    if "CUDAExecutionProvider" in available:
-        return ["CUDAExecutionProvider", "CPUExecutionProvider"]
-    return ["CPUExecutionProvider"]
+
+    try:
+        from src.service.gpu_config import resolve_onnx_providers
+        requested = resolve_onnx_providers()
+    except ImportError:
+        requested = None
+
+    if requested is None:
+        if "CUDAExecutionProvider" in available:
+            return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        return ["CPUExecutionProvider"]
+
+    filtered = []
+    for p in requested:
+        name = p[0] if isinstance(p, tuple) else p
+        if name in available:
+            filtered.append(p)
+    if not filtered or all((p[0] if isinstance(p, tuple) else p) == "CPUExecutionProvider" for p in filtered):
+        filtered = ["CPUExecutionProvider"]
+    return filtered
 
 
 class EmotionDetector:
@@ -164,7 +175,9 @@ class EmotionDetector:
         input_shape = self._session.get_inputs()[0].shape
         self._input_h = input_shape[2] if len(input_shape) == 4 else 64
         self._input_w = input_shape[3] if len(input_shape) == 4 else 64
-        provider_str = ", ".join(providers)
+        provider_str = ", ".join(
+            p[0] if isinstance(p, tuple) else p for p in providers
+        )
         print(f"  感情推定: emotion-ferplus ONNX ({provider_str})")
 
     def detect(self, face_image: np.ndarray) -> tuple[str, float, dict]:
@@ -272,8 +285,11 @@ class VisionAnalyzer:
                         face_info.emotion_ja = EMOTION_JA.get(emotion, "不明")
                         face_info.emotion_confidence = confidence
                         face_info.emotion_scores = scores
-                    except Exception:
-                        pass  # 感情推定失敗は無視
+                    except Exception as e:
+                        # 初回のみ警告表示。連続失敗によるログ氾濫を避ける
+                        if not getattr(self, "_emotion_warned", False):
+                            print(f"⚠️  感情推定失敗 (以降サイレント): {e}")
+                            self._emotion_warned = True
 
             result.faces.append(face_info)
 

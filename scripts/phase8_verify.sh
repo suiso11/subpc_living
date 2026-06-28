@@ -48,6 +48,7 @@ check "src/service/power.py" "[ -f '${PROJECT_ROOT}/src/service/power.py' ]"
 check "src/service/gpu_power_daemon.py" "[ -f '${PROJECT_ROOT}/src/service/gpu_power_daemon.py' ]"
 check "scripts/systemd/subpc-web.service" "[ -f '${SCRIPT_DIR}/systemd/subpc-web.service' ]"
 check "scripts/systemd/subpc-voice.service" "[ -f '${SCRIPT_DIR}/systemd/subpc-voice.service' ]"
+check "scripts/systemd/subpc-discord.service" "[ -f '${SCRIPT_DIR}/systemd/subpc-discord.service' ]"
 check "scripts/systemd/subpc-gpu-powersave.service" "[ -f '${SCRIPT_DIR}/systemd/subpc-gpu-powersave.service' ]"
 check "scripts/systemd/subpc-gpu-powerd@.service" "[ -f '${SCRIPT_DIR}/systemd/subpc-gpu-powerd@.service' ]"
 check "scripts/service_ctl.sh" "[ -f '${SCRIPT_DIR}/service_ctl.sh' ]"
@@ -242,7 +243,7 @@ fi
 echo ""
 echo "[systemd ユニットファイル]"
 
-for SVC_FILE in subpc-web.service subpc-voice.service subpc-gpu-powersave.service subpc-gpu-powerd@.service; do
+for SVC_FILE in subpc-web.service subpc-voice.service subpc-discord.service subpc-gpu-powersave.service subpc-gpu-powerd@.service; do
     SVC_PATH="${SCRIPT_DIR}/systemd/${SVC_FILE}"
     echo -n "  ${SVC_FILE} 構文チェック... "
     if systemd-analyze verify --user "$SVC_PATH" > /dev/null 2>&1; then
@@ -269,7 +270,7 @@ echo ""
 echo "[ユニットインストール状況]"
 
 SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
-for SVC_FILE in subpc-web.service subpc-voice.service; do
+for SVC_FILE in subpc-web.service subpc-voice.service subpc-discord.service; do
     DEST="${SYSTEMD_USER_DIR}/${SVC_FILE}"
     if [ -L "$DEST" ] || [ -f "$DEST" ]; then
         check "${SVC_FILE} インストール済み" "true"

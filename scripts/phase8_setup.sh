@@ -67,7 +67,7 @@ mkdir -p "$SYSTEMD_USER_DIR"
 echo "✅ ${SYSTEMD_USER_DIR} ディレクトリ確認"
 
 # パスの事前置換: %h を実際のパスに展開したユニットファイルを生成
-for SVC_FILE in subpc-web.service subpc-voice.service; do
+for SVC_FILE in subpc-web.service subpc-voice.service subpc-discord.service; do
     SRC="${SCRIPT_DIR}/systemd/${SVC_FILE}"
     DEST="${SYSTEMD_USER_DIR}/${SVC_FILE}"
     if [ -f "$SRC" ]; then

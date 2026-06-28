@@ -9,6 +9,8 @@ build/
 
 # データ（個人データはgitに含めない）
 data/
+.env
+config/discord.env
 
 # モデル・バイナリ（サイズが大きいためgit管理外）
 models/

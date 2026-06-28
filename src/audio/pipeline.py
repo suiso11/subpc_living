@@ -67,7 +67,7 @@ class VoicePipeline:
 
         # STT (faster-whisper) — Phase 9: device="auto" でGPU自動検出
         self.stt = WhisperSTT(
-            model_size=stt_model if stt_model != "small" else "auto",
+            model_size=stt_model,
             language="ja",
         )
 
@@ -428,7 +428,7 @@ class VoicePipeline:
         # --- STT ---
         self._state = self.STATE_PROCESSING
         print("\n🔄 音声認識中...")
-        self.idle_manager.notify_inference_start()
+        self.idle_manager.notify_inference_start(wait_for_gpu=True)
         try:
             user_text = self.stt.transcribe(speech_audio)
         except Exception:
@@ -482,7 +482,6 @@ class VoicePipeline:
         played_sentences: list[str] = []
 
         # TTS再生ワーカースレッド
-        self._tts_stop = False
         tts_thread = threading.Thread(target=self._tts_worker, daemon=True)
         tts_thread.start()
 
@@ -531,8 +530,6 @@ class VoicePipeline:
         while True:
             text = self._tts_queue.get()
             if text is None:
-                break
-            if self._tts_stop:
                 break
 
             self._state = self.STATE_SPEAKING
@@ -649,11 +646,7 @@ class VoicePipeline:
 
         with stream:
             while self._running and detected_word is None:
-                try:
-                    import time
-                    time.sleep(0.05)  # 50ms ポーリング
-                except KeyboardInterrupt:
-                    raise
+                time.sleep(0.05)  # 50ms ポーリング
 
         return detected_word
 

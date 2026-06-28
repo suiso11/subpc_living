@@ -699,7 +699,7 @@ async def websocket_chat(websocket: WebSocket):
 
                     # アイドル管理: STT前にGPUをアクティブ化
                     if idle_manager is not None and not inference_started:
-                        idle_manager.notify_inference_start()
+                        idle_manager.notify_inference_start(wait_for_gpu=True)
                         inference_started = True
 
                     # STT実行

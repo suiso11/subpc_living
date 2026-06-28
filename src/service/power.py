@@ -161,7 +161,11 @@ class GpuPowerManager:
             return False, str(e)
 
     def _run_powerd(self, payload: dict) -> tuple[bool, str]:
-        """root 側 GPU power daemon に制御要求を送る"""
+        """root 側 GPU power daemon に制御要求を送る
+
+        一時的なソケットエラー (daemon 再起動中など) では恒久無効化しない。
+        次回呼び出しで再試行可能にする。
+        """
         if not _socket_exists(self._power_socket):
             return False, f"GPU power daemon 未起動 ({self._power_socket})"
 
@@ -187,11 +191,14 @@ class GpuPowerManager:
             data = json.loads(raw)
             ok = bool(data.get("ok"))
             message = str(data.get("message", ""))
+            # daemon 側の明示的な権限エラーのみ恒久ブロック扱いにする
+            if not ok and ("Insufficient Permissions" in message or "権限" in message):
+                self._power_control_blocked = True
+                self._power_control_message = message
             return ok, message
         except Exception as e:
-            self._power_control_blocked = True
-            self._power_control_message = f"GPU power daemon 接続失敗: {e}"
-            return False, self._power_control_message
+            # 一時エラーとして扱う。恒久無効化せず次回再試行可能に
+            return False, f"GPU power daemon 接続失敗: {e}"
 
     def probe_power_control(self) -> tuple[bool, str]:
         """GPU 電力制御が利用可能かを確認"""

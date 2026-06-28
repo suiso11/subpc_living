@@ -666,6 +666,29 @@ python src/audio/main.py --no-persona
 
 systemd で Web UI・音声対話をサービスとして管理。自動再起動・GPU省電力制御を統合。
 
+Discord を操作コンソールにする場合は、`config/discord.env.example` を参考に
+`config/discord.env` を作成し、`DISCORD_BOT_TOKEN` を設定する。
+
+Discord 側の slash command:
+
+| コマンド | 説明 |
+|---------|------|
+| `/ask` | LLM に質問し、チャンネル単位の会話履歴で応答 |
+| `/tts` | テキストを kokoro-onnx で WAV 化して添付 |
+| `/status` | Ollama・モデル・ヘルスチェック状態を表示 |
+| `/service` | `status` / `logs` / `health` / `gpu` / 許可時のみ `start` `stop` `restart` |
+| `/reset` | そのチャンネルの会話履歴をリセット |
+
+`DISCORD_AUTO_REPLY_CHANNEL_IDS` を設定したチャンネルでは、slash command なしで
+通常投稿されたテキストすべてに LLM が返信する。未設定の場合は
+`DISCORD_ALLOWED_CHANNEL_IDS` が自動返信対象として使われる。
+この機能には Discord Developer Portal の Bot 設定で
+**Message Content Intent** を有効化する必要がある。
+
+`/service start|stop|restart` は `DISCORD_ALLOW_SERVICE_CONTROL=true` の場合のみ有効。
+外部サーバーに bot を入れる場合は `DISCORD_ALLOWED_USER_IDS` か
+`DISCORD_ALLOWED_CHANNEL_IDS` を設定して操作範囲を制限する。
+
 ### サービス管理 (service_ctl.sh)
 
 ```bash
@@ -677,6 +700,9 @@ bash scripts/service_ctl.sh start web
 
 # 音声対話をサービスとして起動
 bash scripts/service_ctl.sh start voice
+
+# Discord 操作コンソールを起動
+bash scripts/service_ctl.sh start discord
 
 # 全サービス起動
 bash scripts/service_ctl.sh start all
@@ -700,6 +726,7 @@ bash scripts/service_ctl.sh gpu
 # 自動起動を有効化
 bash scripts/service_ctl.sh enable web
 bash scripts/service_ctl.sh enable voice
+bash scripts/service_ctl.sh enable discord
 
 # 自動起動を無効化
 bash scripts/service_ctl.sh disable web
@@ -710,12 +737,12 @@ bash scripts/service_ctl.sh disable web
 | コマンド | 説明 |
 |---------|------|
 | `status` | 全サービスの状態を表示 |
-| `start [web│voice│powerd│all]` | サービスを開始 |
-| `stop [web│voice│powerd│all]` | サービスを停止 |
-| `restart [web│voice│powerd│all]` | サービスを再起動 |
-| `enable [web│voice│powerd│all]` | 自動起動を有効化 |
-| `disable [web│voice│powerd│all]` | 自動起動を無効化 |
-| `logs [web│voice│powerd] [-f]` | ログを表示 |
+| `start [web│voice│discord│powerd│all]` | サービスを開始 |
+| `stop [web│voice│discord│powerd│all]` | サービスを停止 |
+| `restart [web│voice│discord│powerd│all]` | サービスを再起動 |
+| `enable [web│voice│discord│powerd│all]` | 自動起動を有効化 |
+| `disable [web│voice│discord│powerd│all]` | 自動起動を無効化 |
+| `logs [web│voice│discord│powerd] [-f]` | ログを表示 |
 | `health` | ヘルスチェック実行 |
 | `gpu` | GPU 情報表示 |
 
@@ -781,6 +808,7 @@ LLM 推論開始時に GPU をアクティブモードに自動切替し、推�
 |-------------|------|------|
 | `subpc-web` | ユーザー | Web UI サーバー (Type=notify, Watchdog付き) |
 | `subpc-voice` | ユーザー | 音声対話パイプライン |
+| `subpc-discord` | ユーザー | Discord 操作コンソール |
 | `subpc-gpu-powersave` | システム | GPU 省電力制御 (起動時に idle を適用, oneshot, 要sudo) |
 | `subpc-gpu-powerd@$USER` | システム | GPU 動的電力制御デーモン (`IdleManager` 用, 要sudo) |
 

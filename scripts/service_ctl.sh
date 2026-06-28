@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 # ユーザーサービス一覧
-USER_SERVICES=("subpc-web" "subpc-voice")
+USER_SERVICES=("subpc-web" "subpc-voice" "subpc-discord")
 # システムサービス一覧
 SYSTEM_SERVICES=("subpc-gpu-powersave" "subpc-gpu-powerd@${USER}")
 
@@ -41,6 +41,7 @@ usage() {
     echo "サービス名:"
     echo "  web        Web UI サーバー (subpc-web)"
     echo "  voice      音声対話パイプライン (subpc-voice)"
+    echo "  discord    Discord 操作コンソール (subpc-discord)"
     echo "  gpu        GPU 省電力制御 (subpc-gpu-powersave, 要 sudo)"
     echo "  powerd     GPU 動的電力制御デーモン (subpc-gpu-powerd@${USER}, 要 sudo)"
     echo "  all        全サービス"
@@ -57,6 +58,7 @@ resolve_service() {
     case "$1" in
         web)   echo "subpc-web" ;;
         voice) echo "subpc-voice" ;;
+        discord) echo "subpc-discord" ;;
         gpu)   echo "subpc-gpu-powersave" ;;
         powerd) echo "subpc-gpu-powerd@${USER}" ;;
         *)     echo "$1" ;;
@@ -86,9 +88,11 @@ show_status() {
     echo -e "${COLOR_CYAN}${COLOR_BOLD}=== ユーザーサービス ===${COLOR_RESET}"
     for svc in "${USER_SERVICES[@]}"; do
         local state
-        state=$(systemctl --user is-active "$svc" 2>/dev/null || echo "unknown")
+        state=$(systemctl --user is-active "$svc" 2>/dev/null)
+        state=${state:-unknown}
         local enabled
-        enabled=$(systemctl --user is-enabled "$svc" 2>/dev/null || echo "unknown")
+        enabled=$(systemctl --user is-enabled "$svc" 2>/dev/null)
+        enabled=${enabled:-unknown}
         local icon
         case "$state" in
             active)   icon="${COLOR_GREEN}● active${COLOR_RESET}" ;;
@@ -103,9 +107,11 @@ show_status() {
     echo -e "${COLOR_CYAN}${COLOR_BOLD}=== システムサービス ===${COLOR_RESET}"
     for svc in "${SYSTEM_SERVICES[@]}"; do
         local state
-        state=$(systemctl is-active "$svc" 2>/dev/null || echo "unknown")
+        state=$(systemctl is-active "$svc" 2>/dev/null)
+        state=${state:-unknown}
         local enabled
-        enabled=$(systemctl is-enabled "$svc" 2>/dev/null || echo "unknown")
+        enabled=$(systemctl is-enabled "$svc" 2>/dev/null)
+        enabled=${enabled:-unknown}
         local icon
         case "$state" in
             active)   icon="${COLOR_GREEN}● active${COLOR_RESET}" ;;
@@ -119,7 +125,8 @@ show_status() {
     echo ""
     echo -e "${COLOR_CYAN}${COLOR_BOLD}=== 関連サービス ===${COLOR_RESET}"
     local ollama_state
-    ollama_state=$(systemctl is-active ollama 2>/dev/null || echo "unknown")
+    ollama_state=$(systemctl is-active ollama 2>/dev/null)
+    ollama_state=${ollama_state:-unknown}
     local ollama_icon
     case "$ollama_state" in
         active) ollama_icon="${COLOR_GREEN}● active${COLOR_RESET}" ;;
