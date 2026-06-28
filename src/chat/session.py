@@ -34,6 +34,7 @@ class ChatSession:
     def add_assistant_message(self, content: str) -> None:
         """アシスタントの応答を追加"""
         self._messages.append({"role": "assistant", "content": content})
+        self._trim_history()
 
     def build_messages(self) -> list[dict]:
         """Ollama APIに渡すメッセージリストを構築"""
