@@ -36,6 +36,13 @@ class ChatConfig:
     max_history_turns: int = 20  # 保持する会話ターン数の上限
     history_dir: str = "data/chat_history"  # 履歴保存ディレクトリ
 
+    # --- Web検索設定 ---
+    web_search_enabled: bool = False  # 最新情報が必要そうな時にWeb検索する
+    web_search_auto: bool = True  # True: 必要そうな発話だけ自動検索
+    web_search_max_results: int = 4
+    web_search_timeout_sec: float = 8.0
+    web_search_cache_path: str = ""  # 空なら永続キャッシュしない
+
     # --- 表示設定 ---
     stream: bool = True  # ストリーミング出力を使用するか
 

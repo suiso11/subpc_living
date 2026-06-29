@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from src.vision.context import VisionContext
     from src.monitor.context import MonitorContext
     from src.persona.preloader import SessionPreloader
+    from src.chat.web_search import WebSearchContext
 
 
 class ChatSession:
@@ -29,6 +30,7 @@ class ChatSession:
         vision_context: Optional["VisionContext"] = None,
         monitor_context: Optional["MonitorContext"] = None,
         preloader: Optional["SessionPreloader"] = None,
+        web_search: Optional["WebSearchContext"] = None,
     ):
         self.system_prompt = system_prompt
         self.max_history_turns = max_history_turns
@@ -42,6 +44,7 @@ class ChatSession:
         self.vision_context = vision_context
         self.monitor_context = monitor_context
         self.preloader = preloader
+        self.web_search = web_search
 
     def add_user_message(self, content: str) -> None:
         """ユーザーのメッセージを追加"""
@@ -92,6 +95,17 @@ class ChatSession:
                 rag_context = self.rag.build_context_prompt(last_user)
                 if rag_context:
                     system_content = system_content + rag_context
+
+        if self.web_search is not None and self._messages:
+            last_user = None
+            for msg in reversed(self._messages):
+                if msg["role"] == "user":
+                    last_user = msg["content"]
+                    break
+            if last_user:
+                web_context = self.web_search.build_context_prompt(last_user)
+                if web_context:
+                    system_content = system_content + web_context
 
         # Vision: カメラ映像の現在の状態を注入
         if self.vision_context is not None:

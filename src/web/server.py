@@ -23,6 +23,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from src.chat.client import OllamaClient
 from src.chat.session import ChatSession
 from src.chat.config import ChatConfig
+from src.chat.web_search import WebSearchContext, create_web_search_context
 from src.audio.tts import KokoroTTS
 from src.audio.stt import WhisperSTT
 from src.memory.vectorstore import VectorStore
@@ -47,6 +48,7 @@ monitor: MonitorContext = None
 profile: UserProfile = None
 summarizer: ConversationSummarizer = None
 preloader: SessionPreloader = None
+web_search: Optional[WebSearchContext] = None
 sessions: dict[str, ChatSession] = {}
 idle_manager: Optional[IdleManager] = None
 
@@ -66,7 +68,7 @@ def get_local_ip() -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """サーバー起動/終了時の処理"""
-    global config, llm, tts, stt, rag, vision, monitor, profile, summarizer, preloader, idle_manager
+    global config, llm, tts, stt, rag, vision, monitor, profile, summarizer, preloader, web_search, idle_manager
 
     print("=" * 50)
     print(" Web UI サーバー起動中...")
@@ -88,6 +90,7 @@ async def lifespan(app: FastAPI):
     # 設定ロード
     config_path = PROJECT_ROOT / "config" / "chat_config.json"
     config = ChatConfig.load(config_path)
+    web_search = create_web_search_context(config)
 
     # LLM 初期化
     print("[1/6] Ollama 接続確認...")
@@ -96,6 +99,8 @@ async def lifespan(app: FastAPI):
         print("⚠️  Ollamaに接続できません。チャット機能は使用不可です。")
     else:
         print(f"✅ Ollama OK (model: {config.model})")
+    if web_search is not None:
+        print(f"✅ Web検索 ON (auto={config.web_search_auto}, max_results={config.web_search_max_results})")
 
     # STT 初期化
     print("[2/7] STT 初期化...")
@@ -635,6 +640,7 @@ def get_or_create_session(session_id: str) -> ChatSession:
             vision_context=vision,
             monitor_context=monitor,
             preloader=preloader,
+            web_search=web_search,
         )
     return sessions[session_id]
 

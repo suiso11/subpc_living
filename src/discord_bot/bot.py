@@ -34,12 +34,14 @@ from src.audio.tts import KokoroTTS
 from src.chat.client import OllamaClient
 from src.chat.config import ChatConfig
 from src.chat.session import ChatSession
+from src.chat.web_search import WebSearchContext, create_web_search_context
 from src.discord_bot.training import (
     BAD_REACTION,
     GOOD_REACTION,
     DiscordTrainingLog,
     parse_correction,
 )
+from src.discord_bot.terminal import DiscordTerminal
 from src.service.healthcheck import HealthChecker
 
 
@@ -105,12 +107,18 @@ class DiscordConsoleState:
     llm: OllamaClient | None = None
     tts: KokoroTTS | None = None
     sessions: dict[str, ChatSession] = field(default_factory=dict)
+    session_locks: dict[str, threading.Lock] = field(default_factory=dict)
+    sessions_lock: threading.Lock = field(default_factory=threading.Lock)
+    web_search: WebSearchContext | None = None
     allowed_user_ids: set[int] = field(default_factory=set)
     allowed_channel_ids: set[int] = field(default_factory=set)
     auto_reply_channel_ids: set[int] = field(default_factory=set)
+    terminal_channel_ids: set[int] = field(default_factory=set)
     allow_service_control: bool = False
+    allow_terminal: bool = False
     tts_lock: threading.Lock = field(default_factory=threading.Lock)
     training_log: DiscordTrainingLog | None = None
+    terminal: DiscordTerminal | None = None
 
     def initialize(self) -> None:
         self.config = ChatConfig.load(PROJECT_ROOT / "config" / "chat_config.json")
@@ -123,8 +131,13 @@ class DiscordConsoleState:
         self.auto_reply_channel_ids = parse_id_set(os.environ.get("DISCORD_AUTO_REPLY_CHANNEL_IDS"))
         if not self.auto_reply_channel_ids:
             self.auto_reply_channel_ids = set(self.allowed_channel_ids)
+        self.terminal_channel_ids = parse_id_set(os.environ.get("DISCORD_TERMINAL_CHANNEL_IDS"))
         self.allow_service_control = parse_bool(
             os.environ.get("DISCORD_ALLOW_SERVICE_CONTROL"),
+            default=False,
+        )
+        self.allow_terminal = parse_bool(
+            os.environ.get("DISCORD_ALLOW_TERMINAL"),
             default=False,
         )
         training_dir = Path(os.environ.get("DISCORD_TRAINING_DIR", "data/discord_training"))
@@ -134,6 +147,17 @@ class DiscordConsoleState:
             training_dir,
             enabled=parse_bool(os.environ.get("DISCORD_TRAINING_LOG_ENABLED"), default=True),
             system_prompt=self.config.system_prompt,
+        )
+        self.web_search = create_web_search_context(self.config)
+        terminal_workdir = Path(
+            os.environ.get("DISCORD_TERMINAL_WORKDIR", str(PROJECT_ROOT))
+        ).expanduser()
+        self.terminal = DiscordTerminal(
+            enabled=self.allow_terminal,
+            workdir=terminal_workdir,
+            session_prefix=os.environ.get("DISCORD_TERMINAL_SESSION_PREFIX", "subpc_discord"),
+            capture_lines=int(os.environ.get("DISCORD_TERMINAL_CAPTURE_LINES", "80")),
+            command_prefix=os.environ.get("DISCORD_TERMINAL_PREFIX", "!t"),
         )
 
     def close(self) -> None:
@@ -152,9 +176,28 @@ class DiscordConsoleState:
             return False
         if self.allowed_user_ids and message.author.id not in self.allowed_user_ids:
             return False
-        if message.channel.id not in self.auto_reply_channel_ids:
+        if not (self._message_channel_ids(message) & self.auto_reply_channel_ids):
             return False
         return True
+
+    def is_terminal_message(self, message: discord.Message) -> bool:
+        return self.terminal_reject_reason(message) is None
+
+    def terminal_reject_reason(self, message: discord.Message) -> str | None:
+        if not self.allow_terminal:
+            return "terminal is disabled. Set DISCORD_ALLOW_TERMINAL=true."
+        if not self.terminal_channel_ids:
+            return "terminal channel is not configured. Set DISCORD_TERMINAL_CHANNEL_IDS."
+        if message.author.bot:
+            return "bot message"
+        if self.allowed_user_ids and message.author.id not in self.allowed_user_ids:
+            return f"user is not allowed: {message.author.id}"
+        if not (self._message_channel_ids(message) & self.terminal_channel_ids):
+            return (
+                f"terminal is not enabled in this channel: {message.channel.id}. "
+                f"configured: {sorted(self.terminal_channel_ids)}"
+            )
+        return None
 
     def is_allowed_feedback(self, user_id: int, channel_id: int) -> bool:
         if self.allowed_user_ids and user_id not in self.allowed_user_ids:
@@ -163,42 +206,89 @@ class DiscordConsoleState:
             return False
         return True
 
-    def _session_for_ids(self, guild_id: int | None, channel_id: int | None) -> ChatSession:
+    def auto_reply_enabled(self) -> bool:
+        return bool(self.auto_reply_channel_ids)
+
+    def terminal_enabled(self) -> bool:
+        return self.allow_terminal and bool(self.terminal_channel_ids)
+
+    def message_content_required(self) -> bool:
+        return self.auto_reply_enabled() or self.terminal_enabled()
+
+    @staticmethod
+    def _message_channel_ids(message: discord.Message) -> set[int]:
+        ids = {message.channel.id}
+        parent_id = getattr(message.channel, "parent_id", None)
+        if isinstance(parent_id, int):
+            ids.add(parent_id)
+        return ids
+
+    @staticmethod
+    def _shared_session_key(guild_id: int | None, channel_id: int | None) -> str:
+        return f"discord:{guild_id or 0}:{channel_id or 0}"
+
+    @staticmethod
+    def _ephemeral_session_key(
+        guild_id: int | None,
+        channel_id: int | None,
+        user_id: int,
+    ) -> str:
+        return f"discord-ephemeral:{guild_id or 0}:{channel_id or 0}:{user_id}"
+
+    def _session_for_key(self, key: str) -> tuple[ChatSession, threading.Lock]:
         assert self.config is not None
-        key = f"discord:{guild_id or 0}:{channel_id or 0}"
-        if key not in self.sessions:
-            self.sessions[key] = ChatSession(
-                system_prompt=self.config.system_prompt,
-                max_history_turns=self.config.max_history_turns,
-                history_dir=str(PROJECT_ROOT / self.config.history_dir),
+        with self.sessions_lock:
+            if key not in self.sessions:
+                self.sessions[key] = ChatSession(
+                    system_prompt=self.config.system_prompt,
+                    max_history_turns=self.config.max_history_turns,
+                    history_dir=str(PROJECT_ROOT / self.config.history_dir),
+                    web_search=self.web_search,
+                )
+            if key not in self.session_locks:
+                self.session_locks[key] = threading.Lock()
+            return self.sessions[key], self.session_locks[key]
+
+    def get_session(
+        self,
+        interaction: discord.Interaction,
+        *,
+        ephemeral: bool = False,
+    ) -> tuple[ChatSession, threading.Lock]:
+        if ephemeral:
+            key = self._ephemeral_session_key(
+                interaction.guild_id,
+                interaction.channel_id,
+                interaction.user.id,
             )
-        return self.sessions[key]
+        else:
+            key = self._shared_session_key(interaction.guild_id, interaction.channel_id)
+        return self._session_for_key(key)
 
-    def get_session(self, interaction: discord.Interaction) -> ChatSession:
-        return self._session_for_ids(interaction.guild_id, interaction.channel_id)
-
-    def get_message_session(self, message: discord.Message) -> ChatSession:
-        return self._session_for_ids(
+    def get_message_session(self, message: discord.Message) -> tuple[ChatSession, threading.Lock]:
+        key = self._shared_session_key(
             message.guild.id if message.guild else None,
             message.channel.id,
         )
+        return self._session_for_key(key)
 
     def reset_session(self, interaction: discord.Interaction) -> None:
-        guild_id = interaction.guild_id or 0
-        channel_id = interaction.channel_id or 0
-        self.sessions.pop(f"discord:{guild_id}:{channel_id}", None)
+        key = self._shared_session_key(interaction.guild_id, interaction.channel_id)
+        with self.sessions_lock:
+            self.sessions.pop(key, None)
+            self.session_locks.pop(key, None)
 
-    def ask(self, interaction: discord.Interaction, prompt: str) -> str:
+    def ask(self, interaction: discord.Interaction, prompt: str, *, ephemeral: bool = False) -> str:
         if self.llm is None or self.config is None:
             raise RuntimeError("LLM is not initialized")
-        session = self.get_session(interaction)
-        return self.ask_session(session, prompt)
+        session, lock = self.get_session(interaction, ephemeral=ephemeral)
+        return self.ask_session(session, prompt, lock)
 
     def ask_message(self, message: discord.Message) -> str:
         if self.llm is None or self.config is None:
             raise RuntimeError("LLM is not initialized")
-        session = self.get_message_session(message)
-        return self.ask_session(session, message.content.strip())
+        session, lock = self.get_message_session(message)
+        return self.ask_session(session, message.content.strip(), lock)
 
     def record_auto_reply(
         self,
@@ -255,25 +345,35 @@ class DiscordConsoleState:
             return "修正を学習候補に保存しました。"
         return f"修正を保存できませんでした: {result.reason}"
 
-    def ask_session(self, session: ChatSession, prompt: str) -> str:
+    def handle_terminal_message(self, message: discord.Message) -> str | None:
+        if self.terminal is None:
+            return None
+        result = self.terminal.handle_message(message.channel.id, message.content)
+        if result is None:
+            return None
+        prefix = "" if result.ok else "terminal error:\n"
+        return prefix + result.text
+
+    def ask_session(self, session: ChatSession, prompt: str, lock: threading.Lock) -> str:
         if self.llm is None or self.config is None:
             raise RuntimeError("LLM is not initialized")
-        session.add_user_message(prompt)
-        try:
-            response = self.llm.generate(
-                session.build_messages(),
-                temperature=self.config.temperature,
-                top_p=self.config.top_p,
-                top_k=self.config.top_k,
-                repeat_penalty=self.config.repeat_penalty,
-                num_ctx=self.config.num_ctx,
-            )
-        except Exception:
-            if session._messages and session._messages[-1]["role"] == "user":
-                session._messages.pop()
-            raise
-        session.add_assistant_message(response)
-        return response
+        with lock:
+            session.add_user_message(prompt)
+            try:
+                response = self.llm.generate(
+                    session.build_messages(),
+                    temperature=self.config.temperature,
+                    top_p=self.config.top_p,
+                    top_k=self.config.top_k,
+                    repeat_penalty=self.config.repeat_penalty,
+                    num_ctx=self.config.num_ctx,
+                )
+            except Exception:
+                if session._messages and session._messages[-1]["role"] == "user":
+                    session._messages.pop()
+                raise
+            session.add_assistant_message(response)
+            return response
 
     def synthesize(self, text: str, voice: str, speed: float) -> bytes:
         with self.tts_lock:
@@ -289,13 +389,20 @@ class DiscordConsoleState:
         health = checker.check_all(include_web=False)
         llm_ok = self.llm.is_available() if self.llm is not None else False
         tts_loaded = self.tts is not None and self.tts.is_loaded()
+        with self.sessions_lock:
+            session_count = len(self.sessions)
         return (
             f"status: {health['status']}\n"
             f"ollama: {'ok' if llm_ok else 'ng'}\n"
             f"model: {self.config.model}\n"
-            f"sessions: {len(self.sessions)}\n"
+            f"sessions: {session_count}\n"
             f"tts_loaded: {tts_loaded}\n"
             f"auto_reply_channels: {len(self.auto_reply_channel_ids)}\n"
+            f"terminal_channels: {len(self.terminal_channel_ids)}\n"
+            f"terminal_enabled: {self.allow_terminal}\n"
+            f"terminal_tmux: {self.terminal.is_available() if self.terminal else False}\n"
+            f"message_content_intent: {self.message_content_required()}\n"
+            f"web_search: {self.web_search is not None}\n"
             f"service_control: {self.allow_service_control}\n"
             f"{self.training_log.summary_text() if self.training_log else 'training_log: unavailable'}\n"
             f"checks: {health['checks']}"
@@ -343,7 +450,7 @@ async def require_allowed(interaction: discord.Interaction, state: DiscordConsol
 
 def build_bot(state: DiscordConsoleState) -> commands.Bot:
     intents = discord.Intents.default()
-    intents.message_content = True
+    intents.message_content = state.message_content_required()
     intents.reactions = True
     bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -363,9 +470,42 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
     async def on_ready() -> None:
         print(f"[Discord] logged in as {bot.user} ({bot.user.id if bot.user else 'unknown'})")
         print(f"[Discord] auto reply channels: {sorted(state.auto_reply_channel_ids)}")
+        print(f"[Discord] terminal channels: {sorted(state.terminal_channel_ids)}")
 
     @bot.event
     async def on_message(message: discord.Message) -> None:
+        if message.author.bot:
+            return
+
+        terminal_content = message.content.strip()
+        terminal_prefix = state.terminal.command_prefix if state.terminal else "!t"
+        terminal_reason = state.terminal_reject_reason(message)
+
+        if terminal_reason is None and not terminal_content:
+            await message.reply(
+                "terminal error:\n"
+                "message content is empty. Discord Developer Portal で Message Content Intent を有効にしてください。",
+                mention_author=False,
+            )
+            return
+
+        if terminal_reason is None and terminal_content.startswith(terminal_prefix):
+            async with message.channel.typing():
+                try:
+                    output = await asyncio.to_thread(state.handle_terminal_message, message)
+                except Exception as e:
+                    output = f"terminal error: `{e}`"
+            if output:
+                for chunk in split_message(f"```text\n{clean_output(output, 1800)}\n```"):
+                    await message.reply(chunk, mention_author=False)
+            return
+
+        if terminal_content.startswith(terminal_prefix):
+            print(f"[Discord] terminal message ignored: {terminal_reason}")
+            if terminal_reason and not terminal_reason.startswith("user is not allowed"):
+                await message.reply(f"terminal error:\n{terminal_reason}", mention_author=False)
+            return
+
         if not state.is_allowed_message(message):
             return
         content = message.content.strip()
@@ -418,7 +558,7 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
             return
         await interaction.response.defer(thinking=True, ephemeral=ephemeral)
         try:
-            response = await asyncio.to_thread(state.ask, interaction, prompt)
+            response = await asyncio.to_thread(state.ask, interaction, prompt, ephemeral=ephemeral)
         except Exception as e:
             await interaction.followup.send(f"LLM error: `{e}`", ephemeral=True)
             return

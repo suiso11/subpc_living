@@ -24,6 +24,7 @@ from src.audio.wakeword import WakeWordDetector
 from src.chat.client import OllamaClient
 from src.chat.session import ChatSession
 from src.chat.config import ChatConfig
+from src.chat.web_search import WebSearchContext, create_web_search_context
 from src.memory.vectorstore import VectorStore
 from src.memory.rag import RAGRetriever
 from src.vision.context import VisionContext
@@ -90,6 +91,7 @@ class VoicePipeline:
             base_url=self.config.ollama_base_url,
             model=self.config.model,
         )
+        self.web_search: Optional[WebSearchContext] = create_web_search_context(self.config)
 
         # RAG (Phase 4: 長期記憶)
         self.enable_rag = enable_rag
@@ -170,6 +172,7 @@ class VoicePipeline:
             vision_context=self.vision_context,
             monitor_context=self.monitor_context,
             preloader=self.preloader,
+            web_search=self.web_search,
         )
 
         # ストリーミングTTS設定
