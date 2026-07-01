@@ -6,10 +6,13 @@ from src.persona.profile import UserProfile
 from src.persona.summarizer import ConversationSummarizer
 from src.persona.preloader import SessionPreloader
 from src.persona.proactive import ProactiveEngine
+from src.persona.daily_personalizer import DailyPersonalizer, PersonalizationResult
 
 __all__ = [
     "UserProfile",
     "ConversationSummarizer",
     "SessionPreloader",
     "ProactiveEngine",
+    "DailyPersonalizer",
+    "PersonalizationResult",
 ]

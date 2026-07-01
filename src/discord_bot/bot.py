@@ -47,6 +47,7 @@ from src.discord_bot.terminal import DiscordTerminal
 from src.diary.collector import DiaryCollector
 from src.diary.service import DailyDiaryResult, DailyDiaryService
 from src.integrations.google_calendar import GoogleCalendarMCPClient
+from src.persona.daily_personalizer import DailyPersonalizer, PersonalizationResult
 from src.service.healthcheck import HealthChecker
 
 
@@ -117,6 +118,16 @@ def parse_hhmm(value: str | None, default: str = "23:50") -> time:
         return time(hour=int(hour_text), minute=int(minute_text))
 
 
+def parse_float(value: str | None, default: float) -> float:
+    if value is None or not value.strip():
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        print(f"[Discord] float 設定値を無視します: {value}")
+        return default
+
+
 def clean_output(text: str, limit: int = 3500) -> str:
     text = ANSI_RE.sub("", text).strip()
     if len(text) <= limit:
@@ -160,6 +171,9 @@ class DiscordConsoleState:
     diary_calendar_id: str = "primary"
     diary_service: DailyDiaryService | None = None
     diary_task: asyncio.Task | None = None
+    diary_personalization_enabled: bool = True
+    diary_personalization_min_confidence: float = 0.72
+    daily_personalizer: DailyPersonalizer | None = None
 
     def initialize(self) -> None:
         self.config = ChatConfig.load(PROJECT_ROOT / "config" / "chat_config.json")
@@ -206,6 +220,14 @@ class DiscordConsoleState:
         self.diary_post_time = parse_hhmm(os.environ.get("DIARY_POST_TIME"), default="23:50")
         self.diary_calendar_enabled = parse_bool(os.environ.get("DIARY_CALENDAR_ENABLED"), default=True)
         self.diary_calendar_id = os.environ.get("DIARY_CALENDAR_ID", "primary").strip() or "primary"
+        self.diary_personalization_enabled = parse_bool(
+            os.environ.get("DIARY_PERSONALIZATION_ENABLED"),
+            default=True,
+        )
+        self.diary_personalization_min_confidence = parse_float(
+            os.environ.get("DIARY_PERSONALIZATION_MIN_CONFIDENCE"),
+            default=0.72,
+        )
         try:
             calendar_client = (
                 GoogleCalendarMCPClient.from_env()
@@ -225,9 +247,16 @@ class DiscordConsoleState:
                 temperature=0.4,
                 num_ctx=self.config.num_ctx,
             )
+            self.daily_personalizer = DailyPersonalizer(
+                project_root=PROJECT_ROOT,
+                llm=self.llm,
+                min_confidence=self.diary_personalization_min_confidence,
+                num_ctx=self.config.num_ctx,
+            )
         except Exception as e:
             print(f"[Discord] diary initialization failed: {e}")
             self.diary_service = None
+            self.daily_personalizer = None
 
     def close(self) -> None:
         if self.diary_task is not None:
@@ -475,6 +504,7 @@ class DiscordConsoleState:
             f"diary_enabled: {self.diary_enabled}\n"
             f"diary_channel_id: {self.diary_channel_id or '-'}\n"
             f"diary_post_time: {self.diary_post_time.strftime('%H:%M')} {self.diary_timezone}\n"
+            f"diary_personalization: {self.diary_personalization_enabled}\n"
             f"message_content_intent: {self.message_content_required()}\n"
             f"web_search: {self.web_search is not None}\n"
             f"service_control: {self.allow_service_control}\n"
@@ -557,9 +587,34 @@ async def send_diary_to_channel(
     for chunk in split_message(result.markdown):
         await channel.send(chunk)
     state.diary_service.mark_posted(target_date, channel_id=state.diary_channel_id)
+    await maybe_personalize_from_diary(state, target_date, result.markdown)
     if result.calendar_error:
         print(f"[Discord] diary calendar warning: {result.calendar_error[:500]}")
     return result
+
+
+async def maybe_personalize_from_diary(
+    state: DiscordConsoleState,
+    target_date: date,
+    diary_markdown: str,
+) -> PersonalizationResult | None:
+    if not state.diary_personalization_enabled or state.daily_personalizer is None:
+        return None
+    try:
+        result = await asyncio.to_thread(
+            state.daily_personalizer.run,
+            target_date,
+            diary_markdown=diary_markdown,
+            dry_run=False,
+        )
+        print(
+            "[Discord] daily personalization: "
+            f"date={result.target_date} applied={result.applied_count} audit={result.audit_path}"
+        )
+        return result
+    except Exception as e:
+        print(f"[Discord] daily personalization failed: {e}")
+        return None
 
 
 async def diary_scheduler_loop(bot: commands.Bot, state: DiscordConsoleState) -> None:
@@ -816,6 +871,51 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
 
         for chunk in split_message(result.markdown):
             await interaction.followup.send(chunk, ephemeral=True)
+
+    @bot.tree.command(name="personalize", description="保存済み日記からプロフィール更新候補を抽出します")
+    @app_commands.describe(
+        target_date="YYYY-MM-DD。空なら今日",
+        dry_run="trueならプロフィールを更新せず監査ログだけ作成",
+    )
+    async def personalize(
+        interaction: discord.Interaction,
+        target_date: str = "",
+        dry_run: bool = True,
+    ) -> None:
+        if not await require_allowed(interaction, state):
+            return
+        if state.daily_personalizer is None:
+            await interaction.response.send_message("パーソナライズサービスが初期化されていません。", ephemeral=True)
+            return
+        try:
+            diary_date = parse_diary_date(target_date, state.diary_timezone)
+        except ValueError:
+            await interaction.response.send_message("target_date は YYYY-MM-DD で指定してください。", ephemeral=True)
+            return
+
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        try:
+            result = await asyncio.to_thread(
+                state.daily_personalizer.run,
+                diary_date,
+                dry_run=dry_run,
+            )
+        except Exception as e:
+            await interaction.followup.send(f"personalize error: `{e}`", ephemeral=True)
+            return
+
+        applied = "\n".join(
+            f"- {key}: {len(values)}"
+            for key, values in result.applied.items()
+        )
+        text = (
+            f"target_date: {result.target_date}\n"
+            f"dry_run: {result.dry_run}\n"
+            f"applied_count: {result.applied_count}\n"
+            f"audit_path: {result.audit_path}\n"
+            f"applied:\n{applied}"
+        )
+        await interaction.followup.send(f"```text\n{clean_output(text, 1800)}\n```", ephemeral=True)
 
     @bot.tree.command(name="service", description="限定されたサービス管理コマンドを実行します")
     @app_commands.choices(

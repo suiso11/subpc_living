@@ -151,6 +151,7 @@
 | F-17 | テキスト出力 | Web UI 等でテキストベースの応答も表示 |
 | F-18 | 状態表示 | 現在のAIの状態（リスニング中/処理中/応答中等）を表示 |
 | F-29 | 日次日記投稿 | 1日の終わりに予定・会話・PCログをまとめ、専用Discordチャンネルへ日記として投稿 |
+| F-30 | 日次パーソナライズ | 日記から安定した嗜好・習慣・事実だけを抽出し、短いプロフィールへ反映 |
 
 ### 5.6 日記・ライフログ
 
@@ -166,6 +167,8 @@
 
 生成結果は `data/diary/YYYY-MM-DD.md` に保存し、投稿済み状態は `data/diary/posted.json` で管理する。Google Calendar の認証未設定・取得失敗時も日記生成全体は止めず、予定なしとして続行する。
 
+日記投稿後は、必要に応じて日次パーソナライズを実行する。全ログを会話コンテキストへ足し続けるのではなく、信頼度の高い更新候補だけを `user_profile.json` の `preferences` / `habits` / `notes` / `extracted_facts` へ圧縮する。抽出結果と適用内容は `data/profile/personalization/YYYY-MM-DD.json` に監査ログとして残す。
+
 関連設定:
 
 ```env
@@ -173,6 +176,8 @@ DIARY_ENABLED=true
 DISCORD_DIARY_CHANNEL_ID=
 DIARY_POST_TIME=23:50
 DIARY_TIMEZONE=Asia/Tokyo
+DIARY_PERSONALIZATION_ENABLED=true
+DIARY_PERSONALIZATION_MIN_CONFIDENCE=0.72
 DIARY_CALENDAR_ENABLED=true
 DIARY_CALENDAR_ID=primary
 GOOGLE_OAUTH_CREDENTIALS=/home/haruka/.config/google-calendar-mcp/gcp-oauth.keys.json
@@ -289,7 +294,7 @@ GOOGLE_OAUTH_CREDENTIALS=/home/haruka/.config/google-calendar-mcp/gcp-oauth.keys
 | Phase 8 | 常時稼働化 | systemd 管理、自動再起動、ヘルスチェック、GPU省電力制御 | ✅ **完了** |
 | **Phase 9** | **GPU換装** | **P40に換装、モデル13B化、全モジュールGPU化、レイテンシ改善** | ✅ **完了** |
 | **Phase 10** | **ウェイクワード検知** | **OpenWakeWordで呼びかけ検知、常時待機→自動起動** | ✅ **完了** |
-| **Phase 11** | **日次日記・Calendar連携** | **Google Calendar MCPとローカルログを使い、専用Discordチャンネルへ日記投稿** | ✅ **完了** |
+| **Phase 11** | **日次日記・Calendar連携** | **Google Calendar MCPとローカルログを使い、日記投稿と日次パーソナライズを実行** | ✅ **完了** |
 
 ## 11. 今後の検討事項
 

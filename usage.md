@@ -696,6 +696,8 @@ DIARY_ENABLED=true
 DISCORD_DIARY_CHANNEL_ID=123456789012345678
 DIARY_POST_TIME=23:50
 DIARY_TIMEZONE=Asia/Tokyo
+DIARY_PERSONALIZATION_ENABLED=true
+DIARY_PERSONALIZATION_MIN_CONFIDENCE=0.72
 
 # Google Calendar MCP を日記の予定ソースに使う場合
 DIARY_CALENDAR_ENABLED=true
@@ -710,6 +712,14 @@ GOOGLE_OAUTH_CREDENTIALS=/home/haruka/.config/google-calendar-mcp/gcp-oauth.keys
 - `data/profile/summaries/summary_*.json` の直近要約
 - `data/metrics/system_metrics.db` の当日PCメトリクス
 - `data/profile/user_profile.json` のプロフィールと手動スケジュール
+
+`DIARY_PERSONALIZATION_ENABLED=true` の場合、日記投稿後に同じ日記から
+プロフィール更新候補を抽出し、信頼度が
+`DIARY_PERSONALIZATION_MIN_CONFIDENCE` 以上のものだけを
+`data/profile/user_profile.json` に反映する。全ログを会話コンテキストへ
+足し続けるのではなく、安定した嗜好・習慣・メモ・事実へ圧縮する。
+各日の抽出結果と適用内容は `data/profile/personalization/YYYY-MM-DD.json`
+に監査ログとして保存する。
 
 Google Calendar MCP は OAuth JSON が無い、未認証、取得失敗の状態でも
 日記生成全体は止めない。予定は空として扱い、エラーは
@@ -737,7 +747,14 @@ GOOGLE_OAUTH_CREDENTIALS="$HOME/.config/google-calendar-mcp/gcp-oauth.keys.json"
 # Google Calendar なしで保存
 .venv/bin/python -m src.diary.main --no-calendar
 
+# 保存済み日記からプロフィール更新候補を抽出（監査ログのみ）
+.venv/bin/python -m src.persona.personalize_daily --dry-run
+
+# 保存済み日記からプロフィールへ反映
+.venv/bin/python -m src.persona.personalize_daily
+
 # Discord からは /diary post:false でプレビュー、post:true で日記チャンネルへ投稿
+# /personalize dry_run:true で候補確認、dry_run:false で手動反映
 ```
 
 `/service start|stop|restart` は `DISCORD_ALLOW_SERVICE_CONTROL=true` の場合のみ有効。

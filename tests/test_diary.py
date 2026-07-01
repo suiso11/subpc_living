@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 from src.diary.collector import DiaryCollector
 from src.diary.service import DailyDiaryService
 from src.integrations.google_calendar import GoogleCalendarMCPClient
+from src.persona.daily_personalizer import DailyPersonalizer
 
 
 class FakeLLM:
@@ -140,6 +141,117 @@ class DailyDiaryServiceTest(unittest.TestCase):
             self.assertFalse(service.was_posted(date(2026, 7, 1)))
             service.mark_posted(date(2026, 7, 1), channel_id=123)
             self.assertTrue(service.was_posted(date(2026, 7, 1)))
+
+
+class DailyPersonalizerTest(unittest.TestCase):
+    def test_dry_run_does_not_update_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_profile(root)
+            self._write_diary(root)
+            llm = FakeLLM(
+                json.dumps(
+                    {
+                        "preferences": [
+                            {
+                                "key": "coffee",
+                                "value": "ホンジュラスのコーヒーを好む",
+                                "confidence": 0.9,
+                            }
+                        ],
+                        "habits": [],
+                        "notes": [],
+                        "facts": [],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            personalizer = DailyPersonalizer(project_root=root, llm=llm)
+
+            result = personalizer.run(date(2026, 7, 1), dry_run=True)
+            profile = json.loads((root / "data" / "profile" / "user_profile.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result.applied_count, 1)
+            self.assertEqual(profile["preferences"], {})
+            self.assertTrue(Path(result.audit_path).exists())
+
+    def test_apply_updates_profile_and_skips_low_confidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_profile(root)
+            self._write_diary(root)
+            llm = FakeLLM(
+                "```json\n"
+                + json.dumps(
+                    {
+                        "preferences": [
+                            {
+                                "key": "coffee",
+                                "value": "ホンジュラスのコーヒーを好む",
+                                "confidence": 0.9,
+                            }
+                        ],
+                        "habits": [
+                            {
+                                "key": "sleep_pattern",
+                                "value": "夜更かし気味",
+                                "confidence": 0.6,
+                            }
+                        ],
+                        "notes": [
+                            {
+                                "text": "制作や探索の文脈を優先する",
+                                "confidence": 0.8,
+                            }
+                        ],
+                        "facts": [
+                            {
+                                "text": "コーヒーイベントの記録を日記材料として残すと役立つ",
+                                "confidence": 0.75,
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n```"
+            )
+            personalizer = DailyPersonalizer(project_root=root, llm=llm)
+
+            result = personalizer.run(date(2026, 7, 1), dry_run=False)
+            profile = json.loads((root / "data" / "profile" / "user_profile.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result.applied_count, 3)
+            self.assertEqual(profile["preferences"]["coffee"], "ホンジュラスのコーヒーを好む")
+            self.assertNotIn("sleep_pattern", profile["habits"])
+            self.assertIn("制作や探索の文脈を優先する", profile["notes"])
+            self.assertIn("コーヒーイベントの記録を日記材料として残すと役立つ", profile["extracted_facts"])
+
+    @staticmethod
+    def _write_profile(root: Path) -> None:
+        path = root / "data" / "profile" / "user_profile.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "name": "はるか",
+                    "nickname": "",
+                    "preferences": {},
+                    "habits": {},
+                    "schedule": [],
+                    "notes": [],
+                    "extracted_facts": [],
+                    "updated_at": "",
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _write_diary(root: Path) -> None:
+        path = root / "data" / "diary" / "2026-07-01.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# 2026-07-01 の日記\n\nコーヒーイベントの話があった。", encoding="utf-8")
 
 
 if __name__ == "__main__":
