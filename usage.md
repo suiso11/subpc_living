@@ -678,12 +678,67 @@ Discord 側の slash command:
 | `/status` | Ollama・モデル・ヘルスチェック状態を表示 |
 | `/service` | `status` / `logs` / `health` / `gpu` / 許可時のみ `start` `stop` `restart` |
 | `/reset` | そのチャンネルの会話履歴をリセット |
+| `/diary` | 当日の日記を生成。プレビューまたは日記専用チャンネルへ投稿 |
 
 `DISCORD_AUTO_REPLY_CHANNEL_IDS` を設定したチャンネルでは、slash command なしで
 通常投稿されたテキストすべてに LLM が返信する。未設定の場合は
 `DISCORD_ALLOWED_CHANNEL_IDS` が自動返信対象として使われる。
 この機能には Discord Developer Portal の Bot 設定で
 **Message Content Intent** を有効化する必要がある。
+
+### 日次日記
+
+Discord bot は毎日指定時刻に日記を生成し、通常会話・terminal とは別の
+`DISCORD_DIARY_CHANNEL_ID` へ投稿できる。
+
+```env
+DIARY_ENABLED=true
+DISCORD_DIARY_CHANNEL_ID=123456789012345678
+DIARY_POST_TIME=23:50
+DIARY_TIMEZONE=Asia/Tokyo
+
+# Google Calendar MCP を日記の予定ソースに使う場合
+DIARY_CALENDAR_ENABLED=true
+DIARY_CALENDAR_ID=primary
+GOOGLE_OAUTH_CREDENTIALS=/home/haruka/.config/google-calendar-mcp/gcp-oauth.keys.json
+```
+
+日記生成に使う材料:
+
+- Google Calendar MCP の当日予定
+- `data/discord_training/conversations.jsonl` の当日会話
+- `data/profile/summaries/summary_*.json` の直近要約
+- `data/metrics/system_metrics.db` の当日PCメトリクス
+- `data/profile/user_profile.json` のプロフィールと手動スケジュール
+
+Google Calendar MCP は OAuth JSON が無い、未認証、取得失敗の状態でも
+日記生成全体は止めない。予定は空として扱い、エラーは
+`data/diary/YYYY-MM-DD.json` に保存する。
+自動投稿の重複防止は `data/diary/posted.json` で管理するため、手動で
+Markdownを生成・保存しても、その日が未投稿なら指定時刻に投稿される。
+
+初回の Google Calendar 認証:
+
+```bash
+mkdir -p ~/.config/google-calendar-mcp
+# Google Cloud Console から Desktop app の OAuth JSON を取得し、以下に置く
+# ~/.config/google-calendar-mcp/gcp-oauth.keys.json
+
+GOOGLE_OAUTH_CREDENTIALS="$HOME/.config/google-calendar-mcp/gcp-oauth.keys.json" \
+  npx -y @cocal/google-calendar-mcp auth
+```
+
+手動で日記を生成して確認:
+
+```bash
+# 保存せずプレビュー
+.venv/bin/python -m src.diary.main --no-save
+
+# Google Calendar なしで保存
+.venv/bin/python -m src.diary.main --no-calendar
+
+# Discord からは /diary post:false でプレビュー、post:true で日記チャンネルへ投稿
+```
 
 `/service start|stop|restart` は `DISCORD_ALLOW_SERVICE_CONTROL=true` の場合のみ有効。
 外部サーバーに bot を入れる場合は `DISCORD_ALLOWED_USER_IDS` か

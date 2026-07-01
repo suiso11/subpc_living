@@ -21,7 +21,9 @@ import subprocess
 import sys
 import threading
 from dataclasses import dataclass, field
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import discord
 from discord import app_commands
@@ -42,6 +44,9 @@ from src.discord_bot.training import (
     parse_correction,
 )
 from src.discord_bot.terminal import DiscordTerminal
+from src.diary.collector import DiaryCollector
+from src.diary.service import DailyDiaryResult, DailyDiaryService
+from src.integrations.google_calendar import GoogleCalendarMCPClient
 from src.service.healthcheck import HealthChecker
 
 
@@ -84,6 +89,34 @@ def parse_bool(value: str | None, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def parse_optional_id(value: str | None) -> int | None:
+    if not value:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        print(f"[Discord] ID を無視します: {value}")
+        return None
+
+
+def parse_hhmm(value: str | None, default: str = "23:50") -> time:
+    raw = (value or default).strip()
+    try:
+        hour_text, minute_text = raw.split(":", 1)
+        hour = int(hour_text)
+        minute = int(minute_text)
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError
+        return time(hour=hour, minute=minute)
+    except ValueError:
+        print(f"[Discord] DIARY_POST_TIME を無視します: {raw}")
+        hour_text, minute_text = default.split(":", 1)
+        return time(hour=int(hour_text), minute=int(minute_text))
+
+
 def clean_output(text: str, limit: int = 3500) -> str:
     text = ANSI_RE.sub("", text).strip()
     if len(text) <= limit:
@@ -119,6 +152,14 @@ class DiscordConsoleState:
     tts_lock: threading.Lock = field(default_factory=threading.Lock)
     training_log: DiscordTrainingLog | None = None
     terminal: DiscordTerminal | None = None
+    diary_enabled: bool = False
+    diary_channel_id: int | None = None
+    diary_timezone: str = "Asia/Tokyo"
+    diary_post_time: time = field(default_factory=lambda: time(hour=23, minute=50))
+    diary_calendar_enabled: bool = True
+    diary_calendar_id: str = "primary"
+    diary_service: DailyDiaryService | None = None
+    diary_task: asyncio.Task | None = None
 
     def initialize(self) -> None:
         self.config = ChatConfig.load(PROJECT_ROOT / "config" / "chat_config.json")
@@ -159,8 +200,38 @@ class DiscordConsoleState:
             capture_lines=int(os.environ.get("DISCORD_TERMINAL_CAPTURE_LINES", "80")),
             command_prefix=os.environ.get("DISCORD_TERMINAL_PREFIX", "!t"),
         )
+        self.diary_enabled = parse_bool(os.environ.get("DIARY_ENABLED"), default=False)
+        self.diary_channel_id = parse_optional_id(os.environ.get("DISCORD_DIARY_CHANNEL_ID"))
+        self.diary_timezone = os.environ.get("DIARY_TIMEZONE", "Asia/Tokyo").strip() or "Asia/Tokyo"
+        self.diary_post_time = parse_hhmm(os.environ.get("DIARY_POST_TIME"), default="23:50")
+        self.diary_calendar_enabled = parse_bool(os.environ.get("DIARY_CALENDAR_ENABLED"), default=True)
+        self.diary_calendar_id = os.environ.get("DIARY_CALENDAR_ID", "primary").strip() or "primary"
+        try:
+            calendar_client = (
+                GoogleCalendarMCPClient.from_env()
+                if self.diary_calendar_enabled
+                else None
+            )
+            collector = DiaryCollector(
+                PROJECT_ROOT,
+                calendar_client=calendar_client,
+                timezone=self.diary_timezone,
+            )
+            self.diary_service = DailyDiaryService(
+                project_root=PROJECT_ROOT,
+                llm=self.llm,
+                collector=collector,
+                timezone=self.diary_timezone,
+                temperature=0.4,
+                num_ctx=self.config.num_ctx,
+            )
+        except Exception as e:
+            print(f"[Discord] diary initialization failed: {e}")
+            self.diary_service = None
 
     def close(self) -> None:
+        if self.diary_task is not None:
+            self.diary_task.cancel()
         if self.llm is not None:
             self.llm.close()
 
@@ -401,6 +472,9 @@ class DiscordConsoleState:
             f"terminal_channels: {len(self.terminal_channel_ids)}\n"
             f"terminal_enabled: {self.allow_terminal}\n"
             f"terminal_tmux: {self.terminal.is_available() if self.terminal else False}\n"
+            f"diary_enabled: {self.diary_enabled}\n"
+            f"diary_channel_id: {self.diary_channel_id or '-'}\n"
+            f"diary_post_time: {self.diary_post_time.strftime('%H:%M')} {self.diary_timezone}\n"
             f"message_content_intent: {self.message_content_required()}\n"
             f"web_search: {self.web_search is not None}\n"
             f"service_control: {self.allow_service_control}\n"
@@ -448,6 +522,78 @@ async def require_allowed(interaction: discord.Interaction, state: DiscordConsol
     return False
 
 
+def parse_diary_date(value: str | None, timezone: str) -> date:
+    if not value:
+        return datetime.now(ZoneInfo(timezone)).date()
+    return date.fromisoformat(value.strip())
+
+
+async def send_diary_to_channel(
+    bot: commands.Bot,
+    state: DiscordConsoleState,
+    target_date: date,
+    *,
+    overwrite: bool = False,
+) -> DailyDiaryResult:
+    if state.diary_service is None:
+        raise RuntimeError("diary service is not initialized")
+    if state.diary_channel_id is None:
+        raise RuntimeError("DISCORD_DIARY_CHANNEL_ID is not configured")
+
+    channel = bot.get_channel(state.diary_channel_id)
+    if channel is None:
+        channel = await bot.fetch_channel(state.diary_channel_id)
+    if not hasattr(channel, "send"):
+        raise RuntimeError(f"diary target is not a text channel: {state.diary_channel_id}")
+
+    result = await asyncio.to_thread(
+        state.diary_service.generate,
+        target_date,
+        save=True,
+        overwrite=overwrite,
+        include_calendar=state.diary_calendar_enabled,
+        calendar_id=state.diary_calendar_id,
+    )
+    for chunk in split_message(result.markdown):
+        await channel.send(chunk)
+    state.diary_service.mark_posted(target_date, channel_id=state.diary_channel_id)
+    if result.calendar_error:
+        print(f"[Discord] diary calendar warning: {result.calendar_error[:500]}")
+    return result
+
+
+async def diary_scheduler_loop(bot: commands.Bot, state: DiscordConsoleState) -> None:
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            if not state.diary_enabled or state.diary_service is None or state.diary_channel_id is None:
+                await asyncio.sleep(300)
+                continue
+
+            tz = ZoneInfo(state.diary_timezone)
+            now = datetime.now(tz)
+            run_at = datetime.combine(now.date(), state.diary_post_time, tzinfo=tz)
+
+            if now >= run_at and not state.diary_service.was_posted(now.date()):
+                try:
+                    await send_diary_to_channel(bot, state, now.date())
+                    print(f"[Discord] diary posted for {now.date().isoformat()}")
+                except Exception as e:
+                    print(f"[Discord] diary post failed: {e}")
+                await asyncio.sleep(60)
+                continue
+
+            if now >= run_at:
+                run_at = run_at + timedelta(days=1)
+            sleep_sec = max(30.0, min((run_at - now).total_seconds(), 3600.0))
+            await asyncio.sleep(sleep_sec)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[Discord] diary scheduler error: {e}")
+            await asyncio.sleep(300)
+
+
 def build_bot(state: DiscordConsoleState) -> commands.Bot:
     intents = discord.Intents.default()
     intents.message_content = state.message_content_required()
@@ -465,12 +611,21 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
         else:
             await bot.tree.sync()
             print("[Discord] global slash commands synced")
+        if state.diary_enabled and state.diary_task is None:
+            state.diary_task = asyncio.create_task(diary_scheduler_loop(bot, state))
+            print("[Discord] diary scheduler started")
 
     @bot.event
     async def on_ready() -> None:
         print(f"[Discord] logged in as {bot.user} ({bot.user.id if bot.user else 'unknown'})")
         print(f"[Discord] auto reply channels: {sorted(state.auto_reply_channel_ids)}")
         print(f"[Discord] terminal channels: {sorted(state.terminal_channel_ids)}")
+        print(
+            "[Discord] diary: "
+            f"enabled={state.diary_enabled} "
+            f"channel={state.diary_channel_id or '-'} "
+            f"time={state.diary_post_time.strftime('%H:%M')} {state.diary_timezone}"
+        )
 
     @bot.event
     async def on_message(message: discord.Message) -> None:
@@ -608,6 +763,59 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
         await interaction.response.defer(thinking=True, ephemeral=True)
         text = await asyncio.to_thread(state.status_text)
         await interaction.followup.send(f"```text\n{clean_output(text, 1800)}\n```", ephemeral=True)
+
+    @bot.tree.command(name="diary", description="日記を生成します。投稿先は DISCORD_DIARY_CHANNEL_ID です")
+    @app_commands.describe(
+        target_date="YYYY-MM-DD。空なら今日",
+        post="trueなら日記チャンネルに投稿。falseなら自分だけにプレビュー",
+        overwrite="保存済みの日記を作り直す",
+    )
+    async def diary(
+        interaction: discord.Interaction,
+        target_date: str = "",
+        post: bool = False,
+        overwrite: bool = False,
+    ) -> None:
+        if not await require_allowed(interaction, state):
+            return
+        if state.diary_service is None:
+            await interaction.response.send_message("日記サービスが初期化されていません。", ephemeral=True)
+            return
+        try:
+            diary_date = parse_diary_date(target_date, state.diary_timezone)
+        except ValueError:
+            await interaction.response.send_message("target_date は YYYY-MM-DD で指定してください。", ephemeral=True)
+            return
+
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        try:
+            if post:
+                result = await send_diary_to_channel(
+                    bot,
+                    state,
+                    diary_date,
+                    overwrite=overwrite,
+                )
+                await interaction.followup.send(
+                    f"{result.target_date} の日記を投稿しました。",
+                    ephemeral=True,
+                )
+                return
+
+            result = await asyncio.to_thread(
+                state.diary_service.generate,
+                diary_date,
+                save=False,
+                overwrite=True,
+                include_calendar=state.diary_calendar_enabled,
+                calendar_id=state.diary_calendar_id,
+            )
+        except Exception as e:
+            await interaction.followup.send(f"diary error: `{e}`", ephemeral=True)
+            return
+
+        for chunk in split_message(result.markdown):
+            await interaction.followup.send(chunk, ephemeral=True)
 
     @bot.tree.command(name="service", description="限定されたサービス管理コマンドを実行します")
     @app_commands.choices(
