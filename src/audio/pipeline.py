@@ -483,6 +483,8 @@ class VoicePipeline:
         sentence_buffer = ""
         tts_thread = None
         played_sentences: list[str] = []
+        abort_response = False
+        fallback_text = "出力が乱れたので止めます。"
 
         # TTS再生ワーカースレッド
         tts_thread = threading.Thread(target=self._tts_worker, daemon=True)
@@ -509,12 +511,21 @@ class VoicePipeline:
                     for sent in sentences[:-1]:
                         sent = sent.strip()
                         if sent:
+                            if self._is_repeated_tts_sentence(sent, played_sentences):
+                                response_text = fallback_text
+                                sentence_buffer = ""
+                                print(f"\n{fallback_text}", end="", flush=True)
+                                self._tts_queue.put(fallback_text)
+                                abort_response = True
+                                break
                             self._tts_queue.put(sent)
                             played_sentences.append(sent)
+                    if abort_response:
+                        break
                     sentence_buffer = sentences[-1]
 
             # 残りのバッファも送信
-            if sentence_buffer.strip():
+            if not abort_response and sentence_buffer.strip():
                 self._tts_queue.put(sentence_buffer.strip())
                 played_sentences.append(sentence_buffer.strip())
 
@@ -527,6 +538,23 @@ class VoicePipeline:
                 tts_thread.join(timeout=60)
 
         return response_text
+
+    @staticmethod
+    def _is_repeated_tts_sentence(sentence: str, previous_sentences: list[str]) -> bool:
+        normalized = re.sub(r"\s+", "", sentence)
+        if not normalized or len(previous_sentences) < 5:
+            return False
+
+        recent = [re.sub(r"\s+", "", sent) for sent in previous_sentences[-5:]]
+        if all(sent == normalized for sent in recent):
+            return True
+
+        punct_chars = {"。", "…", ".", "、"}
+        return (
+            len(normalized) <= 6
+            and set(normalized) <= punct_chars
+            and all(set(sent) <= punct_chars for sent in recent)
+        )
 
     def _tts_worker(self) -> None:
         """TTS合成・再生のワーカースレッド"""

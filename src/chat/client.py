@@ -4,6 +4,7 @@ Phase 2: Ollamaとの通信を担当するモジュール
 """
 import httpx
 import re
+from collections import Counter
 from typing import Generator
 import json
 import queue
@@ -11,6 +12,8 @@ import threading
 
 # モデルが返す <think>...</think> 思考ブロックを除去するパターン
 _THINK_PATTERN = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
+_SHORT_REPEAT_PATTERN = re.compile(r"(.{1,12})\1{12,}", re.DOTALL)
+_DEGENERATE_FALLBACK = "出力が乱れたので止めました。もう一度、短く言い直してください。"
 
 
 class OllamaClient:
@@ -60,6 +63,38 @@ class OllamaClient:
         return _THINK_PATTERN.sub("", text).strip()
 
     @staticmethod
+    def _is_degenerate_response(text: str) -> bool:
+        """記号や短文の反復で崩れた生成を検出する。"""
+        compact = re.sub(r"\s+", "", text)
+        if len(compact) < 80:
+            return False
+
+        if re.search(r"(?:……。?){12,}", compact):
+            return True
+
+        punct_count = sum(1 for ch in compact if ch in "…。．.、,・!！?？")
+        if punct_count / max(len(compact), 1) > 0.75:
+            return True
+
+        if _SHORT_REPEAT_PATTERN.search(compact):
+            return True
+
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if len(lines) >= 16:
+            most_common = Counter(lines).most_common(1)[0][1]
+            if most_common >= max(12, int(len(lines) * 0.65)):
+                return True
+
+        return False
+
+    @classmethod
+    def _sanitize_response(cls, text: str) -> str:
+        cleaned = cls._strip_think(text)
+        if cls._is_degenerate_response(cleaned):
+            return _DEGENERATE_FALLBACK
+        return cleaned
+
+    @staticmethod
     def _build_options(
         *,
         temperature: float,
@@ -105,7 +140,7 @@ class OllamaClient:
         resp = self._client.post("/api/chat", json=payload)
         resp.raise_for_status()
         raw = resp.json()["message"]["content"]
-        return self._strip_think(raw)
+        return self._sanitize_response(raw)
 
     def generate_stream(
         self,
