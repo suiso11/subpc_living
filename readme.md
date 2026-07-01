@@ -150,6 +150,35 @@
 | F-16 | 音声合成（TTS） | LLMの応答テキストを音声に変換して出力 |
 | F-17 | テキスト出力 | Web UI 等でテキストベースの応答も表示 |
 | F-18 | 状態表示 | 現在のAIの状態（リスニング中/処理中/応答中等）を表示 |
+| F-29 | 日次日記投稿 | 1日の終わりに予定・会話・PCログをまとめ、専用Discordチャンネルへ日記として投稿 |
+
+### 5.6 日記・ライフログ
+
+1日の終わりに、その日の材料を自動収集して短い日記を生成する。通常会話チャンネルやterminalチャンネルとは分離し、`DISCORD_DIARY_CHANNEL_ID` で指定した日記専用チャンネルだけへ投稿する。
+
+日記生成に使う主な材料:
+
+- Google Calendar MCP から取得した当日予定
+- Discord 自動返信ログ (`data/discord_training/conversations.jsonl`)
+- 直近の会話要約 (`data/profile/summaries/`)
+- PCメトリクス (`data/metrics/system_metrics.db`)
+- ユーザープロファイルと手動スケジュール (`data/profile/user_profile.json`)
+
+生成結果は `data/diary/YYYY-MM-DD.md` に保存し、投稿済み状態は `data/diary/posted.json` で管理する。Google Calendar の認証未設定・取得失敗時も日記生成全体は止めず、予定なしとして続行する。
+
+関連設定:
+
+```env
+DIARY_ENABLED=true
+DISCORD_DIARY_CHANNEL_ID=
+DIARY_POST_TIME=23:50
+DIARY_TIMEZONE=Asia/Tokyo
+DIARY_CALENDAR_ENABLED=true
+DIARY_CALENDAR_ID=primary
+GOOGLE_OAUTH_CREDENTIALS=/home/haruka/.config/google-calendar-mcp/gcp-oauth.keys.json
+```
+
+詳細な認証手順・手動生成コマンドは `usage.md` の「日次日記」を参照。
 
 ## 6. 非機能要件
 
@@ -175,7 +204,12 @@
                                               [ユーザープロファイルDB]
 [サブPC] → [システムモニタ] ────────┐
                                     ├→ [ログDB (時系列)] → [分析 → プロファイルDB]
-[メインPC] → [ログ収集エージェント] ─┘```
+[メインPC] → [ログ収集エージェント] ─┘
+
+[Google Calendar MCP] ─┐
+[Discord会話ログ] ──────┼→ [日次日記生成] → [Discord日記チャンネル]
+[PCログ/会話要約/Profile] ─┘
+```
 
 ### 7.2 使用技術・ツール（候補）
 
@@ -199,6 +233,9 @@
 | オーケストレーション | Python (FastAPI / asyncio) | 各モジュールを非同期パイプラインで統合 |
 | プロセス管理 | systemd / supervisord | 常時稼働・自動再起動 |
 | フロントエンド | Web UI (Gradio / Open WebUI) | 状態表示・テキスト対話用。オプション |
+| Discord操作コンソール | discord.py | slash command、自動返信、terminal bridge、日記専用チャンネル投稿 |
+| カレンダー連携 | Google Calendar MCP | 当日予定を日記・プリロード文脈の材料として取得 |
+| 日記保存 | Markdown + JSON | `data/diary/` に本文・メタデータ・投稿済み状態を保存 |
 
 ### 7.3 GTX 1060での運用戦略（現行）
 
@@ -252,6 +289,7 @@
 | Phase 8 | 常時稼働化 | systemd 管理、自動再起動、ヘルスチェック、GPU省電力制御 | ✅ **完了** |
 | **Phase 9** | **GPU換装** | **P40に換装、モデル13B化、全モジュールGPU化、レイテンシ改善** | ✅ **完了** |
 | **Phase 10** | **ウェイクワード検知** | **OpenWakeWordで呼びかけ検知、常時待機→自動起動** | ✅ **完了** |
+| **Phase 11** | **日次日記・Calendar連携** | **Google Calendar MCPとローカルログを使い、専用Discordチャンネルへ日記投稿** | ✅ **完了** |
 
 ## 11. 今後の検討事項
 
@@ -260,10 +298,10 @@
 - スマートホーム連携（Home Assistant等）
 - モバイル端末からのリモートアクセス（LAN内限定）
 - 感情に応じた応答スタイルの動的変更
-- 日記・ライフログの自動生成
+- 日記・ライフログの精度改善（メインPC活動ログ、場所、体調メモ等の追加）
 - PCログからの作業効率分析・改善提案
 - メインPCの操作コンテキストをリアルタイムでLLMに渡し、作業アシスタントとして活用
-- Google Calendar / Notion 等のローカルエクスポートデータをスケジュール源として取り込み
+- Notion 等のローカルエクスポートデータをスケジュール源として取り込み
 - AI側の「性格」・「口調」のカスタマイズ設定
 - 音声クローン（自分の声でTTSする）の可能性調査
 
