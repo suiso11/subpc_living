@@ -31,6 +31,7 @@ python-multipart>=0.0.7
 
 # Discord 操作コンソール
 discord.py>=2.4.0
+discord-ext-voice-recv>=0.5.2a179
 
 # Phase 10: ウェイクワード検知
 openwakeword>=0.4.0

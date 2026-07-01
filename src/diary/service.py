@@ -131,6 +131,7 @@ class DailyDiaryService:
                     "calendar_events": len(sources.calendar.get("events", [])),
                     "manual_schedule": len(sources.manual_schedule),
                     "discord_turns": len(sources.discord_turns),
+                    "voice_transcripts": len(sources.voice_transcripts),
                     "recent_summaries": len(sources.recent_summaries),
                     "metrics_samples": sources.metrics_summary.get("sample_count"),
                 },
@@ -195,6 +196,8 @@ class DailyDiaryService:
             lines.append(f"- 手動スケジュール: {len(sources.manual_schedule)}件")
         if sources.discord_turns:
             lines.append(f"- Discord会話: {len(sources.discord_turns)}ターン")
+        if sources.voice_transcripts:
+            lines.append(f"- Discord通話文字起こし: {len(sources.voice_transcripts)}件")
         sample_count = sources.metrics_summary.get("sample_count")
         if sample_count:
             lines.append(f"- PCメトリクス: {sample_count}サンプル")

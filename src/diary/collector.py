@@ -20,6 +20,7 @@ class DiarySources:
     calendar: dict[str, Any]
     manual_schedule: list[dict[str, Any]]
     discord_turns: list[dict[str, Any]]
+    voice_transcripts: list[dict[str, Any]]
     recent_summaries: list[dict[str, Any]]
     metrics_summary: dict[str, Any]
     profile: dict[str, Any]
@@ -61,6 +62,7 @@ class DiaryCollector:
             calendar=calendar,
             manual_schedule=self._manual_schedule_for_day(profile, target_date),
             discord_turns=self._load_discord_turns(target_date),
+            voice_transcripts=self._load_voice_transcripts(target_date),
             recent_summaries=self._load_recent_summaries(limit=8),
             metrics_summary=self._load_metrics_summary(target_date),
             profile=self._profile_digest(profile),
@@ -148,6 +150,46 @@ class DiaryCollector:
 
         turns.sort(key=lambda item: str(item.get("created_at", "")))
         return turns[-limit:]
+
+    def _load_voice_transcripts(self, target_date: date, *, limit: int = 120) -> list[dict[str, Any]]:
+        path = (
+            self.project_root
+            / "data"
+            / "discord_voice"
+            / "transcripts"
+            / f"{target_date.isoformat()}.jsonl"
+        )
+        if not path.exists():
+            return []
+
+        tz = ZoneInfo(self.timezone)
+        transcripts: list[dict[str, Any]] = []
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                created_at = self._parse_datetime(item.get("created_at"), tz)
+                if created_at is None or created_at.date() != target_date:
+                    continue
+                transcripts.append(
+                    {
+                        "created_at": created_at.isoformat(timespec="seconds"),
+                        "voice_channel_id": item.get("voice_channel_id"),
+                        "user_name": self._truncate(str(item.get("user_name", "")), 80),
+                        "text": self._truncate(str(item.get("text", "")), 500),
+                        "duration_sec": item.get("duration_sec"),
+                    }
+                )
+
+        transcripts.sort(key=lambda item: str(item.get("created_at", "")))
+        return transcripts[-limit:]
 
     def _load_recent_summaries(self, *, limit: int = 8) -> list[dict[str, Any]]:
         summaries_dir = self.project_root / "data" / "profile" / "summaries"

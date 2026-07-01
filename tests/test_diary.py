@@ -43,6 +43,25 @@ class DiaryCollectorTest(unittest.TestCase):
                     },
                 ],
             )
+            self._write_jsonl(
+                root / "data" / "discord_voice" / "transcripts" / "2026-07-01.jsonl",
+                [
+                    {
+                        "created_at": "2026-07-01T21:15:00+09:00",
+                        "voice_channel_id": 10,
+                        "user_name": "haruka",
+                        "text": "通話で今日の作業を振り返った",
+                        "duration_sec": 3.2,
+                    },
+                    {
+                        "created_at": "2026-07-02T00:10:00+09:00",
+                        "voice_channel_id": 10,
+                        "user_name": "haruka",
+                        "text": "翌日の通話",
+                        "duration_sec": 2.0,
+                    },
+                ],
+            )
             self._write_json(
                 root / "data" / "profile" / "user_profile.json",
                 {
@@ -62,6 +81,8 @@ class DiaryCollectorTest(unittest.TestCase):
 
             self.assertEqual(len(sources.discord_turns), 1)
             self.assertEqual(sources.discord_turns[0]["user"], "朝に予定を確認した")
+            self.assertEqual(len(sources.voice_transcripts), 1)
+            self.assertEqual(sources.voice_transcripts[0]["text"], "通話で今日の作業を振り返った")
             self.assertEqual(len(sources.manual_schedule), 1)
             self.assertEqual(sources.manual_schedule[0]["title"], "昼の予定")
             self.assertTrue(sources.metrics_summary["available"])

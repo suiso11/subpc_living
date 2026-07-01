@@ -44,6 +44,7 @@ from src.discord_bot.training import (
     parse_correction,
 )
 from src.discord_bot.terminal import DiscordTerminal
+from src.discord_bot.voice_stt import DiscordVoiceSTT, VoiceSTTConfig, VoiceSTTError
 from src.diary.collector import DiaryCollector
 from src.diary.service import DailyDiaryResult, DailyDiaryService
 from src.integrations.google_calendar import GoogleCalendarMCPClient
@@ -174,6 +175,7 @@ class DiscordConsoleState:
     diary_personalization_enabled: bool = True
     diary_personalization_min_confidence: float = 0.72
     daily_personalizer: DailyPersonalizer | None = None
+    voice_stt: DiscordVoiceSTT | None = None
 
     def initialize(self) -> None:
         self.config = ChatConfig.load(PROJECT_ROOT / "config" / "chat_config.json")
@@ -228,6 +230,9 @@ class DiscordConsoleState:
             os.environ.get("DIARY_PERSONALIZATION_MIN_CONFIDENCE"),
             default=0.72,
         )
+        self.voice_stt = DiscordVoiceSTT(
+            VoiceSTTConfig.from_env(PROJECT_ROOT, timezone=self.diary_timezone)
+        )
         try:
             calendar_client = (
                 GoogleCalendarMCPClient.from_env()
@@ -261,6 +266,8 @@ class DiscordConsoleState:
     def close(self) -> None:
         if self.diary_task is not None:
             self.diary_task.cancel()
+        if self.voice_stt is not None:
+            self.voice_stt.close()
         if self.llm is not None:
             self.llm.close()
 
@@ -505,6 +512,7 @@ class DiscordConsoleState:
             f"diary_channel_id: {self.diary_channel_id or '-'}\n"
             f"diary_post_time: {self.diary_post_time.strftime('%H:%M')} {self.diary_timezone}\n"
             f"diary_personalization: {self.diary_personalization_enabled}\n"
+            f"{self.voice_stt.status_text() if self.voice_stt else 'voice_stt: unavailable'}\n"
             f"message_content_intent: {self.message_content_required()}\n"
             f"web_search: {self.web_search is not None}\n"
             f"service_control: {self.allow_service_control}\n"
@@ -681,6 +689,13 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
             f"channel={state.diary_channel_id or '-'} "
             f"time={state.diary_post_time.strftime('%H:%M')} {state.diary_timezone}"
         )
+        if state.voice_stt is not None:
+            print(
+                "[Discord] voice STT: "
+                f"enabled={state.voice_stt.config.enabled} "
+                f"available={state.voice_stt.available} "
+                f"transcript_channel={state.voice_stt.transcript_channel_id or '-'}"
+            )
 
     @bot.event
     async def on_message(message: discord.Message) -> None:
@@ -810,6 +825,95 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
             content=f"voice={voice} speed={speed}",
             file=discord.File(file_obj, filename="tts.wav"),
         )
+
+    voice_group = app_commands.Group(name="voice", description="Discord通話のSTTを操作します")
+
+    @voice_group.command(name="join", description="実行者がいる通話チャンネルへ参加します")
+    async def voice_join(interaction: discord.Interaction) -> None:
+        if not await require_allowed(interaction, state):
+            return
+        if state.voice_stt is None:
+            await interaction.response.send_message("voice STT が初期化されていません。", ephemeral=True)
+            return
+        await interaction.response.defer(thinking=True)
+        try:
+            text = await state.voice_stt.join(interaction)
+        except VoiceSTTError as e:
+            await interaction.followup.send(f"voice STT error: {e}", ephemeral=True)
+            return
+        except Exception as e:
+            await interaction.followup.send(f"voice STT error: `{e}`", ephemeral=True)
+            return
+        await interaction.followup.send(text)
+
+    @voice_group.command(name="start", description="通話チャンネルのSTTを開始します")
+    @app_commands.describe(transcript_channel="文字起こし投稿先。空なら設定値または実行チャンネル")
+    async def voice_start(
+        interaction: discord.Interaction,
+        transcript_channel: discord.TextChannel | None = None,
+    ) -> None:
+        if not await require_allowed(interaction, state):
+            return
+        if state.voice_stt is None:
+            await interaction.response.send_message("voice STT が初期化されていません。", ephemeral=True)
+            return
+        await interaction.response.defer(thinking=True)
+        try:
+            text = await state.voice_stt.start(
+                interaction,
+                transcript_channel=transcript_channel,
+            )
+        except VoiceSTTError as e:
+            await interaction.followup.send(f"voice STT error: {e}", ephemeral=True)
+            return
+        except Exception as e:
+            await interaction.followup.send(f"voice STT error: `{e}`", ephemeral=True)
+            return
+        await interaction.followup.send(text)
+
+    @voice_group.command(name="stop", description="通話チャンネルのSTTを停止します")
+    async def voice_stop(interaction: discord.Interaction) -> None:
+        if not await require_allowed(interaction, state):
+            return
+        if state.voice_stt is None:
+            await interaction.response.send_message("voice STT が初期化されていません。", ephemeral=True)
+            return
+        await interaction.response.defer(thinking=True)
+        try:
+            text = await state.voice_stt.stop()
+        except Exception as e:
+            await interaction.followup.send(f"voice STT error: `{e}`", ephemeral=True)
+            return
+        await interaction.followup.send(text)
+
+    @voice_group.command(name="leave", description="通話チャンネルから退出します")
+    async def voice_leave(interaction: discord.Interaction) -> None:
+        if not await require_allowed(interaction, state):
+            return
+        if state.voice_stt is None:
+            await interaction.response.send_message("voice STT が初期化されていません。", ephemeral=True)
+            return
+        await interaction.response.defer(thinking=True)
+        try:
+            text = await state.voice_stt.leave()
+        except Exception as e:
+            await interaction.followup.send(f"voice STT error: `{e}`", ephemeral=True)
+            return
+        await interaction.followup.send(text)
+
+    @voice_group.command(name="status", description="通話STTの状態を確認します")
+    async def voice_status(interaction: discord.Interaction) -> None:
+        if not await require_allowed(interaction, state):
+            return
+        if state.voice_stt is None:
+            await interaction.response.send_message("voice STT が初期化されていません。", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            f"```text\n{clean_output(state.voice_stt.status_text(), 1800)}\n```",
+            ephemeral=True,
+        )
+
+    bot.tree.add_command(voice_group)
 
     @bot.tree.command(name="status", description="subpc_living の状態を確認します")
     async def status(interaction: discord.Interaction) -> None:

@@ -679,12 +679,46 @@ Discord 側の slash command:
 | `/service` | `status` / `logs` / `health` / `gpu` / 許可時のみ `start` `stop` `restart` |
 | `/reset` | そのチャンネルの会話履歴をリセット |
 | `/diary` | 当日の日記を生成。プレビューまたは日記専用チャンネルへ投稿 |
+| `/voice` | 通話チャンネルへ参加し、STTの開始・停止・状態確認を行う |
 
 `DISCORD_AUTO_REPLY_CHANNEL_IDS` を設定したチャンネルでは、slash command なしで
 通常投稿されたテキストすべてに LLM が返信する。未設定の場合は
 `DISCORD_ALLOWED_CHANNEL_IDS` が自動返信対象として使われる。
 この機能には Discord Developer Portal の Bot 設定で
 **Message Content Intent** を有効化する必要がある。
+
+### Discord 通話STT
+
+`discord-ext-voice-recv` を使い、実行者が入っているDiscord通話チャンネルの
+音声をユーザー別に受信して `faster-whisper` で文字起こしする。
+結果は指定したテキストチャンネルへ投稿し、同時に
+`data/discord_voice/transcripts/YYYY-MM-DD.jsonl` へ保存する。
+
+```env
+DISCORD_VOICE_STT_ENABLED=true
+DISCORD_VOICE_TRANSCRIPT_CHANNEL_ID=123456789012345678
+DISCORD_VOICE_TIMEZONE=Asia/Tokyo
+DISCORD_VOICE_STT_LANGUAGE=ja
+DISCORD_VOICE_STT_MODEL=auto
+DISCORD_VOICE_STT_DEVICE=auto
+DISCORD_VOICE_STT_COMPUTE_TYPE=auto
+DISCORD_VOICE_STT_SAVE_TRANSCRIPTS=true
+```
+
+主なコマンド:
+
+```text
+/voice join
+/voice start transcript_channel:#voice-log
+/voice stop
+/voice leave
+/voice status
+```
+
+通話の文字起こしは参加者へ明示したうえで使う。botは自動では通話に入らず、
+`DISCORD_VOICE_STT_ENABLED=true` のときだけ `/voice start` で開始する。
+Discord側は通常のBot権限に加えて、対象VCへの接続権限と発言権限、
+文字起こし投稿先への送信権限が必要。
 
 ### 日次日記
 
@@ -709,6 +743,7 @@ GOOGLE_OAUTH_CREDENTIALS=/home/haruka/.config/google-calendar-mcp/gcp-oauth.keys
 
 - Google Calendar MCP の当日予定
 - `data/discord_training/conversations.jsonl` の当日会話
+- `data/discord_voice/transcripts/YYYY-MM-DD.jsonl` の当日通話文字起こし
 - `data/profile/summaries/summary_*.json` の直近要約
 - `data/metrics/system_metrics.db` の当日PCメトリクス
 - `data/profile/user_profile.json` のプロフィールと手動スケジュール

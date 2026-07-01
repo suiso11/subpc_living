@@ -152,6 +152,7 @@
 | F-18 | 状態表示 | 現在のAIの状態（リスニング中/処理中/応答中等）を表示 |
 | F-29 | 日次日記投稿 | 1日の終わりに予定・会話・PCログをまとめ、専用Discordチャンネルへ日記として投稿 |
 | F-30 | 日次パーソナライズ | 日記から安定した嗜好・習慣・事実だけを抽出し、短いプロフィールへ反映 |
+| F-31 | Discord通話STT | Discordの通話チャンネル音声をユーザー別に文字起こしし、専用チャンネルへ投稿・保存 |
 
 ### 5.6 日記・ライフログ
 
@@ -161,6 +162,7 @@
 
 - Google Calendar MCP から取得した当日予定
 - Discord 自動返信ログ (`data/discord_training/conversations.jsonl`)
+- Discord 通話STTログ (`data/discord_voice/transcripts/YYYY-MM-DD.jsonl`)
 - 直近の会話要約 (`data/profile/summaries/`)
 - PCメトリクス (`data/metrics/system_metrics.db`)
 - ユーザープロファイルと手動スケジュール (`data/profile/user_profile.json`)
@@ -238,7 +240,7 @@ GOOGLE_OAUTH_CREDENTIALS=/home/haruka/.config/google-calendar-mcp/gcp-oauth.keys
 | オーケストレーション | Python (FastAPI / asyncio) | 各モジュールを非同期パイプラインで統合 |
 | プロセス管理 | systemd / supervisord | 常時稼働・自動再起動 |
 | フロントエンド | Web UI (Gradio / Open WebUI) | 状態表示・テキスト対話用。オプション |
-| Discord操作コンソール | discord.py | slash command、自動返信、terminal bridge、日記専用チャンネル投稿 |
+| Discord操作コンソール | discord.py + discord-ext-voice-recv | slash command、自動返信、terminal bridge、通話STT、日記専用チャンネル投稿 |
 | カレンダー連携 | Google Calendar MCP | 当日予定を日記・プリロード文脈の材料として取得 |
 | 日記保存 | Markdown + JSON | `data/diary/` に本文・メタデータ・投稿済み状態を保存 |
 
@@ -295,6 +297,7 @@ GOOGLE_OAUTH_CREDENTIALS=/home/haruka/.config/google-calendar-mcp/gcp-oauth.keys
 | **Phase 9** | **GPU換装** | **P40に換装、モデル13B化、全モジュールGPU化、レイテンシ改善** | ✅ **完了** |
 | **Phase 10** | **ウェイクワード検知** | **OpenWakeWordで呼びかけ検知、常時待機→自動起動** | ✅ **完了** |
 | **Phase 11** | **日次日記・Calendar連携** | **Google Calendar MCPとローカルログを使い、日記投稿と日次パーソナライズを実行** | ✅ **完了** |
+| **Phase 12** | **Discord通話STT** | **通話チャンネル音声をユーザー別に文字起こしし、Discord投稿・日記材料として保存** | ✅ **完了** |
 
 ## 11. 今後の検討事項
 
