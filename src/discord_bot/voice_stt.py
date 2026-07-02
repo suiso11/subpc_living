@@ -97,6 +97,96 @@ def _patch_voice_recv_opus_decoder() -> None:
 _patch_voice_recv_opus_decoder()
 
 
+# Discord voice is end-to-end encrypted with the DAVE protocol (mandatory:
+# advertising max_dave_protocol_version=0 gets the connection closed with 4017).
+# discord.py 2.7 implements the MLS handshake and *send-side* frame encryption,
+# but discord-ext-voice-recv knows nothing about DAVE, so received frames stay
+# E2EE after transport decryption and reach the Opus decoder as random bytes —
+# ~40% raise "corrupted stream" and the rest decode into buzzing noise, which
+# Whisper transcribes as 「ブーブー」「パカッ」. Fix: run each received frame
+# through discord.py's own DaveSession (which holds the MLS group keys) right
+# after transport decryption.
+_DAVE_DECRYPT_FAILURES = 0
+_DAVE_DECRYPT_OK = 0
+
+
+def dave_decrypt_failure_count() -> int:
+    return _DAVE_DECRYPT_FAILURES
+
+
+def _dave_decrypt_frame(voice_client: Any, ssrc: int, data: bytes) -> bytes:
+    """Decrypt one received DAVE media frame; return input unchanged if N/A.
+
+    Falls back to the original bytes when the session isn't ready, the sender
+    is unknown, or decryption fails (e.g. unencrypted Opus silence frames) —
+    the Opus decoder then either handles them or the loss-concealment path
+    kicks in.
+    """
+    global _DAVE_DECRYPT_FAILURES, _DAVE_DECRYPT_OK
+    if not data:
+        return data
+    try:
+        session = getattr(getattr(voice_client, "_connection", None), "dave_session", None)
+        if session is None or not session.ready:
+            return data
+        user_id = voice_client._get_id_from_ssrc(ssrc)
+        if user_id is None:
+            return data
+        import davey
+
+        frame = session.decrypt(user_id, davey.MediaType.audio, bytes(data))
+        if not frame:
+            return data
+        _DAVE_DECRYPT_OK += 1
+        if _DAVE_DECRYPT_OK == 1:
+            print("[DiscordVoiceSTT] DAVE E2EE フレーム復号 OK (受信音声は正常に復号されます)")
+        return bytes(frame)
+    except Exception as exc:
+        _DAVE_DECRYPT_FAILURES += 1
+        if _DAVE_DECRYPT_FAILURES <= 3 or _DAVE_DECRYPT_FAILURES % 200 == 0:
+            print(
+                "[DiscordVoiceSTT] DAVE decrypt failed "
+                f"count={_DAVE_DECRYPT_FAILURES} ssrc={ssrc} len={len(data)}: {exc}"
+            )
+        return data
+
+
+def _patch_voice_recv_dave_decrypt() -> None:
+    """Insert DAVE frame decryption right after transport decryption.
+
+    AudioReader binds `decrypt_rtp` as an instance attribute on its
+    PacketDecryptor, so wrap it per-reader from a patched AudioReader.__init__.
+    This point sees every packet exactly once (including ones later used for
+    FEC), before any Opus decoding.
+    """
+    if voice_recv is None:
+        return
+    try:
+        from discord.ext.voice_recv.reader import AudioReader
+    except Exception:
+        return
+    if getattr(AudioReader.__init__, "_subpc_dave_patched", False):
+        return
+
+    original_init = AudioReader.__init__
+
+    def patched_init(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        original_init(self, *args, **kwargs)
+        voice_client = self.voice_client
+        inner_decrypt = self.decryptor.decrypt_rtp
+
+        def decrypt_rtp_with_dave(packet):  # type: ignore[no-untyped-def]
+            return _dave_decrypt_frame(voice_client, packet.ssrc, inner_decrypt(packet))
+
+        self.decryptor.decrypt_rtp = decrypt_rtp_with_dave
+
+    patched_init._subpc_dave_patched = True  # type: ignore[attr-defined]
+    AudioReader.__init__ = patched_init  # type: ignore[assignment]
+
+
+_patch_voice_recv_dave_decrypt()
+
+
 DISCORD_PCM_SAMPLE_RATE = 48000
 DISCORD_PCM_CHANNELS = 2
 STT_SAMPLE_RATE = 16000
@@ -719,6 +809,7 @@ class DiscordVoiceSTT:
             f"voice_received_audio_sec: {audio_seconds:.1f}\n"
             f"voice_transcripts: {self.transcript_count}\n"
             f"voice_decode_errors: {decode_errors}\n"
+            f"voice_dave_decrypt_failures: {dave_decrypt_failure_count()}\n"
             f"voice_dropped_segments: {dropped}\n"
             f"voice_last_error: {self.last_error or '-'}"
         )
