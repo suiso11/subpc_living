@@ -1166,6 +1166,30 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
             f"読み上げました ({duration:.1f}秒): {text[:100]}{'...' if len(text) > 100 else ''}"
         )
 
+    @voice_group.command(name="tts", description="通話でのTTS自動読み上げをON/OFFします")
+    @app_commands.describe(enabled="true=読み上げON / false=OFF。省略で現在の状態を表示")
+    async def voice_tts_toggle(
+        interaction: discord.Interaction,
+        enabled: bool | None = None,
+    ) -> None:
+        if not await require_allowed(interaction, state):
+            return
+        if state.voice_tts is None:
+            await interaction.response.send_message("voice TTS が初期化されていません。", ephemeral=True)
+            return
+        if enabled is None:
+            current = "ON" if state.voice_tts.autoread_enabled else "OFF"
+            await interaction.response.send_message(
+                f"TTS自動読み上げは現在 {current} です。/voice tts enabled:true|false で切り替えられます。",
+                ephemeral=True,
+            )
+            return
+        state.voice_tts.autoread_enabled = enabled
+        await interaction.response.send_message(
+            f"TTS自動読み上げを {'ON' if enabled else 'OFF'} にしました。"
+            + ("" if enabled else " (/voice say での手動読み上げは引き続き使えます)")
+        )
+
     @voice_group.command(name="status", description="通話STTの状態を確認します")
     async def voice_status(interaction: discord.Interaction) -> None:
         if not await require_allowed(interaction, state):
@@ -1176,7 +1200,7 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
         status_lines = state.voice_stt.status_text()
         if state.voice_tts is not None:
             status_lines += (
-                f"\nvoice_tts_autoread: {state.voice_tts.config.autoread}"
+                f"\nvoice_tts_autoread: {state.voice_tts.autoread_enabled}"
                 f"\nvoice_tts_played: {state.voice_tts.played_count}"
                 f"\nvoice_tts_last_error: {state.voice_tts.last_error or '-'}"
             )

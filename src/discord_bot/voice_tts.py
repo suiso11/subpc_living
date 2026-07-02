@@ -117,6 +117,8 @@ class VoiceTTSPlayer:
         self._play_lock = asyncio.Lock()
         self.played_count = 0
         self.last_error: str = ""
+        # /voice tts on|off で実行中に切り替えられる。初期値は env 設定。
+        self.autoread_enabled = config.autoread
 
     def _connected_voice_client(self) -> Any:
         voice_client = self._get_voice_client()
@@ -187,7 +189,7 @@ class VoiceTTSPlayer:
 
     async def autoread(self, text: str) -> None:
         """Best-effort auto readout for LLM replies; never raises."""
-        if not self.config.autoread:
+        if not self.autoread_enabled:
             return
         voice_client = self._get_voice_client()
         if voice_client is None or not voice_client.is_connected():
