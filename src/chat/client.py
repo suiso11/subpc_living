@@ -102,15 +102,19 @@ class OllamaClient:
         top_k: int,
         repeat_penalty: float,
         num_ctx: int,
+        num_predict: int | None = None,
     ) -> dict:
         """Ollama options を統一的に組み立てる"""
-        return {
+        options = {
             "temperature": temperature,
             "top_p": top_p,
             "top_k": top_k,
             "repeat_penalty": repeat_penalty,
             "num_ctx": num_ctx,
         }
+        if num_predict is not None and num_predict > 0:
+            options["num_predict"] = num_predict
+        return options
 
     def generate(
         self,
@@ -121,6 +125,7 @@ class OllamaClient:
         top_k: int = 40,
         repeat_penalty: float = 1.1,
         num_ctx: int = 8192,
+        num_predict: int | None = None,
     ) -> str:
         """非ストリーミングでチャット応答を生成"""
         payload = {
@@ -135,6 +140,7 @@ class OllamaClient:
                 top_k=top_k,
                 repeat_penalty=repeat_penalty,
                 num_ctx=num_ctx,
+                num_predict=num_predict,
             ),
         }
         resp = self._client.post("/api/chat", json=payload)
@@ -151,6 +157,7 @@ class OllamaClient:
         top_k: int = 40,
         repeat_penalty: float = 1.1,
         num_ctx: int = 8192,
+        num_predict: int | None = None,
     ) -> Generator[str, None, None]:
         """ストリーミングでチャット応答を生成（トークン単位で返す）
 
@@ -168,6 +175,7 @@ class OllamaClient:
                 top_k=top_k,
                 repeat_penalty=repeat_penalty,
                 num_ctx=num_ctx,
+                num_predict=num_predict,
             ),
         }
 
@@ -226,6 +234,7 @@ class OllamaClient:
         top_k: int = 40,
         repeat_penalty: float = 1.1,
         num_ctx: int = 8192,
+        num_predict: int | None = None,
     ) -> queue.Queue:
         """スレッドセーフなキューベースのストリーミング。
 
@@ -245,6 +254,7 @@ class OllamaClient:
                     top_k=top_k,
                     repeat_penalty=repeat_penalty,
                     num_ctx=num_ctx,
+                    num_predict=num_predict,
                 ):
                     q.put(token)
             except Exception as e:

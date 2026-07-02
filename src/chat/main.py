@@ -172,6 +172,7 @@ def main():
                     top_k=config.top_k,
                     repeat_penalty=config.repeat_penalty,
                     num_ctx=config.num_ctx,
+                    num_predict=config.num_predict,
                 ):
                     print(token, end="", flush=True)
                     full_response += token
@@ -190,6 +191,7 @@ def main():
                     top_k=config.top_k,
                     repeat_penalty=config.repeat_penalty,
                     num_ctx=config.num_ctx,
+                    num_predict=config.num_predict,
                 )
                 print(response)
                 session.add_assistant_message(response)

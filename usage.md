@@ -720,6 +720,26 @@ DISCORD_VOICE_STT_SAVE_TRANSCRIPTS=true
 Discord側は通常のBot権限に加えて、対象VCへの接続権限と発言権限、
 文字起こし投稿先への送信権限が必要。
 
+### Discord 返答ログの学習データ化
+
+Discord bot の自動返信は `data/discord_training/conversations.jsonl` に、
+👍/👎 は `feedback.jsonl` に、`修正: ...` 返信は
+`training_candidates.jsonl` に保存される。モデル調整に使う場合は、
+生ログをそのまま学習に入れず、明示的に修正した候補を優先する。
+
+STT返答チャンネルなど特定プロファイルだけを DPO 形式に出す例:
+
+```bash
+python scripts/export_discord_training.py \
+  --format preference \
+  --profile voice_short \
+  --source discord_voice_transcript \
+  --output data/discord_training/exports/voice_short_preference.jsonl
+```
+
+SFT形式に出す場合も、デフォルトでは `修正: ...` 済みの候補だけを使う。
+👍済みの生返答も混ぜたい場合だけ `--include-positive-feedback` を付ける。
+
 ### 日次日記
 
 Discord bot は毎日指定時刻に日記を生成し、通常会話・terminal とは別の

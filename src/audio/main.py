@@ -154,6 +154,7 @@ def run_text_to_speech_mode(args):
                 top_k=config.top_k,
                 num_ctx=config.num_ctx,
                 repeat_penalty=config.repeat_penalty,
+                num_predict=config.num_predict,
             ):
                 print(token, end="", flush=True)
                 response += token

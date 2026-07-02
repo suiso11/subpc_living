@@ -499,6 +499,7 @@ class VoicePipeline:
                 top_k=self.config.top_k,
                 num_ctx=self.config.num_ctx,
                 repeat_penalty=self.config.repeat_penalty,
+                num_predict=self.config.num_predict,
             ):
                 response_text += token
                 sentence_buffer += token
@@ -580,6 +581,7 @@ class VoicePipeline:
             top_k=self.config.top_k,
             num_ctx=self.config.num_ctx,
             repeat_penalty=self.config.repeat_penalty,
+            num_predict=self.config.num_predict,
         ):
             response_text += token
             print(token, end="", flush=True)

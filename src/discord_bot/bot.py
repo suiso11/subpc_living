@@ -23,6 +23,7 @@ import threading
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import discord
@@ -53,6 +54,7 @@ from src.service.healthcheck import HealthChecker
 
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+VOICE_TRANSCRIPT_RE = re.compile(r"^\[\d{2}:\d{2}:\d{2}\]\s+.+?:\s*(?P<text>.+)$", re.DOTALL)
 MAX_DISCORD_MESSAGE = 1900
 
 
@@ -146,10 +148,85 @@ def split_message(text: str) -> list[str]:
     return chunks
 
 
+def _coerce_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_optional_int(value: Any, default: int | None = None) -> int | None:
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+@dataclass(frozen=True)
+class DiscordLLMProfile:
+    name: str
+    ollama_base_url: str
+    model: str
+    system_prompt: str
+    max_history_turns: int
+    temperature: float
+    top_p: float
+    top_k: int
+    repeat_penalty: float
+    num_ctx: int
+    num_predict: int | None = None
+
+    @classmethod
+    def from_config(
+        cls,
+        config: ChatConfig,
+        *,
+        name: str = "default",
+        overrides: dict[str, Any] | None = None,
+    ) -> "DiscordLLMProfile":
+        raw = overrides or {}
+        system_prompt = str(raw.get("system_prompt", config.system_prompt))
+        suffix = str(raw.get("system_prompt_suffix", "") or "")
+        if suffix:
+            system_prompt = f"{system_prompt.rstrip()}\n{suffix}"
+
+        return cls(
+            name=name,
+            ollama_base_url=str(raw.get("ollama_base_url", config.ollama_base_url)),
+            model=str(raw.get("model", config.model)),
+            system_prompt=system_prompt,
+            max_history_turns=_coerce_int(
+                raw.get("max_history_turns", config.max_history_turns),
+                config.max_history_turns,
+            ),
+            temperature=_coerce_float(raw.get("temperature", config.temperature), config.temperature),
+            top_p=_coerce_float(raw.get("top_p", config.top_p), config.top_p),
+            top_k=_coerce_int(raw.get("top_k", config.top_k), config.top_k),
+            repeat_penalty=_coerce_float(
+                raw.get("repeat_penalty", config.repeat_penalty),
+                config.repeat_penalty,
+            ),
+            num_ctx=_coerce_int(raw.get("num_ctx", config.num_ctx), config.num_ctx),
+            num_predict=_coerce_optional_int(raw.get("num_predict", config.num_predict), config.num_predict),
+        )
+
+
 @dataclass
 class DiscordConsoleState:
     config: ChatConfig | None = None
     llm: OllamaClient | None = None
+    llm_clients: dict[tuple[str, str], OllamaClient] = field(default_factory=dict)
+    llm_profiles: dict[str, DiscordLLMProfile] = field(default_factory=dict)
+    channel_profile_map: dict[int, str] = field(default_factory=dict)
     tts: KokoroTTS | None = None
     sessions: dict[str, ChatSession] = field(default_factory=dict)
     session_locks: dict[str, threading.Lock] = field(default_factory=dict)
@@ -179,10 +256,9 @@ class DiscordConsoleState:
 
     def initialize(self) -> None:
         self.config = ChatConfig.load(PROJECT_ROOT / "config" / "chat_config.json")
-        self.llm = OllamaClient(
-            base_url=self.config.ollama_base_url,
-            model=self.config.model,
-        )
+        self.llm_profiles = self._load_llm_profiles()
+        self.channel_profile_map = self._load_channel_profile_map()
+        self.llm = self._llm_for_profile(self.llm_profiles["default"])
         self.allowed_user_ids = parse_id_set(os.environ.get("DISCORD_ALLOWED_USER_IDS"))
         self.allowed_channel_ids = parse_id_set(os.environ.get("DISCORD_ALLOWED_CHANNEL_IDS"))
         self.auto_reply_channel_ids = parse_id_set(os.environ.get("DISCORD_AUTO_REPLY_CHANNEL_IDS"))
@@ -268,8 +344,8 @@ class DiscordConsoleState:
             self.diary_task.cancel()
         if self.voice_stt is not None:
             self.voice_stt.close()
-        if self.llm is not None:
-            self.llm.close()
+        for client in set(self.llm_clients.values()):
+            client.close()
 
     def is_allowed(self, interaction: discord.Interaction) -> bool:
         if self.allowed_user_ids and interaction.user.id not in self.allowed_user_ids:
@@ -286,6 +362,31 @@ class DiscordConsoleState:
         if not (self._message_channel_ids(message) & self.auto_reply_channel_ids):
             return False
         return True
+
+    def is_allowed_voice_transcript_message(
+        self,
+        message: discord.Message,
+        *,
+        bot_user_id: int | None,
+    ) -> bool:
+        if bot_user_id is None or message.author.id != bot_user_id:
+            return False
+        if self.voice_stt is None or self.voice_stt.transcript_channel_id is None:
+            return False
+        channel_ids = self._message_channel_ids(message)
+        if self.voice_stt.transcript_channel_id not in channel_ids:
+            return False
+        if not (channel_ids & self.auto_reply_channel_ids):
+            return False
+        return self.extract_voice_transcript_text(message.content) is not None
+
+    @staticmethod
+    def extract_voice_transcript_text(content: str) -> str | None:
+        match = VOICE_TRANSCRIPT_RE.match(content.strip())
+        if match is None:
+            return None
+        text = match.group("text").strip()
+        return text or None
 
     def is_terminal_message(self, message: discord.Message) -> bool:
         return self.terminal_reject_reason(message) is None
@@ -322,6 +423,56 @@ class DiscordConsoleState:
     def message_content_required(self) -> bool:
         return self.auto_reply_enabled() or self.terminal_enabled()
 
+    def _load_llm_profiles(self) -> dict[str, DiscordLLMProfile]:
+        assert self.config is not None
+        profiles = {
+            "default": DiscordLLMProfile.from_config(self.config, name="default"),
+        }
+        for name, raw_profile in self.config.discord_channel_profiles.items():
+            if not isinstance(raw_profile, dict):
+                print(f"[Discord] LLM profile を無視します: {name}")
+                continue
+            profiles[name] = DiscordLLMProfile.from_config(
+                self.config,
+                name=name,
+                overrides=raw_profile,
+            )
+        return profiles
+
+    def _load_channel_profile_map(self) -> dict[int, str]:
+        assert self.config is not None
+        mapping: dict[int, str] = {}
+        for raw_channel_id, profile_name in self.config.discord_channel_profile_map.items():
+            try:
+                channel_id = int(raw_channel_id)
+            except (TypeError, ValueError):
+                print(f"[Discord] channel profile ID を無視します: {raw_channel_id}")
+                continue
+            if profile_name not in self.llm_profiles:
+                print(
+                    "[Discord] 未定義のLLM profile を無視します: "
+                    f"channel={channel_id} profile={profile_name}"
+                )
+                continue
+            mapping[channel_id] = profile_name
+        return mapping
+
+    def _llm_for_profile(self, profile: DiscordLLMProfile) -> OllamaClient:
+        key = (profile.ollama_base_url, profile.model)
+        if key not in self.llm_clients:
+            self.llm_clients[key] = OllamaClient(
+                base_url=profile.ollama_base_url,
+                model=profile.model,
+            )
+        return self.llm_clients[key]
+
+    def profile_for_channel_ids(self, channel_ids: set[int]) -> DiscordLLMProfile:
+        for channel_id in channel_ids:
+            profile_name = self.channel_profile_map.get(channel_id)
+            if profile_name:
+                return self.llm_profiles[profile_name]
+        return self.llm_profiles["default"]
+
     @staticmethod
     def _message_channel_ids(message: discord.Message) -> set[int]:
         ids = {message.channel.id}
@@ -342,16 +493,23 @@ class DiscordConsoleState:
     ) -> str:
         return f"discord-ephemeral:{guild_id or 0}:{channel_id or 0}:{user_id}"
 
-    def _session_for_key(self, key: str) -> tuple[ChatSession, threading.Lock]:
+    def _session_for_key(
+        self,
+        key: str,
+        profile: DiscordLLMProfile,
+    ) -> tuple[ChatSession, threading.Lock]:
         assert self.config is not None
         with self.sessions_lock:
             if key not in self.sessions:
                 self.sessions[key] = ChatSession(
-                    system_prompt=self.config.system_prompt,
-                    max_history_turns=self.config.max_history_turns,
+                    system_prompt=profile.system_prompt,
+                    max_history_turns=profile.max_history_turns,
                     history_dir=str(PROJECT_ROOT / self.config.history_dir),
                     web_search=self.web_search,
                 )
+            else:
+                self.sessions[key].system_prompt = profile.system_prompt
+                self.sessions[key].max_history_turns = profile.max_history_turns
             if key not in self.session_locks:
                 self.session_locks[key] = threading.Lock()
             return self.sessions[key], self.session_locks[key]
@@ -361,7 +519,9 @@ class DiscordConsoleState:
         interaction: discord.Interaction,
         *,
         ephemeral: bool = False,
-    ) -> tuple[ChatSession, threading.Lock]:
+    ) -> tuple[ChatSession, threading.Lock, DiscordLLMProfile]:
+        channel_ids = {interaction.channel_id} if interaction.channel_id is not None else set()
+        profile = self.profile_for_channel_ids(channel_ids)
         if ephemeral:
             key = self._ephemeral_session_key(
                 interaction.guild_id,
@@ -370,14 +530,20 @@ class DiscordConsoleState:
             )
         else:
             key = self._shared_session_key(interaction.guild_id, interaction.channel_id)
-        return self._session_for_key(key)
+        session, lock = self._session_for_key(key, profile)
+        return session, lock, profile
 
-    def get_message_session(self, message: discord.Message) -> tuple[ChatSession, threading.Lock]:
+    def get_message_session(
+        self,
+        message: discord.Message,
+    ) -> tuple[ChatSession, threading.Lock, DiscordLLMProfile]:
+        profile = self.profile_for_channel_ids(self._message_channel_ids(message))
         key = self._shared_session_key(
             message.guild.id if message.guild else None,
             message.channel.id,
         )
-        return self._session_for_key(key)
+        session, lock = self._session_for_key(key, profile)
+        return session, lock, profile
 
     def reset_session(self, interaction: discord.Interaction) -> None:
         key = self._shared_session_key(interaction.guild_id, interaction.channel_id)
@@ -388,33 +554,45 @@ class DiscordConsoleState:
     def ask(self, interaction: discord.Interaction, prompt: str, *, ephemeral: bool = False) -> str:
         if self.llm is None or self.config is None:
             raise RuntimeError("LLM is not initialized")
-        session, lock = self.get_session(interaction, ephemeral=ephemeral)
-        return self.ask_session(session, prompt, lock)
+        session, lock, profile = self.get_session(interaction, ephemeral=ephemeral)
+        return self.ask_session(session, prompt, lock, profile)
 
     def ask_message(self, message: discord.Message) -> str:
         if self.llm is None or self.config is None:
             raise RuntimeError("LLM is not initialized")
-        session, lock = self.get_message_session(message)
-        return self.ask_session(session, message.content.strip(), lock)
+        return self.ask_message_text(message, message.content.strip())
+
+    def ask_message_text(self, message: discord.Message, prompt: str) -> str:
+        if self.llm is None or self.config is None:
+            raise RuntimeError("LLM is not initialized")
+        session, lock, profile = self.get_message_session(message)
+        return self.ask_session(session, prompt, lock, profile)
 
     def record_auto_reply(
         self,
         message: discord.Message,
         response: str,
         reply_messages: list[discord.Message],
+        user_text: str | None = None,
+        source: str = "discord_auto_reply",
     ) -> None:
         if self.training_log is None or self.config is None:
             return
+        profile = self.profile_for_channel_ids(self._message_channel_ids(message))
         self.training_log.record_turn(
             guild_id=message.guild.id if message.guild else None,
             channel_id=message.channel.id,
             user_id=message.author.id,
             user_message_id=message.id,
             assistant_message_ids=[reply.id for reply in reply_messages],
-            user_text=message.content.strip(),
+            user_text=user_text if user_text is not None else message.content.strip(),
             assistant_text=response,
-            model=self.config.model,
-            num_ctx=self.config.num_ctx,
+            model=profile.model,
+            num_ctx=profile.num_ctx,
+            source=source,
+            profile=profile.name,
+            num_predict=profile.num_predict,
+            temperature=profile.temperature,
         )
 
     def record_feedback(
@@ -461,19 +639,27 @@ class DiscordConsoleState:
         prefix = "" if result.ok else "terminal error:\n"
         return prefix + result.text
 
-    def ask_session(self, session: ChatSession, prompt: str, lock: threading.Lock) -> str:
+    def ask_session(
+        self,
+        session: ChatSession,
+        prompt: str,
+        lock: threading.Lock,
+        profile: DiscordLLMProfile,
+    ) -> str:
         if self.llm is None or self.config is None:
             raise RuntimeError("LLM is not initialized")
+        llm = self._llm_for_profile(profile)
         with lock:
             session.add_user_message(prompt)
             try:
-                response = self.llm.generate(
+                response = llm.generate(
                     session.build_messages(),
-                    temperature=self.config.temperature,
-                    top_p=self.config.top_p,
-                    top_k=self.config.top_k,
-                    repeat_penalty=self.config.repeat_penalty,
-                    num_ctx=self.config.num_ctx,
+                    temperature=profile.temperature,
+                    top_p=profile.top_p,
+                    top_k=profile.top_k,
+                    repeat_penalty=profile.repeat_penalty,
+                    num_ctx=profile.num_ctx,
+                    num_predict=profile.num_predict,
                 )
             except Exception:
                 if session._messages and session._messages[-1]["role"] == "user":
@@ -498,10 +684,13 @@ class DiscordConsoleState:
         tts_loaded = self.tts is not None and self.tts.is_loaded()
         with self.sessions_lock:
             session_count = len(self.sessions)
+        default_profile = self.llm_profiles.get("default")
         return (
             f"status: {health['status']}\n"
             f"ollama: {'ok' if llm_ok else 'ng'}\n"
-            f"model: {self.config.model}\n"
+            f"model: {default_profile.model if default_profile else self.config.model}\n"
+            f"llm_profiles: {', '.join(sorted(self.llm_profiles))}\n"
+            f"channel_profile_map: {len(self.channel_profile_map)}\n"
             f"sessions: {session_count}\n"
             f"tts_loaded: {tts_loaded}\n"
             f"auto_reply_channels: {len(self.auto_reply_channel_ids)}\n"
@@ -699,7 +888,41 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
 
     @bot.event
     async def on_message(message: discord.Message) -> None:
-        if message.author.bot:
+        bot_user_id = bot.user.id if bot.user is not None else None
+        transcript_text = None
+        if state.is_allowed_voice_transcript_message(message, bot_user_id=bot_user_id):
+            transcript_text = state.extract_voice_transcript_text(message.content)
+        elif message.author.bot:
+            return
+
+        if transcript_text is not None:
+            async with message.channel.typing():
+                try:
+                    response = await asyncio.to_thread(
+                        state.ask_message_text,
+                        message,
+                        transcript_text,
+                    )
+                except Exception as e:
+                    await message.reply(f"LLM error: `{e}`", mention_author=False)
+                    return
+            reply_messages = []
+            for chunk in split_message(response):
+                sent = await message.reply(chunk, mention_author=False)
+                reply_messages.append(sent)
+            state.record_auto_reply(
+                message,
+                response,
+                reply_messages,
+                user_text=transcript_text,
+                source="discord_voice_transcript",
+            )
+            if reply_messages:
+                for reaction in (GOOD_REACTION, BAD_REACTION):
+                    try:
+                        await reply_messages[0].add_reaction(reaction)
+                    except discord.HTTPException as e:
+                        print(f"[Discord] feedback reaction failed: {e}")
             return
 
         terminal_content = message.content.strip()

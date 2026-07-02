@@ -769,6 +769,7 @@ async def websocket_chat(websocket: WebSocket):
                     top_k=config.top_k,
                     repeat_penalty=config.repeat_penalty,
                     num_ctx=config.num_ctx,
+                    num_predict=config.num_predict,
                 )
 
                 while True:

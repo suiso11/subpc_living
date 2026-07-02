@@ -2,7 +2,7 @@
 チャット設定モジュール
 Phase 2: テキスト対話用の設定を管理する
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import json
 
@@ -21,6 +21,7 @@ class ChatConfig:
     top_k: int = 40
     repeat_penalty: float = 1.1
     num_ctx: int = 8192  # コンテキスト長
+    num_predict: int | None = None  # 最大生成トークン数。NoneならOllamaデフォルト
 
     # --- システムプロンプト ---
     system_prompt: str = (
@@ -45,6 +46,12 @@ class ChatConfig:
 
     # --- 表示設定 ---
     stream: bool = True  # ストリーミング出力を使用するか
+
+    # --- Discord チャンネル別LLMプロファイル ---
+    # discord_channel_profile_map: {"channel_id": "profile_name"}
+    # discord_channel_profiles: {"profile_name": {"temperature": 0.4, ...}}
+    discord_channel_profile_map: dict[str, str] = field(default_factory=dict)
+    discord_channel_profiles: dict[str, dict] = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: str | Path = "config/chat_config.json") -> "ChatConfig":

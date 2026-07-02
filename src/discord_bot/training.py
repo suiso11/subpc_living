@@ -101,6 +101,10 @@ class DiscordTrainingLog:
         assistant_text: str,
         model: str,
         num_ctx: int,
+        source: str = "discord_auto_reply",
+        profile: str = "default",
+        num_predict: int | None = None,
+        temperature: float | None = None,
     ) -> str | None:
         if not self.enabled:
             return None
@@ -108,7 +112,8 @@ class DiscordTrainingLog:
         turn = {
             "turn_id": uuid.uuid4().hex,
             "created_at": self._now(),
-            "source": "discord_auto_reply",
+            "source": source,
+            "profile": profile,
             "guild_id": guild_id,
             "channel_id": channel_id,
             "user_id": user_id,
@@ -116,6 +121,8 @@ class DiscordTrainingLog:
             "assistant_message_ids": assistant_message_ids,
             "model": model,
             "num_ctx": num_ctx,
+            "num_predict": num_predict,
+            "temperature": temperature,
             "user": user_text,
             "assistant": assistant_text,
         }
@@ -201,6 +208,10 @@ class DiscordTrainingLog:
                 "assistant_message_ids": turn.get("assistant_message_ids", []),
                 "model": turn.get("model"),
                 "num_ctx": turn.get("num_ctx"),
+                "num_predict": turn.get("num_predict"),
+                "temperature": turn.get("temperature"),
+                "turn_source": turn.get("source"),
+                "profile": turn.get("profile", "default"),
                 "messages": self._build_sft_messages(turn["user"], corrected_text),
                 "input": turn["user"],
                 "preferred_output": corrected_text,
