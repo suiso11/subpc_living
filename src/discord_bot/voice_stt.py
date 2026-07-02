@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import queue
 import threading
@@ -15,6 +16,7 @@ from zoneinfo import ZoneInfo
 
 import discord
 import numpy as np
+from discord.opus import OpusError
 
 from src.audio.stt import WhisperSTT
 
@@ -24,10 +26,118 @@ except Exception:  # pragma: no cover - exercised when optional dependency is ab
     voice_recv = None
 
 
+# discord-ext-voice_recv's reader logs every non-ReceiverReport RTCP packet at
+# INFO, which is noisy on real Discord voice streams. Quiet it down so STT
+# diagnostics stay readable.
+logging.getLogger("discord.ext.voice_recv.reader").setLevel(logging.WARNING)
+
+
+# Module-level counter for swallowed Opus decode errors. The monkeypatched
+# decoder runs deep inside discord-ext-voice_recv with no handle back to our
+# sink, so we track the count here and let the sink/status read it. Diagnostic
+# only; not reset between sessions.
+_OPUS_DECODE_ERRORS = 0
+
+
+def opus_decode_error_count() -> int:
+    return _OPUS_DECODE_ERRORS
+
+
+def _patch_voice_recv_opus_decoder() -> None:
+    """Make PacketDecoder._decode_packet swallow OpusError instead of crashing the reader.
+
+    discord-ext-voice_recv's jitter buffer and FEC handling already absorb most
+    packet loss, but a corrupted/missing reference frame can still raise
+    OpusError from Decoder.decode. The library propagates that out of the RTP
+    callback and stops the voice reader entirely, which kills STT mid-session.
+
+    We must NOT drop the frame (empty PCM) or swap in a fresh decoder here:
+    Opus is stateful, so both splice discontinuities into the stream and the
+    resulting audio sounds like buzzing/clicking to Whisper. Instead ask the
+    decoder to conceal the loss (decode(None)), which emits a plausible 20 ms of
+    PCM and keeps decoder state intact.
+    """
+    if voice_recv is None:
+        return
+    try:
+        from discord.ext.voice_recv.opus import PacketDecoder
+    except Exception:
+        return
+    if getattr(PacketDecoder._decode_packet, "_subpc_patched", False):
+        return
+
+    original = PacketDecoder._decode_packet
+
+    def safe_decode(self, packet):  # type: ignore[no-untyped-def]
+        global _OPUS_DECODE_ERRORS
+        try:
+            return original(self, packet)
+        except OpusError as exc:
+            _OPUS_DECODE_ERRORS += 1
+            decoder = getattr(self, "_decoder", None)
+            concealed = b""
+            if decoder is not None:
+                try:
+                    # Packet loss concealment: emit ~20 ms of interpolated PCM
+                    # without discarding decoder state.
+                    concealed = decoder.decode(None, fec=False)
+                except Exception:
+                    concealed = b""
+            if _OPUS_DECODE_ERRORS == 1 or _OPUS_DECODE_ERRORS % 50 == 0:
+                print(
+                    "[DiscordVoiceSTT] opus decode error concealed "
+                    f"count={_OPUS_DECODE_ERRORS} ssrc={getattr(self, 'ssrc', '?')}: {exc}"
+                )
+            return packet, concealed
+
+    safe_decode._subpc_patched = True  # type: ignore[attr-defined]
+    PacketDecoder._decode_packet = safe_decode  # type: ignore[assignment]
+
+
+_patch_voice_recv_opus_decoder()
+
+
 DISCORD_PCM_SAMPLE_RATE = 48000
 DISCORD_PCM_CHANNELS = 2
 STT_SAMPLE_RATE = 16000
 MAX_DISCORD_MESSAGE = 1900
+
+
+# Whisper on near-silent or short Japanese audio reliably emits these filler
+# phrases. Drop them so the transcript channel stays useful.
+_WHISPER_HALLUCINATION_PHRASES = (
+    "ご視聴ありがとうございました",
+    "ご清聴ありがとうございました",
+    "ありがとうございました",
+    "おつかれさまでした",
+    "お疲れ様でした",
+    "以上で終わります",
+    "ご視聴ありがとうございました。",
+)
+
+_HIRAGANA = set(
+    "ぁぃぅぇぉゃゅょっゎあいうえおかきくけこさしすせそたちつてとなにぬねの"
+    "はひふへほまみむめもやゆよらりるれろわをんー"
+)
+_KATAKANA = set(
+    "ァィゥェォャュョッヮアイウエオカキクケコサシスセソタチツテトナニヌネノ"
+    "ハヒフヘホマミムメモヤユヨラリルレロワヲンー"
+)
+_HALLUCINATION_PUNCT = set(" 　、。！？!?,.")
+
+
+def _is_likely_hallucination(text: str) -> bool:
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    for phrase in _WHISPER_HALLUCINATION_PHRASES:
+        if phrase in stripped:
+            return True
+    if len(stripped) <= 2:
+        chars = set(stripped) - _HALLUCINATION_PUNCT
+        if chars and chars <= (_HIRAGANA | _KATAKANA):
+            return True
+    return False
 
 
 class VoiceSTTError(RuntimeError):
@@ -65,6 +175,33 @@ def _parse_float(value: str | None, default: float) -> float:
         return float(value)
     except ValueError:
         return default
+
+
+def _resolve_debug_audio_dir(project_root: Path) -> Path | None:
+    """Optional dir for dumping the exact 16 kHz mono audio sent to Whisper.
+
+    Set DISCORD_VOICE_STT_DEBUG_AUDIO_DIR to a path to enable. Diagnostic only:
+    lets us inspect/listen to what STT actually receives when transcripts look
+    like noise. Unset (default) means no dump.
+    """
+    raw = os.environ.get("DISCORD_VOICE_STT_DEBUG_AUDIO_DIR", "").strip()
+    if not raw:
+        return None
+    path = Path(raw)
+    return path if path.is_absolute() else project_root / path
+
+
+def _write_debug_wav(path: Path, audio: np.ndarray) -> None:
+    import wave
+
+    pcm16 = np.clip(audio, -1.0, 1.0)
+    pcm16 = (pcm16 * 32767.0).astype("<i2")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(STT_SAMPLE_RATE)
+        wav.writeframes(pcm16.tobytes())
 
 
 def _split_message(text: str) -> list[str]:
@@ -119,6 +256,8 @@ class VoiceSTTConfig:
     max_segment_seconds: float = 12.0
     max_queue_size: int = 16
     save_transcripts: bool = True
+    hallucination_filter: bool = True
+    debug_audio_dir: Path | None = None
 
     @classmethod
     def from_env(cls, project_root: str | Path, *, timezone: str = "Asia/Tokyo") -> "VoiceSTTConfig":
@@ -167,6 +306,11 @@ class VoiceSTTConfig:
                 os.environ.get("DISCORD_VOICE_STT_SAVE_TRANSCRIPTS"),
                 default=True,
             ),
+            hallucination_filter=_parse_bool(
+                os.environ.get("DISCORD_VOICE_STT_HALLUCINATION_FILTER"),
+                default=True,
+            ),
+            debug_audio_dir=_resolve_debug_audio_dir(root),
         )
 
 
@@ -315,6 +459,7 @@ class DiscordSTTSink(_AudioSinkBase):
         self.voice_channel_id = voice_channel_id
         self.dropped_segments = 0
         self.received_packets = 0
+        self.received_audio_seconds = 0.0
         self._buffers: dict[int, SpeechSegmenter] = {}
         self._lock = threading.RLock()
         self._closed = False
@@ -333,6 +478,14 @@ class DiscordSTTSink(_AudioSinkBase):
         audio = pcm48_stereo_to_16k_mono(pcm)
         with self._lock:
             self.received_packets += 1
+            self.received_audio_seconds += audio.size / STT_SAMPLE_RATE
+            if self.received_packets == 1 or self.received_packets % 250 == 0:
+                print(
+                    "[DiscordVoiceSTT] receiving audio "
+                    f"packets={self.received_packets} "
+                    f"audio_sec={self.received_audio_seconds:.1f} "
+                    f"user={getattr(user, 'display_name', None) or user}"
+                )
             segmenter = self._buffers.setdefault(user.id, SpeechSegmenter(self.config))
             completed = segmenter.add_audio(audio, now)
         for speech in completed:
@@ -385,8 +538,17 @@ class DiscordSTTSink(_AudioSinkBase):
         )
         try:
             self.output_queue.put_nowait(chunk)
+            print(
+                "[DiscordVoiceSTT] speech segment queued "
+                f"user={chunk.user_name} duration={chunk.duration_sec:.2f}s "
+                f"reason={chunk.reason} queue={self.output_queue.qsize()}"
+            )
         except queue.Full:
             self.dropped_segments += 1
+            print(
+                "[DiscordVoiceSTT] speech segment dropped "
+                f"user={chunk.user_name} dropped={self.dropped_segments}"
+            )
 
     def _user_from_id(self, user_id: int) -> discord.User | discord.Member | None:
         voice_client = getattr(self, "voice_client", None)
@@ -460,7 +622,10 @@ class DiscordVoiceSTT:
             assert voice_recv is not None
             self.voice_client = await channel.connect(cls=voice_recv.VoiceRecvClient, self_deaf=False)
 
-        return f"voice channel に参加しました: {channel.name}"
+        return (
+            f"voice channel に参加しました: {channel.name}\n"
+            "文字起こしを始めるには /voice start を実行してください。"
+        )
 
     async def start(
         self,
@@ -474,6 +639,7 @@ class DiscordVoiceSTT:
         if self.listening:
             return "voice STT はすでに開始済みです。"
 
+        self.last_error = ""
         self._bot = interaction.client
         self._loop = asyncio.get_running_loop()
         self.transcript_channel_id = (
@@ -493,6 +659,11 @@ class DiscordVoiceSTT:
         )
         self.voice_client.listen(self.sink, after=self._after_listening)
         self.started_at = datetime.now(timezone.utc)
+        print(
+            "[DiscordVoiceSTT] listening started "
+            f"guild={guild_id} voice_channel={voice_channel_id} "
+            f"transcript_channel={self.transcript_channel_id}"
+        )
         await self._send_notice(
             f"[voice] STT started. transcript_channel_id={self.transcript_channel_id}"
         )
@@ -504,6 +675,12 @@ class DiscordVoiceSTT:
                 self.voice_client.stop_listening()
         if self.sink is not None:
             self.sink.flush_all()
+            print(
+                "[DiscordVoiceSTT] listening stopped "
+                f"packets={self.sink.received_packets} "
+                f"audio_sec={self.sink.received_audio_seconds:.1f} "
+                f"transcripts={self.transcript_count}"
+            )
         self.sink = None
         self.started_at = None
         self._stop_event.set()
@@ -528,6 +705,8 @@ class DiscordVoiceSTT:
             channel_name = getattr(self.voice_client.channel, "name", "-")
         dropped = self.sink.dropped_segments if self.sink is not None else 0
         packets = self.sink.received_packets if self.sink is not None else 0
+        audio_seconds = self.sink.received_audio_seconds if self.sink is not None else 0.0
+        decode_errors = opus_decode_error_count()
         return (
             f"voice_stt_enabled: {self.config.enabled}\n"
             f"voice_recv_available: {self.available}\n"
@@ -537,7 +716,9 @@ class DiscordVoiceSTT:
             f"voice_transcript_channel_id: {self.transcript_channel_id or '-'}\n"
             f"voice_queue_size: {self._queue.qsize()}\n"
             f"voice_received_packets: {packets}\n"
+            f"voice_received_audio_sec: {audio_seconds:.1f}\n"
             f"voice_transcripts: {self.transcript_count}\n"
+            f"voice_decode_errors: {decode_errors}\n"
             f"voice_dropped_segments: {dropped}\n"
             f"voice_last_error: {self.last_error or '-'}"
         )
@@ -579,17 +760,46 @@ class DiscordVoiceSTT:
             except queue.Empty:
                 continue
             try:
+                if self.config.debug_audio_dir is not None:
+                    self._dump_debug_audio(chunk)
                 text = self._transcribe(chunk.audio)
+                if text and self.config.hallucination_filter and _is_likely_hallucination(text):
+                    print(
+                        "[DiscordVoiceSTT] filtered hallucination "
+                        f"user={chunk.user_name} duration={chunk.duration_sec:.2f}s "
+                        f"text={text!r}"
+                    )
+                    text = ""
                 if text:
                     self.transcript_count += 1
                     self.last_transcript_at = datetime.now(timezone.utc)
                     self._write_transcript(chunk, text)
                     self._schedule_transcript_send(chunk, text)
+                else:
+                    print(
+                        "[DiscordVoiceSTT] empty transcript "
+                        f"user={chunk.user_name} duration={chunk.duration_sec:.2f}s"
+                    )
             except Exception as exc:
                 self.last_error = str(exc)
                 print(f"[DiscordVoiceSTT] worker error: {exc}")
             finally:
                 self._queue.task_done()
+
+    def _dump_debug_audio(self, chunk: SpeechChunk) -> None:
+        try:
+            local_dt = chunk.ended_at.astimezone(ZoneInfo(self.config.timezone))
+            stamp = local_dt.strftime("%H%M%S_%f")[:-3]
+            name = f"{local_dt.date().isoformat()}_{stamp}_{chunk.user_name}_{chunk.reason}.wav"
+            safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in name)
+            path = self.config.debug_audio_dir / safe  # type: ignore[operator]
+            _write_debug_wav(path, chunk.audio)
+            print(
+                f"[DiscordVoiceSTT] debug audio saved {path} "
+                f"duration={chunk.duration_sec:.2f}s"
+            )
+        except Exception as exc:  # diagnostics must never break the worker
+            print(f"[DiscordVoiceSTT] debug audio dump failed: {exc}")
 
     def _transcribe(self, audio: np.ndarray) -> str:
         with self._stt_lock:

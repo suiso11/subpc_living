@@ -10,6 +10,7 @@ import numpy as np
 from src.discord_bot.voice_stt import (
     SpeechSegmenter,
     VoiceSTTConfig,
+    _is_likely_hallucination,
     pcm48_stereo_to_16k_mono,
 )
 
@@ -49,6 +50,18 @@ class DiscordVoiceSTTTest(unittest.TestCase):
             self.assertEqual(len(emitted), 1)
             self.assertGreaterEqual(emitted[0].audio.size, segmenter.frame_size * 3)
             self.assertEqual(emitted[0].reason, "silence")
+
+    def test_hallucination_filter_drops_known_junk(self) -> None:
+        self.assertTrue(_is_likely_hallucination("ご視聴ありがとうございました"))
+        self.assertTrue(_is_likely_hallucination("おつかれさまでした"))
+        self.assertTrue(_is_likely_hallucination("すっ"))
+        self.assertTrue(_is_likely_hallucination("ん"))
+
+    def test_hallucination_filter_keeps_real_speech(self) -> None:
+        self.assertFalse(_is_likely_hallucination("今日はいい天気ですね"))
+        self.assertFalse(_is_likely_hallucination("うん、分かりました"))
+        self.assertFalse(_is_likely_hallucination(""))
+        self.assertFalse(_is_likely_hallucination("OK"))
 
 
 if __name__ == "__main__":
