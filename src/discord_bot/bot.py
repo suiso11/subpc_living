@@ -46,6 +46,7 @@ from src.discord_bot.training import (
 )
 from src.discord_bot.terminal import DiscordTerminal
 from src.discord_bot.voice_stt import DiscordVoiceSTT, VoiceSTTConfig, VoiceSTTError
+from src.discord_bot.voice_tts import VoiceTTSConfig, VoiceTTSError, VoiceTTSPlayer
 from src.diary.collector import DiaryCollector
 from src.diary.service import DailyDiaryResult, DailyDiaryService
 from src.integrations.google_calendar import GoogleCalendarMCPClient
@@ -253,6 +254,7 @@ class DiscordConsoleState:
     diary_personalization_min_confidence: float = 0.72
     daily_personalizer: DailyPersonalizer | None = None
     voice_stt: DiscordVoiceSTT | None = None
+    voice_tts: VoiceTTSPlayer | None = None
 
     def initialize(self) -> None:
         self.config = ChatConfig.load(PROJECT_ROOT / "config" / "chat_config.json")
@@ -308,6 +310,11 @@ class DiscordConsoleState:
         )
         self.voice_stt = DiscordVoiceSTT(
             VoiceSTTConfig.from_env(PROJECT_ROOT, timezone=self.diary_timezone)
+        )
+        self.voice_tts = VoiceTTSPlayer(
+            config=VoiceTTSConfig.from_env(),
+            synthesize=self.synthesize,
+            get_voice_client=lambda: self.voice_stt.voice_client if self.voice_stt else None,
         )
         try:
             calendar_client = (
@@ -917,6 +924,9 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
                 user_text=transcript_text,
                 source="discord_voice_transcript",
             )
+            if state.voice_tts is not None:
+                # 通話由来の質問には音声でも返す (接続中のみ、失敗しても無視)
+                asyncio.create_task(state.voice_tts.autoread(response))
             if reply_messages:
                 for reaction in (GOOD_REACTION, BAD_REACTION):
                     try:
@@ -1124,6 +1134,38 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
             return
         await interaction.followup.send(text)
 
+    @voice_group.command(name="say", description="接続中の通話チャンネルでテキストを読み上げます")
+    @app_commands.describe(text="読み上げるテキスト", voice="Kokoro voice", speed="読み上げ速度")
+    @app_commands.choices(
+        voice=[
+            app_commands.Choice(name=f"{voice} - {label}", value=voice)
+            for voice, label in KokoroTTS.JA_VOICES.items()
+        ]
+    )
+    async def voice_say(
+        interaction: discord.Interaction,
+        text: str,
+        voice: str | None = None,
+        speed: float | None = None,
+    ) -> None:
+        if not await require_allowed(interaction, state):
+            return
+        if state.voice_tts is None:
+            await interaction.response.send_message("voice TTS が初期化されていません。", ephemeral=True)
+            return
+        await interaction.response.defer(thinking=True)
+        try:
+            duration = await state.voice_tts.say(text, voice=voice, speed=speed)
+        except VoiceTTSError as e:
+            await interaction.followup.send(f"voice TTS error: {e}", ephemeral=True)
+            return
+        except Exception as e:
+            await interaction.followup.send(f"voice TTS error: `{e}`", ephemeral=True)
+            return
+        await interaction.followup.send(
+            f"読み上げました ({duration:.1f}秒): {text[:100]}{'...' if len(text) > 100 else ''}"
+        )
+
     @voice_group.command(name="status", description="通話STTの状態を確認します")
     async def voice_status(interaction: discord.Interaction) -> None:
         if not await require_allowed(interaction, state):
@@ -1131,8 +1173,15 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
         if state.voice_stt is None:
             await interaction.response.send_message("voice STT が初期化されていません。", ephemeral=True)
             return
+        status_lines = state.voice_stt.status_text()
+        if state.voice_tts is not None:
+            status_lines += (
+                f"\nvoice_tts_autoread: {state.voice_tts.config.autoread}"
+                f"\nvoice_tts_played: {state.voice_tts.played_count}"
+                f"\nvoice_tts_last_error: {state.voice_tts.last_error or '-'}"
+            )
         await interaction.response.send_message(
-            f"```text\n{clean_output(state.voice_stt.status_text(), 1800)}\n```",
+            f"```text\n{clean_output(status_lines, 1800)}\n```",
             ephemeral=True,
         )
 
