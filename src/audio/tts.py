@@ -121,6 +121,7 @@ class KokoroTTS:
         self._model_path = self.models_dir / self.MODEL_FILE
         self._voices_path = self.models_dir / self.VOICES_FILE
         self._kokoro = None
+        self._ja_g2p = None
 
     def is_installed(self) -> bool:
         """モデルファイルがダウンロード済みか確認"""
@@ -160,6 +161,43 @@ class KokoroTTS:
         elapsed = time.time() - start
         print(f"[TTS] モデルロード完了 ({elapsed:.1f}秒)")
 
+        if self.lang == "ja":
+            self._load_ja_g2p()
+
+    def _load_ja_g2p(self) -> None:
+        """日本語G2P (misaki) をロード。
+
+        kokoro-onnx 内蔵の espeak-ng は漢字を読めない（「今日」が
+        "Chinese letter" と読まれる）ため、misaki + unidic で
+        音素化してから is_phonemes=True で合成する。
+        """
+        if self._ja_g2p is not None:
+            return
+        try:
+            from misaki import ja
+            self._ja_g2p = ja.JAG2P()
+            print("[TTS] 日本語G2P (misaki) ロード完了")
+        except Exception as e:
+            print(f"[TTS] ⚠️ 日本語G2Pロード失敗 (espeak-ngにフォールバック、漢字は読めません): {e}")
+            print("[TTS]    修復方法: .venv/bin/python -m unidic download")
+
+    def _create_chunk(self, chunk: str) -> tuple[np.ndarray, int]:
+        """1チャンクを合成。日本語はmisakiで音素化してから渡す。"""
+        if self.lang == "ja" and self._ja_g2p is not None:
+            phonemes, _ = self._ja_g2p(chunk)
+            return self._kokoro.create(
+                phonemes,
+                voice=self.voice,
+                speed=self.speed,
+                is_phonemes=True,
+            )
+        return self._kokoro.create(
+            chunk,
+            voice=self.voice,
+            speed=self.speed,
+            lang=self.lang,
+        )
+
     def synthesize(self, text: str) -> bytes:
         """
         テキストを音声に変換し、WAVバイトデータを返す。
@@ -187,12 +225,7 @@ class KokoroTTS:
 
         for chunk in chunks:
             try:
-                samples, sr = self._kokoro.create(
-                    chunk,
-                    voice=self.voice,
-                    speed=self.speed,
-                    lang=self.lang,
-                )
+                samples, sr = self._create_chunk(chunk)
                 all_samples.append(samples)
             except (IndexError, Exception) as e:
                 # 音素変換エラー時はスキップして続行
@@ -249,9 +282,7 @@ class KokoroTTS:
             (audio_data as float32, sample_rate)
         """
         self.load()
-        samples, sr = self._kokoro.create(
-            text, voice=self.voice, speed=self.speed, lang=self.lang,
-        )
+        samples, sr = self._create_chunk(text)
         return samples, sr
 
     def set_voice(self, voice: str) -> None:
