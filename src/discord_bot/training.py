@@ -134,6 +134,11 @@ class DiscordTrainingLog:
                 self._turns_by_assistant_message_id[message_id] = turn
         return turn["turn_id"]
 
+    def get_turn_by_assistant_message_id(self, assistant_message_id: int) -> dict | None:
+        """bot返答メッセージIDから会話ターンを引く (見つからなければ None)。"""
+        with self._lock:
+            return self._turns_by_assistant_message_id.get(assistant_message_id)
+
     def record_feedback(
         self,
         *,

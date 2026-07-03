@@ -621,6 +621,35 @@ class DiscordConsoleState:
             emoji=emoji,
         )
 
+    def generate_correction_candidate(self, turn: dict, temperature: float) -> str:
+        """👎されたターンに対する言い直し案を1つ生成する (同期・スレッドで実行)。"""
+        profile = (
+            self.llm_profiles.get(turn.get("profile") or "default")
+            or self.llm_profiles["default"]
+        )
+        llm = self._llm_for_profile(profile)
+        messages = [
+            {"role": "system", "content": profile.system_prompt},
+            {"role": "user", "content": turn["user"]},
+            {"role": "assistant", "content": turn["assistant"]},
+            {
+                "role": "user",
+                "content": (
+                    "今の返答は良くなかった。同じ発言への返答を、違う切り口でもう一度。"
+                    "前置きや説明はなしで、返答本文だけを出して。"
+                ),
+            },
+        ]
+        return llm.generate(
+            messages,
+            temperature=temperature,
+            top_p=profile.top_p,
+            top_k=profile.top_k,
+            repeat_penalty=profile.repeat_penalty,
+            num_ctx=profile.num_ctx,
+            num_predict=profile.num_predict,
+        ).strip()
+
     def record_correction(self, message: discord.Message, corrected_text: str) -> str:
         if self.training_log is None:
             return "training log is disabled"
@@ -807,6 +836,104 @@ class CorrectionModal(discord.ui.Modal, title="返答の修正を学習候補に
             )
 
 
+
+
+class CorrectionPickView(discord.ui.View):
+    """👎後に提示する言い直し案の選択UI。
+
+    ボタンで案を選ぶと、その案を preferred、元のbot返答を rejected として
+    学習候補に保存する。「自分で書く」は CorrectionModal に落ちる。
+    """
+
+    def __init__(
+        self,
+        state: DiscordConsoleState,
+        target: discord.Message,
+        candidates: list[str],
+    ):
+        super().__init__(timeout=600)
+        self.state = state
+        self.target = target
+        self.candidates = candidates
+        self.message: discord.Message | None = None  # 選択肢を載せたbotメッセージ
+
+        for index in range(len(candidates)):
+            button = discord.ui.Button(
+                label=f"案{index + 1}",
+                style=discord.ButtonStyle.primary,
+                row=0,
+            )
+            button.callback = self._make_pick_callback(index)
+            self.add_item(button)
+
+        write_button = discord.ui.Button(
+            label="自分で書く", style=discord.ButtonStyle.secondary, row=1
+        )
+        write_button.callback = self._write_callback
+        self.add_item(write_button)
+
+        cancel_button = discord.ui.Button(
+            label="やめる", style=discord.ButtonStyle.secondary, row=1
+        )
+        cancel_button.callback = self._cancel_callback
+        self.add_item(cancel_button)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        channel_id = interaction.channel_id or 0
+        if self.state.is_allowed_feedback(interaction.user.id, channel_id):
+            return True
+        await interaction.response.send_message(
+            "この操作は許可されていません。", ephemeral=True
+        )
+        return False
+
+    def _make_pick_callback(self, index: int):
+        async def _pick(interaction: discord.Interaction) -> None:
+            chosen = self.candidates[index]
+            if self.state.training_log is None:
+                await interaction.response.send_message("training log is disabled", ephemeral=True)
+                return
+            result = self.state.training_log.record_correction(
+                assistant_message_id=self.target.id,
+                channel_id=self.target.channel.id,
+                guild_id=self.target.guild.id if self.target.guild else None,
+                user_id=interaction.user.id,
+                correction_message_id=interaction.id,
+                corrected_text=chosen,
+            )
+            if result.ok:
+                text = f"案{index + 1} を学習候補に保存しました。\n> {chosen[:300]}"
+            else:
+                text = f"保存できませんでした: {result.reason}"
+            self.stop()
+            await interaction.response.edit_message(content=text, view=None)
+
+        return _pick
+
+    async def _write_callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_modal(CorrectionModal(self.state, self.target))
+
+    async def _cancel_callback(self, interaction: discord.Interaction) -> None:
+        self.stop()
+        await interaction.response.edit_message(content="修正をキャンセルしました。", view=None)
+
+    async def on_timeout(self) -> None:
+        if self.message is not None:
+            try:
+                await self.message.edit(
+                    content="修正案の選択は期限切れになりました。", view=None
+                )
+            except discord.HTTPException:
+                pass
+
+
+def render_correction_choices(candidates: list[str]) -> str:
+    lines = ["どの返答が良い? ボタンで選ぶと学習候補に保存します。"]
+    per_candidate = max(200, 1500 // max(1, len(candidates)))
+    for index, candidate in enumerate(candidates):
+        shown = candidate[:per_candidate] + ("…" if len(candidate) > per_candidate else "")
+        lines.append(f"**案{index + 1}**: {shown}")
+    return "\n".join(lines)
 
 
 def parse_diary_date(value: str | None, timezone: str) -> date:
@@ -1047,6 +1174,61 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
                 except discord.HTTPException as e:
                     print(f"[Discord] feedback reaction failed: {e}")
 
+    # 👎で言い直し案を出したメッセージのID (多重生成を防ぐ)
+    correction_offered_ids: set[int] = set()
+    correction_suggest_enabled = parse_bool(
+        os.environ.get("DISCORD_CORRECTION_SUGGESTIONS_ENABLED"), default=True
+    )
+
+    async def offer_correction_candidates(payload: discord.RawReactionActionEvent) -> None:
+        """👎されたbot返答への言い直し案を生成し、選択ボタン付きで提示する。"""
+        if state.training_log is None:
+            return
+        turn = state.training_log.get_turn_by_assistant_message_id(payload.message_id)
+        if turn is None:
+            return
+        channel = bot.get_channel(payload.channel_id)
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(payload.channel_id)
+            except discord.HTTPException:
+                return
+        try:
+            target = await channel.fetch_message(payload.message_id)
+        except discord.HTTPException:
+            return
+
+        notice = await target.reply("言い直し案を生成中...", mention_author=False)
+        try:
+            raw = await asyncio.gather(
+                *[
+                    asyncio.to_thread(state.generate_correction_candidate, turn, temp)
+                    for temp in (0.5, 0.85, 1.15)
+                ],
+                return_exceptions=True,
+            )
+        except Exception as e:
+            await notice.edit(content=f"言い直し案の生成に失敗しました: `{e}`")
+            return
+
+        original = (turn.get("assistant") or "").strip()
+        candidates: list[str] = []
+        for item in raw:
+            if isinstance(item, Exception) or not isinstance(item, str):
+                continue
+            text = item.strip()
+            if not text or text == original or text in candidates:
+                continue
+            candidates.append(text)
+
+        if not candidates:
+            await notice.edit(content="言い直し案を生成できませんでした。「修正する」(右クリック)で直接書けます。")
+            return
+
+        view = CorrectionPickView(state, target, candidates)
+        await notice.edit(content=render_correction_choices(candidates), view=view)
+        view.message = notice
+
     @bot.event
     async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
         if bot.user is not None and payload.user_id == bot.user.id:
@@ -1061,6 +1243,13 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
             user_id=payload.user_id,
             emoji=str(payload.emoji),
         )
+        if (
+            correction_suggest_enabled
+            and str(payload.emoji) == BAD_REACTION
+            and payload.message_id not in correction_offered_ids
+        ):
+            correction_offered_ids.add(payload.message_id)
+            asyncio.create_task(offer_correction_candidates(payload))
 
     @bot.tree.command(name="ask", description="subpc_living の LLM に質問します")
     @app_commands.describe(prompt="質問または指示", ephemeral="自分だけに表示する")
