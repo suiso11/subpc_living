@@ -756,6 +756,59 @@ async def require_allowed(interaction: discord.Interaction, state: DiscordConsol
     return False
 
 
+class CorrectionModal(discord.ui.Modal, title="返答の修正を学習候補に保存"):
+    """bot返答を右クリック→「修正する」で開く入力フォーム。
+
+    botの返答をプリフィルして表示するので、理想の返答に書き換えて送信する
+    だけで `修正: ...` 返信と同じ preferred/rejected ペアが記録される。
+    """
+
+    def __init__(self, state: DiscordConsoleState, target: discord.Message):
+        super().__init__()
+        self.state = state
+        self.target = target
+        self.corrected: discord.ui.TextInput = discord.ui.TextInput(
+            label="理想の返答に書き換えてください",
+            style=discord.TextStyle.paragraph,
+            default=(target.content or "")[:4000],
+            max_length=4000,
+            required=True,
+        )
+        self.add_item(self.corrected)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        corrected_text = str(self.corrected.value).strip()
+        if self.state.training_log is None:
+            await interaction.response.send_message("training log is disabled", ephemeral=True)
+            return
+        if corrected_text == (self.target.content or "").strip():
+            await interaction.response.send_message(
+                "返答が書き換えられていません。理想の返答に直してから送信してください。",
+                ephemeral=True,
+            )
+            return
+        result = self.state.training_log.record_correction(
+            assistant_message_id=self.target.id,
+            channel_id=self.target.channel.id,
+            guild_id=self.target.guild.id if self.target.guild else None,
+            user_id=interaction.user.id,
+            correction_message_id=interaction.id,
+            corrected_text=corrected_text,
+        )
+        if result.ok:
+            await interaction.response.send_message(
+                f"修正を学習候補に保存しました。\n> {corrected_text[:200]}",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                f"修正を保存できませんでした: {result.reason}",
+                ephemeral=True,
+            )
+
+
+
+
 def parse_diary_date(value: str | None, timezone: str) -> date:
     if not value:
         return datetime.now(ZoneInfo(timezone)).date()
@@ -1210,6 +1263,25 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
         )
 
     bot.tree.add_command(voice_group)
+
+    async def correction_menu_callback(
+        interaction: discord.Interaction,
+        message: discord.Message,
+    ) -> None:
+        if not await require_allowed(interaction, state):
+            return
+        if bot.user is None or message.author.id != bot.user.id:
+            await interaction.response.send_message(
+                "botの返答メッセージに対して実行してください。", ephemeral=True
+            )
+            return
+        await interaction.response.send_modal(CorrectionModal(state, message))
+
+    correction_menu = app_commands.ContextMenu(
+        name="修正する",
+        callback=correction_menu_callback,
+    )
+    bot.tree.add_command(correction_menu)
 
     @bot.tree.command(name="status", description="subpc_living の状態を確認します")
     async def status(interaction: discord.Interaction) -> None:
