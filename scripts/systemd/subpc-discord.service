@@ -1,14 +1,17 @@
 [Unit]
 Description=subpc_living Discord 操作コンソール
 Documentation=https://github.com/suiso11/subpc_living
-After=network.target ollama.service
-Wants=ollama.service
+After=network.target ollama.service subpc-sbv2-tts.service
+Wants=ollama.service subpc-sbv2-tts.service
 
 [Service]
 Type=simple
 WorkingDirectory=%h/ドキュメント/subpc_living
 Environment=PATH=%h/ドキュメント/subpc_living/.venv/bin:/usr/local/bin:/usr/bin:/bin
 Environment=PYTHONUNBUFFERED=1
+Environment=DISPLAY=:0
+Environment=TTS_ONNX_PROVIDER=CUDAExecutionProvider
+Environment=TTS_ONNX_DEVICE_ID=1
 EnvironmentFile=-%h/ドキュメント/subpc_living/config/discord.env
 
 # 起動前にヘルスチェック (Ollama 接続確認)
@@ -23,7 +26,7 @@ RestartSec=15
 
 # リソース制限
 MemoryMax=4G
-CPUQuota=200%
+CPUQuota=800%
 
 # ロギング
 StandardOutput=journal

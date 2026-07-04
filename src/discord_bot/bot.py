@@ -3,7 +3,7 @@ Discord 操作コンソール。
 
 Slash commands:
 - /ask: Ollama に質問
-- /tts: kokoro-onnx で WAV を生成して添付
+- /tts: TTS backend で WAV を生成して添付
 - /status: ヘルスチェック
 - /service: service_ctl.sh 経由の限定サービス操作
 
@@ -21,7 +21,7 @@ import subprocess
 import sys
 import threading
 from dataclasses import dataclass, field
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -33,9 +33,10 @@ from discord.ext import commands
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.audio.tts import KokoroTTS
+from src.audio.tts_factory import all_tts_voices, backend_name, create_tts_backend
 from src.chat.client import OllamaClient
 from src.chat.config import ChatConfig
+from src.chat.emotion import parse_emotion_tag
 from src.chat.session import ChatSession
 from src.chat.web_search import WebSearchContext, create_web_search_context
 from src.discord_bot.training import (
@@ -44,18 +45,40 @@ from src.discord_bot.training import (
     DiscordTrainingLog,
     parse_correction,
 )
+from src.discord_bot.proactive_bridge import ProactiveBridge, create_proactive_bridge, rewrite_message
+from src.discord_bot.task_ui import (
+    TASK_PREFIX_RE,
+    TaskConfirmView,
+    TaskReminderView,
+    build_extraction_prompt,
+    make_due_summary,
+    parse_due,
+    parse_snooze,
+    validate_extraction,
+)
+from src.discord_bot.task_board import TaskBoardManager, TaskBoardView, TaskModal
+from src.discord_bot.voice_reply_debouncer import VoiceReplyDebouncer
 from src.discord_bot.terminal import DiscordTerminal
 from src.discord_bot.voice_stt import DiscordVoiceSTT, VoiceSTTConfig, VoiceSTTError
 from src.discord_bot.voice_tts import VoiceTTSConfig, VoiceTTSError, VoiceTTSPlayer
+from src.screen.context import ScreenContext
+from src.screen import create_screen_context
 from src.diary.collector import DiaryCollector
 from src.diary.service import DailyDiaryResult, DailyDiaryService
 from src.integrations.google_calendar import GoogleCalendarMCPClient
 from src.persona.daily_personalizer import DailyPersonalizer, PersonalizationResult
 from src.service.healthcheck import HealthChecker
+from src.tasks.reminder import TaskReminderEngine, parse_quiet_hours
+from src.tasks.store import TaskStore
+
+from src.service.log_setup import setup_logging
+logger = setup_logging("subpc-discord")
 
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-VOICE_TRANSCRIPT_RE = re.compile(r"^\[\d{2}:\d{2}:\d{2}\]\s+.+?:\s*(?P<text>.+)$", re.DOTALL)
+VOICE_TRANSCRIPT_RE = re.compile(
+    r"^\[\d{2}:\d{2}:\d{2}\]\s+(?P<speaker>.+?):\s*(?P<text>.+)$", re.DOTALL
+)
 MAX_DISCORD_MESSAGE = 1900
 
 
@@ -84,7 +107,7 @@ def parse_id_set(value: str | None) -> set[int]:
         try:
             result.add(int(item))
         except ValueError:
-            print(f"[Discord] ID を無視します: {item}")
+            logger.warning("[Discord] ID を無視します: %s", item)
     return result
 
 
@@ -103,7 +126,7 @@ def parse_optional_id(value: str | None) -> int | None:
     try:
         return int(value)
     except ValueError:
-        print(f"[Discord] ID を無視します: {value}")
+        logger.warning("[Discord] ID を無視します: %s", value)
         return None
 
 
@@ -117,7 +140,7 @@ def parse_hhmm(value: str | None, default: str = "23:50") -> time:
             raise ValueError
         return time(hour=hour, minute=minute)
     except ValueError:
-        print(f"[Discord] DIARY_POST_TIME を無視します: {raw}")
+        logger.warning("[Discord] DIARY_POST_TIME を無視します: %s", raw)
         hour_text, minute_text = default.split(":", 1)
         return time(hour=int(hour_text), minute=int(minute_text))
 
@@ -128,7 +151,7 @@ def parse_float(value: str | None, default: float) -> float:
     try:
         return float(value)
     except ValueError:
-        print(f"[Discord] float 設定値を無視します: {value}")
+        logger.warning("[Discord] float 設定値を無視します: %s", value)
         return default
 
 
@@ -228,7 +251,7 @@ class DiscordConsoleState:
     llm_clients: dict[tuple[str, str], OllamaClient] = field(default_factory=dict)
     llm_profiles: dict[str, DiscordLLMProfile] = field(default_factory=dict)
     channel_profile_map: dict[int, str] = field(default_factory=dict)
-    tts: KokoroTTS | None = None
+    tts: Any | None = None
     sessions: dict[str, ChatSession] = field(default_factory=dict)
     session_locks: dict[str, threading.Lock] = field(default_factory=dict)
     sessions_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -255,6 +278,19 @@ class DiscordConsoleState:
     daily_personalizer: DailyPersonalizer | None = None
     voice_stt: DiscordVoiceSTT | None = None
     voice_tts: VoiceTTSPlayer | None = None
+    voice_reply_debounce_ms: int = 3000
+    voice_reply_debounce_max_ms: int = 10000
+    voice_reply_debouncer: Any | None = None
+    proactive_bridge: ProactiveBridge | None = None
+    screen_context: ScreenContext | None = None
+    task_store: TaskStore | None = None
+    task_reminder_engine: TaskReminderEngine | None = None
+    tasks_reminder_enabled: bool = True
+    tasks_quiet_hours: tuple[int, int] = (1, 8)
+    tasks_timezone: str = "Asia/Tokyo"
+    tasks_board_enabled: bool = True
+    task_board_channel_id: int | None = None
+    task_board: Any | None = None
 
     def initialize(self) -> None:
         self.config = ChatConfig.load(PROJECT_ROOT / "config" / "chat_config.json")
@@ -284,6 +320,16 @@ class DiscordConsoleState:
             system_prompt=self.config.system_prompt,
         )
         self.web_search = create_web_search_context(self.config)
+        if parse_bool(os.environ.get("DISCORD_SCREEN_CONTEXT_ENABLED"), default=False):
+            try:
+                # SCREEN_CONTEXT_MODE (local|remote) でローカル/リモートを切替
+                screen = create_screen_context()
+                if screen.start():
+                    self.screen_context = screen
+                else:
+                    logger.warning("[Discord] screen context unavailable; continuing without it")
+            except Exception as e:
+                logger.error("[Discord] screen context init failed: %s", e)
         terminal_workdir = Path(
             os.environ.get("DISCORD_TERMINAL_WORKDIR", str(PROJECT_ROOT))
         ).expanduser()
@@ -316,6 +362,56 @@ class DiscordConsoleState:
             synthesize=self.synthesize,
             get_voice_client=lambda: self.voice_stt.voice_client if self.voice_stt else None,
         )
+        self.voice_reply_debounce_ms = _coerce_int(
+            os.environ.get("DISCORD_VOICE_REPLY_DEBOUNCE_MS"), 3000
+        )
+        self.voice_reply_debounce_max_ms = _coerce_int(
+            os.environ.get("DISCORD_VOICE_REPLY_DEBOUNCE_MAX_MS"), 10000
+        )
+        self.tasks_reminder_enabled = parse_bool(
+            os.environ.get("TASKS_REMINDER_ENABLED"), default=True
+        )
+        self.tasks_quiet_hours = parse_quiet_hours(
+            os.environ.get("TASKS_QUIET_HOURS"), default=(1, 8)
+        )
+        self.tasks_timezone = self.diary_timezone
+        self.tasks_board_enabled = parse_bool(
+            os.environ.get("TASKS_BOARD_ENABLED"), default=True
+        )
+        self.task_board_channel_id = parse_optional_id(
+            os.environ.get("DISCORD_TASK_BOARD_CHANNEL_ID")
+        )
+        try:
+            self.task_store = TaskStore(
+                db_path=str(PROJECT_ROOT / "data" / "tasks" / "tasks.db"),
+                timezone_name=self.tasks_timezone,
+            ).initialize()
+        except Exception as e:
+            logger.error("[Discord] task store 初期化失敗 (タスク機能なしで続行): %s", e)
+            self.task_store = None
+        # タスク ⇔ Google Calendar 同期
+        self.tasks_calendar_sync_enabled = parse_bool(
+            os.environ.get("TASKS_CALENDAR_SYNC_ENABLED"), default=False
+        )
+        self.tasks_calendar_id = (
+            os.environ.get("TASKS_CALENDAR_ID", "").strip() or self.diary_calendar_id
+        )
+        self.calendar_sync_interval_min = parse_float(
+            os.environ.get("CALENDAR_SYNC_INTERVAL_MIN"), default=20.0
+        )
+        self.task_calendar_sync = None
+        self.calendar_pull_worker = None
+        # CalendarContext は upcoming.json を読むだけなので同期無効でも常に注入可
+        # (ファイルが無ければ空文字を返す)。
+        try:
+            from src.tasks.calendar_sync import CalendarContext
+            self.calendar_context = CalendarContext(
+                upcoming_path=str(PROJECT_ROOT / "data" / "calendar" / "upcoming.json"),
+                timezone=self.tasks_timezone,
+            )
+        except Exception as e:
+            logger.warning("[Discord] calendar context 初期化スキップ: %s", e)
+            self.calendar_context = None
         try:
             calendar_client = (
                 GoogleCalendarMCPClient.from_env()
@@ -342,13 +438,90 @@ class DiscordConsoleState:
                 num_ctx=self.config.num_ctx,
             )
         except Exception as e:
-            print(f"[Discord] diary initialization failed: {e}")
+            logger.error("[Discord] diary initialization failed: %s", e)
             self.diary_service = None
             self.daily_personalizer = None
+
+    def start_calendar_sync(self, profile: Any = None) -> None:
+        """タスク→カレンダー同期ワーカーとカレンダー→bot pull ワーカーを起動する。
+
+        profile を渡すと (ProactiveEngine と共有する UserProfile)、当日+翌日の
+        予定を profile.schedule に洗い替えし、既存のリマインド (15分前) が効く。
+        """
+        if not self.tasks_calendar_sync_enabled or self.task_store is None:
+            return
+        if self.task_calendar_sync is not None:
+            return
+        try:
+            from src.tasks.calendar_sync import TaskCalendarSync, CalendarPullWorker
+
+            client = GoogleCalendarMCPClient.from_env()
+            sync = TaskCalendarSync(
+                store=self.task_store,
+                calendar_client=client,
+                calendar_id=self.tasks_calendar_id,
+                enabled=True,
+                timezone=self.tasks_timezone,
+            )
+            sync.start()
+            self.task_store.on_change = sync.enqueue
+            self.task_calendar_sync = sync
+
+            pull = CalendarPullWorker(
+                calendar_client=client,
+                calendar_id=self.tasks_calendar_id,
+                profile=profile,
+                store=self.task_store,
+                timezone=self.tasks_timezone,
+                interval_min=self.calendar_sync_interval_min,
+                upcoming_path=str(PROJECT_ROOT / "data" / "calendar" / "upcoming.json"),
+            )
+            pull.start()
+            self.calendar_pull_worker = pull
+            logger.info(
+                "[Discord] calendar sync started: "
+                "calendar=%s pull_interval=%smin schedule_sync=%s",
+                self.tasks_calendar_id,
+                self.calendar_sync_interval_min,
+                "on" if profile is not None else "off",
+            )
+        except Exception as e:
+            logger.error("[Discord] calendar sync 起動失敗 (同期なしで続行): %s", e)
+            self.task_calendar_sync = None
+            self.calendar_pull_worker = None
 
     def close(self) -> None:
         if self.diary_task is not None:
             self.diary_task.cancel()
+        if self.task_calendar_sync is not None:
+            try:
+                self.task_calendar_sync.stop()
+            except Exception:
+                pass
+        if self.calendar_pull_worker is not None:
+            try:
+                self.calendar_pull_worker.stop()
+            except Exception:
+                pass
+        if self.task_reminder_engine is not None:
+            try:
+                self.task_reminder_engine.stop()
+            except Exception:
+                pass
+        if self.task_board is not None:
+            try:
+                self.task_board.stop()
+            except Exception:
+                pass
+        if self.task_store is not None:
+            try:
+                self.task_store.close()
+            except Exception:
+                pass
+        if self.proactive_bridge is not None:
+            self.proactive_bridge.stop()
+        if self.screen_context is not None:
+            self.screen_context.stop()
         if self.voice_stt is not None:
             self.voice_stt.close()
         for client in set(self.llm_clients.values()):
@@ -388,12 +561,21 @@ class DiscordConsoleState:
         return self.extract_voice_transcript_text(message.content) is not None
 
     @staticmethod
-    def extract_voice_transcript_text(content: str) -> str | None:
+    def extract_voice_transcript(content: str) -> tuple[str, str] | None:
+        """Return (speaker, text) from a transcript line, or None if it isn't one."""
         match = VOICE_TRANSCRIPT_RE.match(content.strip())
         if match is None:
             return None
+        speaker = match.group("speaker").strip()
         text = match.group("text").strip()
-        return text or None
+        if not text:
+            return None
+        return speaker, text
+
+    @staticmethod
+    def extract_voice_transcript_text(content: str) -> str | None:
+        parsed = DiscordConsoleState.extract_voice_transcript(content)
+        return parsed[1] if parsed is not None else None
 
     def is_terminal_message(self, message: discord.Message) -> bool:
         return self.terminal_reject_reason(message) is None
@@ -437,7 +619,7 @@ class DiscordConsoleState:
         }
         for name, raw_profile in self.config.discord_channel_profiles.items():
             if not isinstance(raw_profile, dict):
-                print(f"[Discord] LLM profile を無視します: {name}")
+                logger.warning("[Discord] LLM profile を無視します: %s", name)
                 continue
             profiles[name] = DiscordLLMProfile.from_config(
                 self.config,
@@ -453,12 +635,13 @@ class DiscordConsoleState:
             try:
                 channel_id = int(raw_channel_id)
             except (TypeError, ValueError):
-                print(f"[Discord] channel profile ID を無視します: {raw_channel_id}")
+                logger.warning("[Discord] channel profile ID を無視します: %s", raw_channel_id)
                 continue
             if profile_name not in self.llm_profiles:
-                print(
-                    "[Discord] 未定義のLLM profile を無視します: "
-                    f"channel={channel_id} profile={profile_name}"
+                logger.warning(
+                    "[Discord] 未定義のLLM profile を無視します: channel=%s profile=%s",
+                    channel_id,
+                    profile_name,
                 )
                 continue
             mapping[channel_id] = profile_name
@@ -513,6 +696,10 @@ class DiscordConsoleState:
                     max_history_turns=profile.max_history_turns,
                     history_dir=str(PROJECT_ROOT / self.config.history_dir),
                     web_search=self.web_search,
+                    screen_context=self.screen_context,
+                    task_store=self.task_store,
+                    calendar_context=self.calendar_context,
+                    emotion_tags=self.config.emotion_tag_enabled,
                 )
             else:
                 self.sessions[key].system_prompt = profile.system_prompt
@@ -558,18 +745,20 @@ class DiscordConsoleState:
             self.sessions.pop(key, None)
             self.session_locks.pop(key, None)
 
-    def ask(self, interaction: discord.Interaction, prompt: str, *, ephemeral: bool = False) -> str:
+    def ask(
+        self, interaction: discord.Interaction, prompt: str, *, ephemeral: bool = False
+    ) -> tuple[str, str]:
         if self.llm is None or self.config is None:
             raise RuntimeError("LLM is not initialized")
         session, lock, profile = self.get_session(interaction, ephemeral=ephemeral)
         return self.ask_session(session, prompt, lock, profile)
 
-    def ask_message(self, message: discord.Message) -> str:
+    def ask_message(self, message: discord.Message) -> tuple[str, str]:
         if self.llm is None or self.config is None:
             raise RuntimeError("LLM is not initialized")
         return self.ask_message_text(message, message.content.strip())
 
-    def ask_message_text(self, message: discord.Message, prompt: str) -> str:
+    def ask_message_text(self, message: discord.Message, prompt: str) -> tuple[str, str]:
         if self.llm is None or self.config is None:
             raise RuntimeError("LLM is not initialized")
         session, lock, profile = self.get_message_session(message)
@@ -681,7 +870,8 @@ class DiscordConsoleState:
         prompt: str,
         lock: threading.Lock,
         profile: DiscordLLMProfile,
-    ) -> str:
+    ) -> tuple[str, str]:
+        """(clean_text, emotion) を返す。履歴・トレーニングにはタグ除去後のテキストを保存する。"""
         if self.llm is None or self.config is None:
             raise RuntimeError("LLM is not initialized")
         llm = self._llm_for_profile(profile)
@@ -701,16 +891,107 @@ class DiscordConsoleState:
                 if session._messages and session._messages[-1]["role"] == "user":
                     session._messages.pop()
                 raise
+            # 感情タグを分離。履歴には clean text のみ格納する。
+            if self.config.emotion_tag_enabled:
+                emotion, response = parse_emotion_tag(response)
+            else:
+                emotion = "neutral"
             session.add_assistant_message(response)
-            return response
+            return response, emotion
 
-    def synthesize(self, text: str, voice: str, speed: float) -> bytes:
+    def synthesize(
+        self,
+        text: str,
+        voice: str | None,
+        speed: float,
+        style: str | None = None,
+    ) -> bytes:
         with self.tts_lock:
             if self.tts is None:
-                self.tts = KokoroTTS(models_dir=PROJECT_ROOT / "models" / "tts" / "kokoro")
-            self.tts.voice = voice
+                self.tts = create_tts_backend(
+                    env_prefix="DISCORD_VOICE",
+                    models_dir=PROJECT_ROOT / "models" / "tts" / "kokoro",
+                    voice=voice,
+                    speed=speed,
+                )
+            elif voice:
+                self.tts.set_voice(voice)
             self.tts.speed = speed
-            return self.tts.synthesize(text)
+            # style は SBV2 backend で使われ、kokoro では無視される。
+            return self.tts.synthesize(text, style=style)
+
+    def resolve_task_channel_id(self) -> int | None:
+        """リマインド配送先: DISCORD_PROACTIVE_CHANNEL_ID → auto-reply 先頭。"""
+        pid = parse_optional_id(os.environ.get("DISCORD_PROACTIVE_CHANNEL_ID"))
+        if pid is not None:
+            return pid
+        if self.auto_reply_channel_ids:
+            return sorted(self.auto_reply_channel_ids)[0]
+        return None
+
+    def resolve_task_board_channel_id(self) -> int | None:
+        """ボード設置先: DISCORD_TASK_BOARD_CHANNEL_ID → リマインド配送先と同じフォールバック。"""
+        if self.task_board_channel_id is not None:
+            return self.task_board_channel_id
+        return self.resolve_task_channel_id()
+
+    def refresh_task_board(self) -> None:
+        """ボードが有効なら更新を要求する (無効・未初期化なら何もしない)。
+
+        bot ループ上のコルーチンから呼ぶこと (View コールバック等)。
+        """
+        board = self.task_board
+        if board is not None:
+            board.request_refresh()
+
+    def rewrite_task_text(self, message: str) -> str:
+        """タスク通知の定型文をペルソナ口調へ言い換える (履歴を汚さない使い捨て呼び出し)。"""
+        profile = self.llm_profiles.get("default")
+        system_prompt = profile.system_prompt if profile is not None else ""
+        gen_kwargs: dict[str, Any] = {}
+        if profile is not None:
+            gen_kwargs = dict(
+                temperature=profile.temperature,
+                top_p=profile.top_p,
+                top_k=profile.top_k,
+                repeat_penalty=profile.repeat_penalty,
+                num_ctx=profile.num_ctx,
+                num_predict=profile.num_predict,
+            )
+        return rewrite_message(
+            self.llm, system_prompt=system_prompt, message=message, **gen_kwargs
+        )
+
+    def extract_task_from_text(self, user_text: str) -> dict | None:
+        """ユーザー発言から strict JSON でタスクを抽出・検証する (同期・スレッド実行)。"""
+        if self.llm is None or self.config is None:
+            return None
+        now_local = datetime.now(ZoneInfo(self.tasks_timezone))
+        messages = [
+            {"role": "system", "content": build_extraction_prompt(now_local)},
+            {"role": "user", "content": user_text},
+        ]
+        try:
+            raw = self.llm.generate(
+                messages,
+                temperature=0.0,
+                num_ctx=self.config.num_ctx,
+                num_predict=256,
+            )
+        except Exception as e:
+            logger.error("[Discord] task extraction LLM error: %s", e)
+            return None
+        return validate_extraction(raw, assume_tz=ZoneInfo(self.tasks_timezone))
+
+    def add_task_quick(self, title: str, source: str) -> int | None:
+        """「タスク:」プレフィックスの即登録。確認なし。失敗時 None。"""
+        if self.task_store is None:
+            return None
+        try:
+            return self.task_store.add(title, source=source)
+        except Exception as e:
+            logger.error("[Discord] quick task add failed: %s", e)
+            return None
 
     def status_text(self) -> str:
         assert self.config is not None
@@ -729,6 +1010,7 @@ class DiscordConsoleState:
             f"channel_profile_map: {len(self.channel_profile_map)}\n"
             f"sessions: {session_count}\n"
             f"tts_loaded: {tts_loaded}\n"
+            f"tts_backend: {backend_name(self.tts)}\n"
             f"auto_reply_channels: {len(self.auto_reply_channel_ids)}\n"
             f"terminal_channels: {len(self.terminal_channel_ids)}\n"
             f"terminal_enabled: {self.allow_terminal}\n"
@@ -740,6 +1022,10 @@ class DiscordConsoleState:
             f"{self.voice_stt.status_text() if self.voice_stt else 'voice_stt: unavailable'}\n"
             f"message_content_intent: {self.message_content_required()}\n"
             f"web_search: {self.web_search is not None}\n"
+            f"tasks_store: {self.task_store is not None}\n"
+            f"tasks_reminder: {self.task_reminder_engine.is_running if self.task_reminder_engine else False}\n"
+            f"tasks_open: {len(self.task_store.list('open')) if self.task_store else 0}\n"
+            f"tasks_quiet_hours: {self.tasks_quiet_hours[0]}-{self.tasks_quiet_hours[1]}\n"
             f"service_control: {self.allow_service_control}\n"
             f"{self.training_log.summary_text() if self.training_log else 'training_log: unavailable'}\n"
             f"checks: {health['checks']}"
@@ -834,8 +1120,6 @@ class CorrectionModal(discord.ui.Modal, title="返答の修正を学習候補に
                 f"修正を保存できませんでした: {result.reason}",
                 ephemeral=True,
             )
-
-
 
 
 class CorrectionPickView(discord.ui.View):
@@ -973,7 +1257,7 @@ async def send_diary_to_channel(
     state.diary_service.mark_posted(target_date, channel_id=state.diary_channel_id)
     await maybe_personalize_from_diary(state, target_date, result.markdown)
     if result.calendar_error:
-        print(f"[Discord] diary calendar warning: {result.calendar_error[:500]}")
+        logger.warning("[Discord] diary calendar warning: %s", result.calendar_error[:500])
     return result
 
 
@@ -991,13 +1275,15 @@ async def maybe_personalize_from_diary(
             diary_markdown=diary_markdown,
             dry_run=False,
         )
-        print(
-            "[Discord] daily personalization: "
-            f"date={result.target_date} applied={result.applied_count} audit={result.audit_path}"
+        logger.info(
+            "[Discord] daily personalization: date=%s applied=%s audit=%s",
+            result.target_date,
+            result.applied_count,
+            result.audit_path,
         )
         return result
     except Exception as e:
-        print(f"[Discord] daily personalization failed: {e}")
+        logger.error("[Discord] daily personalization failed: %s", e)
         return None
 
 
@@ -1016,9 +1302,9 @@ async def diary_scheduler_loop(bot: commands.Bot, state: DiscordConsoleState) ->
             if now >= run_at and not state.diary_service.was_posted(now.date()):
                 try:
                     await send_diary_to_channel(bot, state, now.date())
-                    print(f"[Discord] diary posted for {now.date().isoformat()}")
+                    logger.info("[Discord] diary posted for %s", now.date().isoformat())
                 except Exception as e:
-                    print(f"[Discord] diary post failed: {e}")
+                    logger.error("[Discord] diary post failed: %s", e)
                 await asyncio.sleep(60)
                 continue
 
@@ -1029,7 +1315,7 @@ async def diary_scheduler_loop(bot: commands.Bot, state: DiscordConsoleState) ->
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            print(f"[Discord] diary scheduler error: {e}")
+            logger.error("[Discord] diary scheduler error: %s", e)
             await asyncio.sleep(300)
 
 
@@ -1039,81 +1325,275 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
     intents.reactions = True
     bot = commands.Bot(command_prefix="!", intents=intents)
 
+    # 常設タスクボードの管理。永続View登録 (setup_hook) → ボード探索/作成 (on_ready)。
+    board_manager = TaskBoardManager(
+        bot,
+        state,
+        channel_id=state.resolve_task_board_channel_id(),
+        enabled=state.tasks_board_enabled and state.task_store is not None,
+        state_path=PROJECT_ROOT / "data" / "tasks" / "board_state.json",
+    )
+    state.task_board = board_manager
+    board_setup_started = False
+
     @bot.event
     async def setup_hook() -> None:
+        if board_manager.enabled:
+            # 再起動後もボードのボタン/Selectを生かすため、永続Viewを登録する。
+            bot.add_view(TaskBoardView(board_manager))
         guild_id = os.environ.get("DISCORD_GUILD_ID", "").strip()
         if guild_id:
             guild = discord.Object(id=int(guild_id))
             bot.tree.copy_global_to(guild=guild)
             await bot.tree.sync(guild=guild)
-            print(f"[Discord] slash commands synced to guild {guild_id}")
+            logger.info("[Discord] slash commands synced to guild %s", guild_id)
         else:
             await bot.tree.sync()
-            print("[Discord] global slash commands synced")
+            logger.info("[Discord] global slash commands synced")
         if state.diary_enabled and state.diary_task is None:
             state.diary_task = asyncio.create_task(diary_scheduler_loop(bot, state))
-            print("[Discord] diary scheduler started")
+            logger.info("[Discord] diary scheduler started")
+
+    # プロアクティブ発話の起動は1度だけ (on_ready は再接続で複数回発火しうる)
+    proactive_started = False
 
     @bot.event
     async def on_ready() -> None:
-        print(f"[Discord] logged in as {bot.user} ({bot.user.id if bot.user else 'unknown'})")
-        print(f"[Discord] auto reply channels: {sorted(state.auto_reply_channel_ids)}")
-        print(f"[Discord] terminal channels: {sorted(state.terminal_channel_ids)}")
-        print(
-            "[Discord] diary: "
-            f"enabled={state.diary_enabled} "
-            f"channel={state.diary_channel_id or '-'} "
-            f"time={state.diary_post_time.strftime('%H:%M')} {state.diary_timezone}"
+        nonlocal proactive_started, board_setup_started
+        logger.info("[Discord] logged in as %s (%s)", bot.user, bot.user.id if bot.user else "unknown")
+        logger.info("[Discord] auto reply channels: %s", sorted(state.auto_reply_channel_ids))
+        logger.info("[Discord] terminal channels: %s", sorted(state.terminal_channel_ids))
+        logger.info(
+            "[Discord] diary: enabled=%s channel=%s time=%s %s",
+            state.diary_enabled,
+            state.diary_channel_id or "-",
+            state.diary_post_time.strftime("%H:%M"),
+            state.diary_timezone,
         )
         if state.voice_stt is not None:
-            print(
-                "[Discord] voice STT: "
-                f"enabled={state.voice_stt.config.enabled} "
-                f"available={state.voice_stt.available} "
-                f"transcript_channel={state.voice_stt.transcript_channel_id or '-'}"
+            logger.info(
+                "[Discord] voice STT: enabled=%s available=%s transcript_channel=%s",
+                state.voice_stt.config.enabled,
+                state.voice_stt.available,
+                state.voice_stt.transcript_channel_id or "-",
             )
+        if not proactive_started:
+            proactive_started = True
+            try:
+                state.proactive_bridge = create_proactive_bridge(state, bot)
+            except Exception as e:
+                logger.error("[Discord] proactive 初期化失敗 (proactiveなしで続行): %s", e)
+                state.proactive_bridge = None
+            if state.proactive_bridge is not None:
+                state.proactive_bridge.start()
+                cfg = state.proactive_bridge.config
+                logger.info(
+                    "[Discord] proactive started: channel=%s rewrite=%s interval=%ss",
+                    cfg.channel_id,
+                    cfg.llm_rewrite,
+                    cfg.check_interval,
+                )
+            _start_task_reminder()
+            # カレンダー同期: schedule 洗い替えは ProactiveEngine と同じ
+            # UserProfile インスタンスに書く必要がある (エンジンは disk を再読込
+            # しないため)。bridge が無ければ profile=None で pull は upcoming.json
+            # の書き出しのみ行う。
+            shared_profile = None
+            if state.proactive_bridge is not None:
+                shared_profile = getattr(state.proactive_bridge.engine, "profile", None)
+            try:
+                state.start_calendar_sync(profile=shared_profile)
+            except Exception as e:
+                logger.error("[Discord] calendar sync 起動失敗: %s", e)
+        if not board_setup_started and board_manager.enabled:
+            board_setup_started = True
+            asyncio.create_task(board_manager.setup())
+
+    def _start_task_reminder() -> None:
+        """タスクのリマインドエンジンを起動 (Discord bot プロセスでのみ、v1)。"""
+        if not state.tasks_reminder_enabled or state.task_store is None:
+            logger.info("[Discord] task reminder disabled (enabled=%s)", state.tasks_reminder_enabled)
+            return
+        if state.task_reminder_engine is not None:
+            return
+        try:
+            engine = TaskReminderEngine(
+                state.task_store,
+                task_reminder_callback,
+                owner="discord",
+                timezone_name=state.tasks_timezone,
+                quiet_hours=state.tasks_quiet_hours,
+                check_interval=60.0,
+            )
+            engine.start()
+            state.task_reminder_engine = engine
+            logger.info(
+                "[Discord] task reminder started: quiet_hours=%s-%s channel=%s",
+                state.tasks_quiet_hours[0],
+                state.tasks_quiet_hours[1],
+                state.resolve_task_channel_id(),
+            )
+        except Exception as e:
+            logger.error("[Discord] task reminder 起動失敗 (タスク通知なしで続行): %s", e)
+            state.task_reminder_engine = None
+
+    def task_reminder_callback(*, trigger_type: str, message: str, task_id: int, stage: str) -> None:
+        """リマインドエンジンのスレッドから呼ばれる。bot ループへブリッジする。"""
+        loop = getattr(bot, "loop", None)
+        if loop is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                deliver_task_reminder(message, task_id, stage), loop
+            )
+        except Exception as e:
+            logger.error("[Discord] task reminder bridge error: %s", e)
+
+    async def deliver_task_reminder(message: str, task_id: int, stage: str) -> None:
+        channel_id = state.resolve_task_channel_id()
+        if channel_id is None:
+            logger.warning("[Discord] task reminder: 配送先チャンネルが未設定")
+            return
+        channel = bot.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(channel_id)
+            except discord.HTTPException:
+                logger.warning("[Discord] task reminder: チャンネル取得失敗 %s", channel_id)
+                return
+        # 定型文をペルソナ口調へ言い換え (失敗時は原文)
+        try:
+            text = await asyncio.to_thread(state.rewrite_task_text, message)
+        except Exception:
+            text = message
+        emotion, text = parse_emotion_tag(text)
+        if not text:
+            text = message
+        view = TaskReminderView(state, task_id)
+        try:
+            await channel.send(text, view=view)
+        except Exception as e:
+            logger.error("[Discord] task reminder send failed: %s", e)
+            return
+        # 通話接続中なら音声でも読み上げる (既存パターン)
+        if state.voice_tts is not None:
+            try:
+                asyncio.create_task(state.voice_tts.autoread(text, emotion=emotion))
+            except Exception:
+                pass
+
+    task_extraction_enabled = parse_bool(
+        os.environ.get("TASKS_CHAT_EXTRACTION_ENABLED"), default=True
+    )
+
+    async def register_quick_task(message: discord.Message, body: str, source: str) -> None:
+        """「タスク: ...」を確認なしで即登録し、短く返信する。"""
+        title = body.strip()
+        if not title:
+            return
+        task_id = await asyncio.to_thread(state.add_task_quick, title, source)
+        if task_id is None:
+            await message.reply("タスクを登録できませんでした。", mention_author=False)
+            return
+        await message.reply(f"タスクを登録しました (#{task_id}): {title}", mention_author=False)
+        state.refresh_task_board()
+
+    async def maybe_offer_task_from_chat(message: discord.Message, user_text: str) -> None:
+        """自然会話からタスク候補を抽出し、確認ボタン付きで提示する (自動登録しない)。"""
+        if not task_extraction_enabled or state.task_store is None:
+            return
+        extracted = await asyncio.to_thread(state.extract_task_from_text, user_text)
+        if extracted is None:
+            return
+        tz = ZoneInfo(state.tasks_timezone)
+        due_at = extracted["due_at"]
+        granularity = "datetime" if due_at is not None else None
+        due_str = make_due_summary(due_at, tz)
+        prio = extracted["priority"]
+        view = TaskConfirmView(
+            state,
+            title=extracted["title"],
+            due_at=due_at,
+            due_granularity=granularity,
+            priority=prio,
+            source="chat",
+        )
+        content = (
+            f"これ、タスクにする? 「{extracted['title']}」"
+            f" (期限: {due_str}, 優先度: {prio})"
+        )
+        try:
+            sent = await message.reply(content, view=view, mention_author=False)
+            view.message = sent
+        except discord.HTTPException as e:
+            logger.error("[Discord] task confirm send failed: %s", e)
+
+    async def handle_voice_reply(message: discord.Message, transcript_text: str) -> None:
+        """通話 transcript (デバウンス後の結合テキスト) に1回だけLLM返信する。"""
+        async with message.channel.typing():
+            try:
+                response, emotion = await asyncio.to_thread(
+                    state.ask_message_text,
+                    message,
+                    transcript_text,
+                )
+            except Exception as e:
+                await message.reply(f"LLM error: `{e}`", mention_author=False)
+                return
+        reply_messages = []
+        for chunk in split_message(response):
+            sent = await message.reply(chunk, mention_author=False)
+            reply_messages.append(sent)
+        state.record_auto_reply(
+            message,
+            response,
+            reply_messages,
+            user_text=transcript_text,
+            source="discord_voice_transcript",
+        )
+        if state.voice_tts is not None:
+            # 通話由来の質問には音声でも返す (接続中のみ、失敗しても無視)
+            asyncio.create_task(state.voice_tts.autoread(response, emotion=emotion))
+        if reply_messages:
+            for reaction in (GOOD_REACTION, BAD_REACTION):
+                try:
+                    await reply_messages[0].add_reaction(reaction)
+                except discord.HTTPException as e:
+                    logger.warning("[Discord] feedback reaction failed: %s", e)
+
+    # 断片ごとの即返信を避け、同じ話者の後続断片が落ち着いてから1回だけ返信する。
+    voice_reply_debouncer = VoiceReplyDebouncer(
+        debounce_ms=state.voice_reply_debounce_ms,
+        max_ms=state.voice_reply_debounce_max_ms,
+        on_flush=lambda msg, txt: asyncio.create_task(handle_voice_reply(msg, txt)),
+    )
+    state.voice_reply_debouncer = voice_reply_debouncer
 
     @bot.event
     async def on_message(message: discord.Message) -> None:
         bot_user_id = bot.user.id if bot.user is not None else None
-        transcript_text = None
+        transcript = None
         if state.is_allowed_voice_transcript_message(message, bot_user_id=bot_user_id):
-            transcript_text = state.extract_voice_transcript_text(message.content)
+            transcript = state.extract_voice_transcript(message.content)
         elif message.author.bot:
             return
 
-        if transcript_text is not None:
-            async with message.channel.typing():
-                try:
-                    response = await asyncio.to_thread(
-                        state.ask_message_text,
-                        message,
-                        transcript_text,
-                    )
-                except Exception as e:
-                    await message.reply(f"LLM error: `{e}`", mention_author=False)
-                    return
-            reply_messages = []
-            for chunk in split_message(response):
-                sent = await message.reply(chunk, mention_author=False)
-                reply_messages.append(sent)
-            state.record_auto_reply(
-                message,
-                response,
-                reply_messages,
-                user_text=transcript_text,
-                source="discord_voice_transcript",
-            )
-            if state.voice_tts is not None:
-                # 通話由来の質問には音声でも返す (接続中のみ、失敗しても無視)
-                asyncio.create_task(state.voice_tts.autoread(response))
-            if reply_messages:
-                for reaction in (GOOD_REACTION, BAD_REACTION):
-                    try:
-                        await reply_messages[0].add_reaction(reaction)
-                    except discord.HTTPException as e:
-                        print(f"[Discord] feedback reaction failed: {e}")
+        if transcript is not None:
+            speaker, transcript_text = transcript
+            # 通話でも「タスク:」プレフィックスは確認なしで即登録する。
+            task_match = TASK_PREFIX_RE.match(transcript_text.strip())
+            if task_match and state.task_store is not None:
+                await register_quick_task(message, task_match.group("body"), source="voice")
+                return
+            # 話者ごとにバッファし、デバウンス満了で結合テキストを1回返信する。
+            voice_reply_debouncer.submit(speaker, message, transcript_text)
             return
+
+        # 許可ユーザーの発言で休憩提案タイマーをリセット (proactive)
+        if state.proactive_bridge is not None and (
+            not state.allowed_user_ids or message.author.id in state.allowed_user_ids
+        ):
+            state.proactive_bridge.notify_user_activity()
 
         terminal_content = message.content.strip()
         terminal_prefix = state.terminal.command_prefix if state.terminal else "!t"
@@ -1139,7 +1619,7 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
             return
 
         if terminal_content.startswith(terminal_prefix):
-            print(f"[Discord] terminal message ignored: {terminal_reason}")
+            logger.info("[Discord] terminal message ignored: %s", terminal_reason)
             if terminal_reason and not terminal_reason.startswith("user is not allowed"):
                 await message.reply(f"terminal error:\n{terminal_reason}", mention_author=False)
             return
@@ -1156,9 +1636,15 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
             await message.reply(result_text, mention_author=False)
             return
 
+        # 「タスク: ...」は明示的なので確認なしで即登録する。
+        task_match = TASK_PREFIX_RE.match(content)
+        if task_match and state.task_store is not None:
+            await register_quick_task(message, task_match.group("body"), source="command")
+            return
+
         async with message.channel.typing():
             try:
-                response = await asyncio.to_thread(state.ask_message, message)
+                response, _emotion = await asyncio.to_thread(state.ask_message, message)
             except Exception as e:
                 await message.reply(f"LLM error: `{e}`", mention_author=False)
                 return
@@ -1167,12 +1653,14 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
             sent = await message.reply(chunk, mention_author=False)
             reply_messages.append(sent)
         state.record_auto_reply(message, response, reply_messages)
+        # 返信送信後に非同期でタスク抽出 (レイテンシに影響させない)。自動登録はしない。
+        asyncio.create_task(maybe_offer_task_from_chat(message, content))
         if reply_messages:
             for reaction in (GOOD_REACTION, BAD_REACTION):
                 try:
                     await reply_messages[0].add_reaction(reaction)
                 except discord.HTTPException as e:
-                    print(f"[Discord] feedback reaction failed: {e}")
+                    logger.warning("[Discord] feedback reaction failed: %s", e)
 
     # 👎で言い直し案を出したメッセージのID (多重生成を防ぐ)
     correction_offered_ids: set[int] = set()
@@ -1258,7 +1746,9 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
             return
         await interaction.response.defer(thinking=True, ephemeral=ephemeral)
         try:
-            response = await asyncio.to_thread(state.ask, interaction, prompt, ephemeral=ephemeral)
+            response, _emotion = await asyncio.to_thread(
+                state.ask, interaction, prompt, ephemeral=ephemeral
+            )
         except Exception as e:
             await interaction.followup.send(f"LLM error: `{e}`", ephemeral=True)
             return
@@ -1272,18 +1762,18 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
         state.reset_session(interaction)
         await interaction.response.send_message("会話履歴をリセットしました。", ephemeral=True)
 
-    @bot.tree.command(name="tts", description="テキストを kokoro-onnx で読み上げ WAV にします")
-    @app_commands.describe(text="読み上げるテキスト", voice="Kokoro voice", speed="読み上げ速度")
+    @bot.tree.command(name="tts", description="テキストをTTSで読み上げ WAV にします")
+    @app_commands.describe(text="読み上げるテキスト", voice="TTS voice", speed="読み上げ速度")
     @app_commands.choices(
         voice=[
             app_commands.Choice(name=f"{voice} - {label}", value=voice)
-            for voice, label in KokoroTTS.JA_VOICES.items()
+            for voice, label in all_tts_voices().items()
         ]
     )
     async def tts(
         interaction: discord.Interaction,
         text: str,
-        voice: str = "jf_alpha",
+        voice: str | None = None,
         speed: float = 1.0,
     ) -> None:
         if not await require_allowed(interaction, state):
@@ -1377,11 +1867,11 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
         await interaction.followup.send(text)
 
     @voice_group.command(name="say", description="接続中の通話チャンネルでテキストを読み上げます")
-    @app_commands.describe(text="読み上げるテキスト", voice="Kokoro voice", speed="読み上げ速度")
+    @app_commands.describe(text="読み上げるテキスト", voice="TTS voice", speed="読み上げ速度")
     @app_commands.choices(
         voice=[
             app_commands.Choice(name=f"{voice} - {label}", value=voice)
-            for voice, label in KokoroTTS.JA_VOICES.items()
+            for voice, label in all_tts_voices().items()
         ]
     )
     async def voice_say(
@@ -1453,6 +1943,156 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
 
     bot.tree.add_command(voice_group)
 
+    task_group = app_commands.Group(name="task", description="タスク管理")
+
+    def _tasks_tz() -> ZoneInfo:
+        return ZoneInfo(state.tasks_timezone)
+
+    def _format_task_line(task: dict) -> str:
+        tz = _tasks_tz()
+        due = task["due_at"]
+        if due is None:
+            due_str = "期限なし"
+        else:
+            local = due.astimezone(tz)
+            due_str = (
+                local.strftime("%-m/%-d")
+                if task["due_granularity"] == "date"
+                else local.strftime("%-m/%-d %H:%M")
+            )
+        prio = {"high": "[高]", "low": "[低]", "normal": ""}.get(task["priority"], "")
+        line = f"#{task['id']} {prio}{task['title']} (期限: {due_str})"
+        if task["action_hint"]:
+            line += f" 次の一手: {task['action_hint']}"
+        return line
+
+    @task_group.command(name="add", description="タスクを追加します")
+    @app_commands.describe(
+        title="タスク名",
+        due="期限。例: 明日 / 7/10 / 7/10 15:00 (省略可)",
+        priority="優先度",
+        note="メモ (省略可)",
+    )
+    @app_commands.choices(
+        priority=[
+            app_commands.Choice(name="high", value="high"),
+            app_commands.Choice(name="normal", value="normal"),
+            app_commands.Choice(name="low", value="low"),
+        ]
+    )
+    async def task_add(
+        interaction: discord.Interaction,
+        title: str,
+        due: str = "",
+        priority: str = "normal",
+        note: str = "",
+    ) -> None:
+        if not await require_allowed(interaction, state):
+            return
+        if state.task_store is None:
+            await interaction.response.send_message("タスクストアが無効です。", ephemeral=True)
+            return
+        now = datetime.now(timezone.utc)
+        due_at = None
+        granularity = None
+        if due.strip():
+            due_at, granularity = parse_due(due, now, _tasks_tz())
+            if due_at is None:
+                await interaction.response.send_message(
+                    "期限を解釈できませんでした。例: 明日 / 7/10 / 7/10 15:00", ephemeral=True
+                )
+                return
+        try:
+            task_id = await asyncio.to_thread(
+                state.task_store.add,
+                title,
+                note=note or None,
+                due_at=due_at,
+                due_granularity=granularity,
+                priority=priority,
+                source="command",
+            )
+        except Exception as e:
+            await interaction.response.send_message(f"追加に失敗しました: `{e}`", ephemeral=True)
+            return
+        due_str = make_due_summary(due_at, _tasks_tz())
+        await interaction.response.send_message(
+            f"タスクを追加しました (#{task_id}): {title} (期限: {due_str}, 優先度: {priority})"
+        )
+        state.refresh_task_board()
+
+    @task_group.command(name="list", description="未完了タスクを一覧表示します")
+    async def task_list(interaction: discord.Interaction) -> None:
+        if not await require_allowed(interaction, state):
+            return
+        if state.task_store is None:
+            await interaction.response.send_message("タスクストアが無効です。", ephemeral=True)
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        tasks = await asyncio.to_thread(state.task_store.list, "open", 50)
+        if not tasks:
+            await interaction.followup.send("未完了のタスクはありません。", ephemeral=True)
+            return
+        lines = [_format_task_line(t) for t in tasks]
+        text = "未完了タスク:\n" + "\n".join(lines)
+        for chunk in split_message(text):
+            await interaction.followup.send(chunk, ephemeral=True)
+
+    @task_group.command(name="done", description="タスクを完了にします")
+    @app_commands.describe(task_id="タスクID (/task list で確認)")
+    async def task_done(interaction: discord.Interaction, task_id: int) -> None:
+        if not await require_allowed(interaction, state):
+            return
+        if state.task_store is None:
+            await interaction.response.send_message("タスクストアが無効です。", ephemeral=True)
+            return
+        ok = await asyncio.to_thread(state.task_store.done, task_id)
+        msg = f"タスク #{task_id} を完了にしました。" if ok else f"タスク #{task_id} が見つからないか、すでに完了/削除済みです。"
+        await interaction.response.send_message(msg)
+        if ok:
+            state.refresh_task_board()
+
+    @task_group.command(name="snooze", description="タスクのリマインドを先送りします")
+    @app_commands.describe(task_id="タスクID", when="例: 30m / 2h / 明日")
+    async def task_snooze(interaction: discord.Interaction, task_id: int, when: str) -> None:
+        if not await require_allowed(interaction, state):
+            return
+        if state.task_store is None:
+            await interaction.response.send_message("タスクストアが無効です。", ephemeral=True)
+            return
+        now = datetime.now(timezone.utc)
+        until = parse_snooze(when, now, _tasks_tz())
+        if until is None:
+            await interaction.response.send_message(
+                "先送り時間を解釈できませんでした。例: 30m / 2h / 明日", ephemeral=True
+            )
+            return
+        ok = await asyncio.to_thread(state.task_store.snooze, task_id, until)
+        if not ok:
+            await interaction.response.send_message(
+                f"タスク #{task_id} が見つからないか、すでに完了/削除済みです。", ephemeral=True
+            )
+            return
+        until_str = until.astimezone(_tasks_tz()).strftime("%-m/%-d %H:%M")
+        await interaction.response.send_message(f"タスク #{task_id} を {until_str} まで先送りしました。")
+        state.refresh_task_board()
+
+    @task_group.command(name="del", description="タスクを削除 (dropped) します")
+    @app_commands.describe(task_id="タスクID")
+    async def task_del(interaction: discord.Interaction, task_id: int) -> None:
+        if not await require_allowed(interaction, state):
+            return
+        if state.task_store is None:
+            await interaction.response.send_message("タスクストアが無効です。", ephemeral=True)
+            return
+        ok = await asyncio.to_thread(state.task_store.drop, task_id)
+        msg = f"タスク #{task_id} を削除しました。" if ok else f"タスク #{task_id} が見つからないか、すでに完了/削除済みです。"
+        await interaction.response.send_message(msg)
+        if ok:
+            state.refresh_task_board()
+
+    bot.tree.add_command(task_group)
+
     async def correction_menu_callback(
         interaction: discord.Interaction,
         message: discord.Message,
@@ -1471,6 +2111,27 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
         callback=correction_menu_callback,
     )
     bot.tree.add_command(correction_menu)
+
+    async def add_task_menu_callback(
+        interaction: discord.Interaction,
+        message: discord.Message,
+    ) -> None:
+        if not await require_allowed(interaction, state):
+            return
+        if state.task_store is None:
+            await interaction.response.send_message("タスクストアが無効です。", ephemeral=True)
+            return
+        # モーダルは3秒以内に開く必要があるため、ここでは重い処理をしない。
+        prefill = (message.content or "").strip()
+        await interaction.response.send_modal(
+            TaskModal(state, prefill_title=prefill, source="context_menu")
+        )
+
+    add_task_menu = app_commands.ContextMenu(
+        name="タスクに登録",
+        callback=add_task_menu_callback,
+    )
+    bot.tree.add_command(add_task_menu)
 
     @bot.tree.command(name="status", description="subpc_living の状態を確認します")
     async def status(interaction: discord.Interaction) -> None:

@@ -47,6 +47,10 @@ class ChatConfig:
     # --- 表示設定 ---
     stream: bool = True  # ストリーミング出力を使用するか
 
+    # --- 感情タグ ---
+    # True: 応答冒頭に [emo:happy] 形式のタグを出力させ、TTSスタイルを動的に切り替える
+    emotion_tag_enabled: bool = False
+
     # --- Discord チャンネル別LLMプロファイル ---
     # discord_channel_profile_map: {"channel_id": "profile_name"}
     # discord_channel_profiles: {"profile_name": {"temperature": 0.4, ...}}

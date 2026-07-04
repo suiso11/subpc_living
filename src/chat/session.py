@@ -13,9 +13,12 @@ from typing import Optional, TYPE_CHECKING
 if TYPE_CHECKING:
     from src.memory.rag import RAGRetriever
     from src.vision.context import VisionContext
+    from src.screen.context import ScreenContext
     from src.monitor.context import MonitorContext
     from src.persona.preloader import SessionPreloader
     from src.chat.web_search import WebSearchContext
+    from src.tasks.store import TaskStore
+    from src.tasks.calendar_sync import CalendarContext
 
 
 class ChatSession:
@@ -28,12 +31,17 @@ class ChatSession:
         history_dir: str = "data/chat_history",
         rag: Optional["RAGRetriever"] = None,
         vision_context: Optional["VisionContext"] = None,
+        screen_context: Optional["ScreenContext"] = None,
         monitor_context: Optional["MonitorContext"] = None,
         preloader: Optional["SessionPreloader"] = None,
         web_search: Optional["WebSearchContext"] = None,
+        task_store: Optional["TaskStore"] = None,
+        calendar_context: Optional["CalendarContext"] = None,
+        emotion_tags: bool = False,
     ):
         self.system_prompt = system_prompt
         self.max_history_turns = max_history_turns
+        self.emotion_tags = emotion_tags
         self.history_dir = Path(history_dir)
         self.history_dir.mkdir(parents=True, exist_ok=True)
 
@@ -42,9 +50,12 @@ class ChatSession:
         self._created_at = datetime.now()
         self.rag = rag
         self.vision_context = vision_context
+        self.screen_context = screen_context
         self.monitor_context = monitor_context
         self.preloader = preloader
         self.web_search = web_search
+        self.task_store = task_store
+        self.calendar_context = calendar_context
 
     def add_user_message(self, content: str) -> None:
         """ユーザーのメッセージを追加"""
@@ -118,6 +129,37 @@ class ChatSession:
             monitor_text = self.monitor_context.get_context_text()
             if monitor_text:
                 system_content = system_content + monitor_text
+
+        # Screen: ユーザーの画面で何をしているかを注入 (VLM描写)
+        if self.screen_context is not None:
+            screen_text = self.screen_context.get_context_text()
+            if screen_text:
+                system_content = system_content + screen_text
+
+        # Calendar: Google Calendar の今日〜明日の予定を注入 (ファイル読取のみ)
+        if self.calendar_context is not None:
+            try:
+                cal_text = self.calendar_context.get_context_text()
+                if cal_text:
+                    system_content = system_content + cal_text
+            except Exception:
+                pass
+
+        # Tasks: 未完了タスクを注入 (0件なら注入しない)
+        if self.task_store is not None:
+            try:
+                from src.tasks.store import build_task_context
+                task_text = build_task_context(self.task_store)
+                if task_text:
+                    system_content = system_content + task_text
+            except Exception:
+                pass
+
+        # 感情タグの指示 (有効時のみ、system content 末尾へ一元的に追加)
+        if self.emotion_tags:
+            from src.chat.emotion import EMOTION_TAG_INSTRUCTION
+            separator = "\n\n" if system_content else ""
+            system_content = system_content + separator + EMOTION_TAG_INSTRUCTION
 
         if system_content:
             messages.append({"role": "system", "content": system_content})

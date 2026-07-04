@@ -117,10 +117,9 @@ class MCPStdioClient:
     def _send(proc: subprocess.Popen, message: dict[str, Any]) -> None:
         if proc.stdin is None:
             raise MCPStdioError("MCP server stdin is closed")
+        # MCP stdio transport は改行区切りJSON (LSP風の Content-Length フレーミングではない)
         payload = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        header = f"Content-Length: {len(payload)}\r\n\r\n".encode("ascii")
-        proc.stdin.write(header)
-        proc.stdin.write(payload)
+        proc.stdin.write(payload + b"\n")
         proc.stdin.flush()
 
     def _wait_for_response(
@@ -163,33 +162,17 @@ class MCPStdioClient:
 
     @staticmethod
     def _read_stdout(stream, messages: "queue.Queue[dict[str, Any] | Exception | None]") -> None:
-        buffer = b""
         try:
-            while True:
-                chunk = stream.read(4096)
-                if not chunk:
-                    messages.put(None)
-                    return
-                buffer += chunk
-                while True:
-                    header_end = buffer.find(b"\r\n\r\n")
-                    if header_end < 0:
-                        break
-                    header = buffer[:header_end].decode("ascii", errors="replace")
-                    length = None
-                    for line in header.split("\r\n"):
-                        if line.lower().startswith("content-length:"):
-                            length = int(line.split(":", 1)[1].strip())
-                            break
-                    if length is None:
-                        raise MCPStdioError(f"Missing Content-Length header: {header}")
-                    frame_start = header_end + 4
-                    frame_end = frame_start + length
-                    if len(buffer) < frame_end:
-                        break
-                    body = buffer[frame_start:frame_end]
-                    buffer = buffer[frame_end:]
-                    messages.put(json.loads(body.decode("utf-8")))
+            for line in stream:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    messages.put(json.loads(line.decode("utf-8")))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    # サーバーがstdoutにログ等を混ぜても壊れないよう非JSON行は無視
+                    continue
+            messages.put(None)
         except Exception as exc:
             messages.put(exc)
 
