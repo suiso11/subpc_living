@@ -17,17 +17,24 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.audio.stt import WhisperSTT
-from src.audio.tts import KokoroTTS
+from src.audio.tts_factory import backend_name, create_tts_backend
 from src.audio.vad import EnergyVAD, create_vad
 from src.audio.audio_io import AudioRecorder, AudioPlayer
 from src.audio.wakeword import WakeWordDetector
 from src.chat.client import OllamaClient
 from src.chat.session import ChatSession
 from src.chat.config import ChatConfig
+from src.chat.emotion import (
+    EmotionTagStreamFilter,
+    emotion_to_sbv2_style,
+    parse_emotion_tag,
+)
 from src.chat.web_search import WebSearchContext, create_web_search_context
 from src.memory.vectorstore import VectorStore
 from src.memory.rag import RAGRetriever
 from src.vision.context import VisionContext
+from src.screen.context import ScreenContext
+from src.screen import create_screen_context
 from src.monitor.context import MonitorContext
 from src.persona.profile import UserProfile
 from src.persona.summarizer import ConversationSummarizer
@@ -57,6 +64,7 @@ class VoicePipeline:
         enable_rag: bool = True,
         enable_vision: bool = True,
         camera_id: int = 0,
+        enable_screen: bool = False,
         enable_monitor: bool = True,
         enable_persona: bool = True,
         enable_wakeword: bool = False,
@@ -72,8 +80,8 @@ class VoicePipeline:
             language="ja",
         )
 
-        # TTS (kokoro-onnx)
-        self.tts = KokoroTTS(
+        # TTS
+        self.tts = create_tts_backend(
             models_dir=PROJECT_ROOT / tts_models_dir,
             voice=tts_voice,
         )
@@ -121,6 +129,21 @@ class VoicePipeline:
                 print(f"⚠️  Vision初期化スキップ: {e}")
                 self.vision_context = None
 
+        # Screen (画面認識: スクリーンショット → VLM描写)
+        self.enable_screen = enable_screen
+        self.screen_context: Optional[ScreenContext] = None
+        if enable_screen:
+            try:
+                # SCREEN_CONTEXT_MODE (local|remote) でローカル/リモートを切替
+                self.screen_context = create_screen_context(
+                    analysis_interval=90.0,
+                    base_url=self.config.ollama_base_url,
+                    model=self.config.model,
+                )
+            except Exception as e:
+                print(f"⚠️  Screen初期化スキップ: {e}")
+                self.screen_context = None
+
         # Monitor (Phase 6: PCログ収集)
         self.enable_monitor = enable_monitor
         self.monitor_context: Optional[MonitorContext] = None
@@ -163,6 +186,29 @@ class VoicePipeline:
                 self.preloader = None
                 self.proactive = None
 
+        # Tasks (読み取り専用): 未完了タスクをLLMコンテキストに注入する
+        self.task_store = None
+        try:
+            from src.tasks.store import TaskStore
+            self.task_store = TaskStore(
+                db_path=str(PROJECT_ROOT / "data" / "tasks" / "tasks.db"),
+            ).initialize()
+        except Exception as e:
+            print(f"⚠️  Tasks初期化スキップ: {e}")
+            self.task_store = None
+
+        # Calendar (読み取り専用): Google Calendar の予定を upcoming.json から注入。
+        # ワーカーは起動しない (Discord 側だけが取得・書き込みを行う)。
+        self.calendar_context = None
+        try:
+            from src.tasks.calendar_sync import CalendarContext
+            self.calendar_context = CalendarContext(
+                upcoming_path=str(PROJECT_ROOT / "data" / "calendar" / "upcoming.json"),
+            )
+        except Exception as e:
+            print(f"⚠️  Calendar context 初期化スキップ: {e}")
+            self.calendar_context = None
+
         # セッション
         self.session = ChatSession(
             system_prompt=self.config.system_prompt,
@@ -170,9 +216,13 @@ class VoicePipeline:
             history_dir=str(PROJECT_ROOT / self.config.history_dir),
             rag=self.rag,
             vision_context=self.vision_context,
+            screen_context=self.screen_context,
             monitor_context=self.monitor_context,
             preloader=self.preloader,
             web_search=self.web_search,
+            task_store=self.task_store,
+            calendar_context=self.calendar_context,
+            emotion_tags=self.config.emotion_tag_enabled,
         )
 
         # ストリーミングTTS設定
@@ -242,7 +292,7 @@ class VoicePipeline:
         print(f"\n[3/{total_steps}] TTS 確認...")
         try:
             self.tts.load()
-            print("✅ TTS OK")
+            print(f"✅ TTS OK ({backend_name(self.tts)})")
         except Exception as e:
             print(f"❌ TTS ロード失敗: {e}")
             return False
@@ -295,6 +345,24 @@ class VoicePipeline:
                 self.vision_context = None
         else:
             print(f"\n[6/{total_steps}] Vision (映像入力) スキップ")
+
+        # Screen (画面認識: スクリーンショット → VLM描写)
+        if self.enable_screen and self.screen_context is not None:
+            print("\n[6+] Screen (画面認識) 初期化...")
+            try:
+                if self.screen_context.start():
+                    status = self.screen_context.get_status()
+                    print(f"✅ Screen OK (VLM: {status['model']}, 解析間隔: {status['analysis_interval']:.0f}秒)")
+                else:
+                    print("⚠️  画面をキャプチャできません (DISPLAY未設定? Screenなしで続行)")
+                    self.session.screen_context = None
+                    self.screen_context = None
+            except Exception as e:
+                print(f"⚠️  Screen 初期化失敗 (Screenなしで続行): {e}")
+                self.session.screen_context = None
+                self.screen_context = None
+        elif self.enable_screen:
+            print("\n[6+] Screen (画面認識) スキップ")
 
         # Monitor (Phase 6)
         if self.enable_monitor and self.monitor_context is not None:
@@ -486,6 +554,16 @@ class VoicePipeline:
         abort_response = False
         fallback_text = "出力が乱れたので止めます。"
 
+        # 感情タグフィルタ (有効時のみ)。冒頭タグを除去しつつ感情を確定する。
+        emo_filter = (
+            EmotionTagStreamFilter() if self.config.emotion_tag_enabled else None
+        )
+
+        def current_style() -> str | None:
+            if emo_filter is None:
+                return None
+            return emotion_to_sbv2_style(emo_filter.emotion)
+
         # TTS再生ワーカースレッド
         tts_thread = threading.Thread(target=self._tts_worker, daemon=True)
         tts_thread.start()
@@ -501,9 +579,12 @@ class VoicePipeline:
                 repeat_penalty=self.config.repeat_penalty,
                 num_predict=self.config.num_predict,
             ):
-                response_text += token
-                sentence_buffer += token
-                print(token, end="", flush=True)
+                piece = emo_filter.feed(token) if emo_filter is not None else token
+                if not piece:
+                    continue
+                response_text += piece
+                sentence_buffer += piece
+                print(piece, end="", flush=True)
 
                 # 文の区切りをチェック
                 sentences = self._split_sentences(sentence_buffer)
@@ -516,10 +597,10 @@ class VoicePipeline:
                                 response_text = fallback_text
                                 sentence_buffer = ""
                                 print(f"\n{fallback_text}", end="", flush=True)
-                                self._tts_queue.put(fallback_text)
+                                self._tts_queue.put((fallback_text, current_style()))
                                 abort_response = True
                                 break
-                            self._tts_queue.put(sent)
+                            self._tts_queue.put((sent, current_style()))
                             played_sentences.append(sent)
                     if abort_response:
                         break
@@ -527,7 +608,7 @@ class VoicePipeline:
 
             # 残りのバッファも送信
             if not abort_response and sentence_buffer.strip():
-                self._tts_queue.put(sentence_buffer.strip())
+                self._tts_queue.put((sentence_buffer.strip(), current_style()))
                 played_sentences.append(sentence_buffer.strip())
 
             print()  # 改行
@@ -560,13 +641,14 @@ class VoicePipeline:
     def _tts_worker(self) -> None:
         """TTS合成・再生のワーカースレッド"""
         while True:
-            text = self._tts_queue.get()
-            if text is None:
+            item = self._tts_queue.get()
+            if item is None:
                 break
+            text, style = item
 
             self._state = self.STATE_SPEAKING
             try:
-                wav_data = self.tts.synthesize(text)
+                wav_data = self.tts.synthesize(text, style=style)
                 self.player.play_wav(wav_data, blocking=True)
             except Exception as e:
                 print(f"\n⚠️  TTS再生エラー: {e}")
@@ -590,11 +672,21 @@ class VoicePipeline:
         if not response_text:
             return ""
 
+        # 感情タグを分離 (有効時のみ)。履歴・返り値には clean text を使う。
+        if self.config.emotion_tag_enabled:
+            emotion, response_text = parse_emotion_tag(response_text)
+            style = emotion_to_sbv2_style(emotion)
+        else:
+            style = None
+
+        if not response_text:
+            return ""
+
         # --- TTS & 再生 ---
         self._state = self.STATE_SPEAKING
         print("\n🔊 読み上げ中...")
         try:
-            wav_data = self.tts.synthesize(response_text)
+            wav_data = self.tts.synthesize(response_text, style=style)
             self.player.play_wav(wav_data, blocking=True)
         except Exception as e:
             print(f"⚠️  TTS/再生エラー: {e}")
@@ -736,4 +828,8 @@ class VoicePipeline:
             self.monitor_context.stop()
         if self.vision_context is not None:
             self.vision_context.stop()
+        if self.screen_context is not None:
+            self.screen_context.stop()
+        if self.task_store is not None:
+            self.task_store.close()
         self.llm.close()

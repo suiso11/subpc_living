@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import io
+import os
 import unittest
 import wave
+from unittest.mock import patch
 
 import numpy as np
 
@@ -47,10 +49,21 @@ class WavToDiscordPCMTest(unittest.TestCase):
         self.assertEqual(wav_to_discord_pcm(wav), b"")
 
     def test_config_defaults(self) -> None:
-        config = VoiceTTSConfig.from_env()
+        with patch.dict(os.environ, {}, clear=True):
+            config = VoiceTTSConfig.from_env()
         self.assertEqual(config.voice, "jf_alpha")
         self.assertTrue(config.autoread)
         self.assertEqual(config.max_chars, 500)
+
+    def test_config_uses_style_bert_default_voice_for_style_backend(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"DISCORD_VOICE_TTS_BACKEND": "style_bert_vits2"},
+            clear=True,
+        ):
+            config = VoiceTTSConfig.from_env()
+
+        self.assertEqual(config.voice, "jvnv-F1-jp")
 
 
 if __name__ == "__main__":

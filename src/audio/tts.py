@@ -1,10 +1,11 @@
 """
 音声合成 (TTS) モジュール
 Phase 3: kokoro-onnx を使用したテキスト→音声変換
-CPU実行、日本語対応（Kokoro 82Mモデル）
+ONNX Runtime 実行、日本語対応（Kokoro 82Mモデル）
 """
 import wave
 import io
+import os
 import re
 import time
 import numpy as np
@@ -14,7 +15,8 @@ from typing import Optional
 # kokoro-onnx の音素上限 (510) を超えないよう、テキストを文単位で分割する。
 # 日本語1文字 ≒ 3〜8音素に展開されるため、安全マージンを取って50文字以下に。
 _MAX_CHUNK_CHARS = 50
-_SENTENCE_SPLIT = re.compile(r'(?<=[。！？、\n.!?,])')
+_CHUNK_PAUSE_SEC = 0.18
+_SENTENCE_SPLIT = re.compile(r'(?<=[。！？\n.!?])')
 
 # 絵文字・特殊文字のパターン
 _EMOJI_PATTERN = re.compile(
@@ -57,8 +59,7 @@ def _split_text(text: str, max_chars: int = _MAX_CHUNK_CHARS) -> list[str]:
     if not text:
         return []
 
-    sentences = _SENTENCE_SPLIT.split(text)
-    sentences = [s.strip() for s in sentences if s.strip()]
+    sentences = _split_sentences_for_tts(text)
 
     if not sentences:
         return [text] if text.strip() else []
@@ -86,6 +87,17 @@ def _split_text(text: str, max_chars: int = _MAX_CHUNK_CHARS) -> list[str]:
             result.append(chunk)
 
     return result
+
+
+def _split_sentences_for_tts(text: str) -> list[str]:
+    """TTS向けに文末で分割する。読点では抑揚を切らない。"""
+    sentences = _SENTENCE_SPLIT.split(text)
+    return [s.strip() for s in sentences if s.strip()]
+
+
+def _pause_samples(sample_rate: int, duration_sec: float = _CHUNK_PAUSE_SEC) -> np.ndarray:
+    """チャンク間に入れる短い無音を生成する。"""
+    return np.zeros(int(sample_rate * duration_sec), dtype=np.float32)
 
 
 class KokoroTTS:
@@ -157,12 +169,53 @@ class KokoroTTS:
 
         print("[TTS] kokoro-onnx モデルをロード中...")
         start = time.time()
-        self._kokoro = Kokoro(str(self._model_path), str(self._voices_path))
+        providers = self._resolve_onnx_providers()
+        if providers is None:
+            self._kokoro = Kokoro(str(self._model_path), str(self._voices_path))
+        else:
+            import onnxruntime as ort
+            if any(
+                (p[0] if isinstance(p, tuple) else p) == "CUDAExecutionProvider"
+                for p in providers
+            ) and hasattr(ort, "preload_dlls"):
+                try:
+                    ort.preload_dlls(directory="")
+                except Exception as e:
+                    print(f"[TTS] CUDAライブラリのプリロードに失敗: {e}")
+            session = ort.InferenceSession(str(self._model_path), providers=providers)
+            self._kokoro = Kokoro.from_session(session, str(self._voices_path))
         elapsed = time.time() - start
-        print(f"[TTS] モデルロード完了 ({elapsed:.1f}秒)")
+        provider_text = ", ".join(self._kokoro.sess.get_providers())
+        print(f"[TTS] モデルロード完了 ({elapsed:.1f}秒, providers={provider_text})")
 
         if self.lang == "ja":
             self._load_ja_g2p()
+
+    @staticmethod
+    def _resolve_onnx_providers() -> list | None:
+        """Return explicit ONNX providers for TTS, or None for kokoro defaults."""
+        provider = (
+            os.environ.get("TTS_ONNX_PROVIDER", "").strip()
+            or os.environ.get("ONNX_PROVIDER", "").strip()
+        )
+        if not provider:
+            return None
+
+        if provider != "CUDAExecutionProvider":
+            return [provider]
+
+        raw_device_id = os.environ.get("TTS_ONNX_DEVICE_ID", "").strip()
+        try:
+            device_id = int(raw_device_id) if raw_device_id else 0
+        except ValueError:
+            device_id = 0
+        return [
+            (
+                "CUDAExecutionProvider",
+                {"device_id": device_id},
+            ),
+            "CPUExecutionProvider",
+        ]
 
     def _load_ja_g2p(self) -> None:
         """日本語G2P (misaki) をロード。
@@ -198,7 +251,12 @@ class KokoroTTS:
             lang=self.lang,
         )
 
-    def synthesize(self, text: str) -> bytes:
+    def synthesize(
+        self,
+        text: str,
+        style: str | None = None,
+        style_weight: float | None = None,
+    ) -> bytes:
         """
         テキストを音声に変換し、WAVバイトデータを返す。
 
@@ -207,6 +265,8 @@ class KokoroTTS:
 
         Args:
             text: 合成するテキスト
+            style: 感情スタイル (kokoro は非対応のため無視。呼び出し側の分岐削減用)
+            style_weight: スタイル強度 (kokoro は非対応のため無視)
 
         Returns:
             WAV形式のバイトデータ
@@ -223,10 +283,12 @@ class KokoroTTS:
         all_samples = []
         sr = self.sample_rate
 
-        for chunk in chunks:
+        for index, chunk in enumerate(chunks):
             try:
                 samples, sr = self._create_chunk(chunk)
                 all_samples.append(samples)
+                if index < len(chunks) - 1:
+                    all_samples.append(_pause_samples(sr))
             except (IndexError, Exception) as e:
                 # 音素変換エラー時はスキップして続行
                 print(f"[TTS] チャンク合成スキップ: {e} ({chunk[:20]}...)")

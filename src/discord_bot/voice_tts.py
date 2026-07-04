@@ -1,6 +1,6 @@
 """Discord voice-channel TTS playback.
 
-Synthesizes text with KokoroTTS and plays it into the voice channel the bot is
+Synthesizes text with the configured TTS backend and plays it into the voice channel the bot is
 connected to (via DiscordVoiceSTT's voice_client). Playback is serialized so
 overlapping /voice say calls and auto-read replies queue instead of clashing.
 
@@ -18,6 +18,8 @@ from typing import Any, Callable
 
 import discord
 import numpy as np
+
+from src.chat.emotion import emotion_to_sbv2_style
 
 DISCORD_SAMPLE_RATE = 48000
 DISCORD_CHANNELS = 2
@@ -61,11 +63,21 @@ class VoiceTTSConfig:
     @classmethod
     def from_env(cls) -> "VoiceTTSConfig":
         return cls(
-            voice=os.environ.get("DISCORD_VOICE_TTS_VOICE", "jf_alpha").strip() or "jf_alpha",
+            voice=os.environ.get("DISCORD_VOICE_TTS_VOICE", "").strip() or _default_voice_from_backend(),
             speed=_parse_float(os.environ.get("DISCORD_VOICE_TTS_SPEED"), 1.0),
             autoread=_parse_bool(os.environ.get("DISCORD_VOICE_TTS_AUTOREAD"), True),
             max_chars=_parse_int(os.environ.get("DISCORD_VOICE_TTS_MAX_CHARS"), 500),
         )
+
+
+def _default_voice_from_backend() -> str:
+    backend = (
+        os.environ.get("DISCORD_VOICE_TTS_BACKEND", "").strip()
+        or os.environ.get("TTS_BACKEND", "").strip()
+    ).lower().replace("-", "_")
+    if backend in {"stylebertvits2", "style_bert", "style_bert_vits2", "sbv2"}:
+        return "jvnv-F1-jp"
+    return "jf_alpha"
 
 
 def wav_to_discord_pcm(wav_data: bytes) -> bytes:
@@ -108,7 +120,7 @@ class VoiceTTSPlayer:
         self,
         *,
         config: VoiceTTSConfig,
-        synthesize: Callable[[str, str, float], bytes],
+        synthesize: Callable[..., bytes],
         get_voice_client: Callable[[], Any | None],
     ):
         self.config = config
@@ -134,8 +146,13 @@ class VoiceTTSPlayer:
         *,
         voice: str | None = None,
         speed: float | None = None,
+        emotion: str | None = None,
     ) -> float:
-        """Speak text in the connected voice channel. Returns audio seconds."""
+        """Speak text in the connected voice channel. Returns audio seconds.
+
+        emotion が与えられれば SBV2 スタイル名へマップして貫通させる
+        (kokoro など他バックエンドでは無視される)。
+        """
         text = (text or "").strip()
         if not text:
             raise VoiceTTSError("読み上げるテキストが空です。")
@@ -144,11 +161,13 @@ class VoiceTTSPlayer:
 
         self._connected_voice_client()
 
+        style = emotion_to_sbv2_style(emotion) if emotion else None
         wav_data = await asyncio.to_thread(
             self._synthesize,
             text,
             voice or self.config.voice,
             speed if speed is not None else self.config.speed,
+            style,
         )
         pcm = await asyncio.to_thread(wav_to_discord_pcm, wav_data)
         if not pcm:
@@ -187,7 +206,7 @@ class VoiceTTSPlayer:
         self.played_count += 1
         return duration
 
-    async def autoread(self, text: str) -> None:
+    async def autoread(self, text: str, emotion: str | None = None) -> None:
         """Best-effort auto readout for LLM replies; never raises."""
         if not self.autoread_enabled:
             return
@@ -195,7 +214,7 @@ class VoiceTTSPlayer:
         if voice_client is None or not voice_client.is_connected():
             return
         try:
-            await self.say(text)
+            await self.say(text, emotion=emotion)
         except Exception as exc:
             self.last_error = str(exc)
             print(f"[DiscordVoiceTTS] autoread failed: {exc}")
