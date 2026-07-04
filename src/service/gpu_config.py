@@ -1,11 +1,12 @@
 """
 GPU 検出・デバイス自動設定モジュール
 Phase 9: GPU換装に伴い、VRAM容量に応じて最適なデバイス設定を自動決定する。
-Phase 10: デュアルGPU対応 (P40 + RTX 2070 Super)
+Phase 10: デュアルGPU対応
 
 構成:
 - P40 (24GB, Compute 6.1): LLM専用 (Ollama)
-- RTX 2070 Super (8GB, Compute 7.5, Tensor Cores): 推論用 (STT/Embedding/Vision)
+- RTX 2070 Super 等の Tensor Core GPU: 推論用 (STT/Embedding/Vision)
+- P5000 等の Pascal GPU: 推論用にできるが float16 は避ける
 - 単GPU: 従来のプロファイルで動作
 - GPUなし: 全てCPU
 """
@@ -150,6 +151,32 @@ def _classify_gpu(gpu: GpuInfo) -> str:
     return "basic"
 
 
+def _compute_capability_tuple(gpu: GpuInfo) -> tuple[int, int]:
+    try:
+        major, minor = gpu.compute_capability.split(".", 1)
+        return int(major), int(minor)
+    except (AttributeError, ValueError, TypeError):
+        return (0, 0)
+
+
+def _has_fast_fp16(gpu: GpuInfo) -> bool:
+    """Tensor Core 世代なら STT の float16 を優先する。"""
+    major, _minor = _compute_capability_tuple(gpu)
+    return major >= 7
+
+
+def _configure_stt_for_gpu(config: DeviceConfig, gpu: GpuInfo) -> None:
+    """STT設定をGPU世代に合わせる。
+
+    Pascal (sm_61) は CTranslate2 CUDA で float16 非対応になりやすく、
+    対応していても低速なので int8 を使う。
+    """
+    config.stt_device = "cuda"
+    config.stt_device_index = gpu.index
+    config.stt_model_size = "medium"
+    config.stt_compute_type = "float16" if _has_fast_fp16(gpu) else "int8"
+
+
 def get_device_config(gpu: Optional[GpuInfo] = None) -> DeviceConfig:
     """GPU情報に基づいて最適なデバイス設定を返す
 
@@ -193,11 +220,8 @@ def get_device_config(gpu: Optional[GpuInfo] = None) -> DeviceConfig:
 
             inf_gpu = gpus[inf_idx]
 
-            # STT: 推論GPU + float16 (Tensor Core活用) + mediumモデル
-            config.stt_device = "cuda"
-            config.stt_device_index = inf_gpu.index
-            config.stt_compute_type = "float16"
-            config.stt_model_size = "medium"
+            # STT: Tensor Core GPU は float16、Pascal GPU は int8
+            _configure_stt_for_gpu(config, inf_gpu)
 
             # Embedding: 推論GPU (PyTorch非対応ならCPU)
             config.embedding_device = f"cuda:{inf_gpu.index}" if inf_gpu.torch_compatible else "cpu"
@@ -228,10 +252,7 @@ def get_device_config(gpu: Optional[GpuInfo] = None) -> DeviceConfig:
         config.llm_gpu_index = llm_gpu.index
         config.inference_gpu_index = inf_gpu.index
 
-        config.stt_device = "cuda"
-        config.stt_device_index = inf_gpu.index
-        config.stt_compute_type = "float16"
-        config.stt_model_size = "medium"
+        _configure_stt_for_gpu(config, inf_gpu)
 
         config.embedding_device = f"cuda:{inf_gpu.index}" if inf_gpu.torch_compatible else "cpu"
 
@@ -254,10 +275,7 @@ def get_device_config(gpu: Optional[GpuInfo] = None) -> DeviceConfig:
         # === P40クラス (24GB) ===
         config.profile = "p40"
 
-        config.stt_device = "cuda"
-        config.stt_device_index = gpu.index
-        config.stt_compute_type = "float16"
-        config.stt_model_size = "medium"
+        _configure_stt_for_gpu(config, gpu)
 
         config.embedding_device = f"cuda:{gpu.index}" if gpu.torch_compatible else "cpu"
 

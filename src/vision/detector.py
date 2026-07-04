@@ -3,7 +3,7 @@
 - 顔検出: OpenCV Haar Cascade (軽量、CPU向け)
 - 感情推定: emotion-ferplus ONNX モデル (onnxruntime)
 - Phase 9: onnxruntime-gpu 利用時は CUDAExecutionProvider を自動選択
-- Phase 10: デュアルGPU対応 — device_id で推論GPU (2070S) を指定
+- Phase 10: デュアルGPU対応 — device_id で推論GPUを指定
 """
 import numpy as np
 from pathlib import Path

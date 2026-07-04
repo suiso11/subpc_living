@@ -3,7 +3,7 @@
 Phase 4: テキストをベクトルに変換する
 multilingual-e5-small を使用（日本語対応、ローカル実行）
 Phase 9: device="auto" でGPU自動検出
-Phase 10: デュアルGPU対応 — cuda:N で推論GPU (2070S) を指定
+Phase 10: デュアルGPU対応 — cuda:N で推論GPUを指定
 """
 import time
 import numpy as np

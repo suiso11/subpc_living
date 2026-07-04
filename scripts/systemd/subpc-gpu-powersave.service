@@ -11,12 +11,12 @@ ExecStart=/usr/bin/nvidia-smi --persistence-mode=1
 
 # GPU 0 (P40): LLM専用 — アイドル時125W (最小値)
 ExecStart=/usr/bin/nvidia-smi --id=0 --power-limit=125
-# GPU 1 (RTX 2070 Super): 推論用 — アイドル時125W (最小値)
-ExecStart=/usr/bin/nvidia-smi --id=1 --power-limit=125
+# GPU 1 (Quadro P5000): 推論用 — アイドル時100W (実機下限は90W)
+ExecStart=/usr/bin/nvidia-smi --id=1 --power-limit=100
 
 # 停止時にデフォルトに戻す
 ExecStop=/usr/bin/nvidia-smi --id=0 --power-limit=250
-ExecStop=/usr/bin/nvidia-smi --id=1 --power-limit=215
+ExecStop=/usr/bin/nvidia-smi --id=1 --power-limit=180
 
 [Install]
 WantedBy=multi-user.target

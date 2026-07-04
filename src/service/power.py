@@ -3,7 +3,7 @@ GPU 省電力制御モジュール
 nvidia-smi を使って GPU の電力制限を動的に変更する。
 常時稼働時のアイドル消費電力を抑え、推論時にフルパワーへ復帰させる。
 Phase 9: GPU名を検出して適切なデフォルト値を自動設定。
-Phase 10: マルチGPU対応 (P40 + RTX 2070 Super)
+Phase 10: マルチGPU対応
 """
 import json
 import os
@@ -22,6 +22,8 @@ GPU_POWER_PRESETS: dict[str, tuple[int, int]] = {
     "GTX 1060":        (80, 120),    # TDP 120W
     "GTX 1070":        (80, 150),    # TDP 150W
     "GTX 1080":        (80, 180),    # TDP 180W
+    "P5000":           (100, 180),   # Quadro P5000, min 90W
+    "QUADRO P5000":    (100, 180),   # Quadro P5000, min 90W
     "RTX 2070":        (125, 215),   # TDP 215W, min 125W
     "RTX 2070 SUPER":  (125, 215),   # TDP 215W, min 125W
     "RTX 2080":        (125, 215),   # TDP 215W
