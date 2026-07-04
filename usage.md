@@ -218,6 +218,43 @@ python src/audio/main.py --text-mode
 | `jf_nezumi` | 日本語 女性 (Nezumi) |
 | `jf_tebukuro` | 日本語 女性 (Tebukuro) |
 | `jm_kumo` | 日本語 男性 (Kumo) |
+| `jvnv-F1-jp` | Style-Bert-VITS2 JVNV F1 JP (7スタイル) |
+| `tsukuyomi-chan` | Style-Bert-VITS2 つくよみちゃん (Neutralのみ) |
+
+Kokoro以外に Style-Bert-VITS2 を使う場合は、専用venvとTTSサーバーを用意する。
+
+```bash
+# JVNV F1 JP (デフォルト)
+bash scripts/setup_style_bert_vits2.sh
+
+# つくよみちゃんコーパスモデル
+SBV2_REPO=ayousanz/tsukuyomi-chan-style-bert-vits2-model \
+SBV2_MODEL_NAME=tsukuyomi-chan \
+SBV2_MODEL_FILE=tsukuyomi-chan_e200_s5200.safetensors \
+SBV2_FILES=tsukuyomi-chan_e200_s5200.safetensors,config.json,style_vectors.npy \
+bash scripts/setup_style_bert_vits2.sh
+```
+
+モデルを切り替えたら systemd ユニットの env も合わせる。
+
+```bash
+# jvnv の場合
+# Environment=SBV2_MODEL_NAME=jvnv-F1-jp
+# Environment=SBV2_MODEL_FILE=jvnv-F1-jp_e160_s14000.safetensors
+
+# つくよみちゃんの場合
+# Environment=SBV2_MODEL_NAME=tsukuyomi-chan
+# Environment=SBV2_MODEL_FILE=tsukuyomi-chan_e200_s5200.safetensors
+
+install -m 0644 scripts/systemd/subpc-sbv2-tts.service ~/.config/systemd/user/subpc-sbv2-tts.service
+systemctl --user daemon-reload
+bash scripts/service_ctl.sh restart sbv2
+curl http://127.0.0.1:50121/health
+```
+
+> つくよみちゃんモデルはスタイルが Neutral のみ（感情切り替え不可）。
+> 7スタイル（Angry/Sad/Happy等）を使いたい場合は `jvnv-F1-jp` を指定する。
+> つくよみちゃんコーパスのライセンスは https://tyc.rei-yumesaki.net/material/corpus/#terms3 に準じる。
 
 ### 使用例
 
@@ -674,7 +711,7 @@ Discord 側の slash command:
 | コマンド | 説明 |
 |---------|------|
 | `/ask` | LLM に質問し、チャンネル単位の会話履歴で応答 |
-| `/tts` | テキストを kokoro-onnx で WAV 化して添付 |
+| `/tts` | テキストを設定済みTTSバックエンドで WAV 化して添付 |
 | `/status` | Ollama・モデル・ヘルスチェック状態を表示 |
 | `/service` | `status` / `logs` / `health` / `gpu` / 許可時のみ `start` `stop` `restart` |
 | `/reset` | そのチャンネルの会話履歴をリセット |
@@ -719,6 +756,23 @@ DISCORD_VOICE_STT_SAVE_TRANSCRIPTS=true
 `DISCORD_VOICE_STT_ENABLED=true` のときだけ `/voice start` で開始する。
 Discord側は通常のBot権限に加えて、対象VCへの接続権限と発言権限、
 文字起こし投稿先への送信権限が必要。
+
+### Discord 通話TTS
+
+通話TTSは Kokoro と Style-Bert-VITS2 を切り替えられる。
+Style-Bert-VITS2 は別プロセスの `subpc-sbv2-tts` が `127.0.0.1:50121` で受ける。
+
+```env
+DISCORD_VOICE_TTS_BACKEND=style_bert_vits2
+DISCORD_VOICE_TTS_VOICE=tsukuyomi-chan
+DISCORD_VOICE_TTS_SPEED=0.95
+```
+
+`DISCORD_VOICE_TTS_VOICE` は `jvnv-F1-jp` か `tsukuyomi-chan` を指定する。
+SBV2サーバ側の `SBV2_MODEL_NAME` / `SBV2_MODEL_FILE` env と一致している必要がある。
+
+Kokoroへ戻す場合は `DISCORD_VOICE_TTS_BACKEND=kokoro` とし、
+`DISCORD_VOICE_TTS_VOICE=jf_alpha` など Kokoro の voice 名を指定する。
 
 ### Discord 返答ログの学習データ化
 
@@ -864,12 +918,12 @@ bash scripts/service_ctl.sh disable web
 | コマンド | 説明 |
 |---------|------|
 | `status` | 全サービスの状態を表示 |
-| `start [web│voice│discord│powerd│all]` | サービスを開始 |
-| `stop [web│voice│discord│powerd│all]` | サービスを停止 |
-| `restart [web│voice│discord│powerd│all]` | サービスを再起動 |
-| `enable [web│voice│discord│powerd│all]` | 自動起動を有効化 |
-| `disable [web│voice│discord│powerd│all]` | 自動起動を無効化 |
-| `logs [web│voice│discord│powerd] [-f]` | ログを表示 |
+| `start [web│voice│sbv2│discord│powerd│all]` | サービスを開始 |
+| `stop [web│voice│sbv2│discord│powerd│all]` | サービスを停止 |
+| `restart [web│voice│sbv2│discord│powerd│all]` | サービスを再起動 |
+| `enable [web│voice│sbv2│discord│powerd│all]` | 自動起動を有効化 |
+| `disable [web│voice│sbv2│discord│powerd│all]` | 自動起動を無効化 |
+| `logs [web│voice│sbv2│discord│powerd] [-f]` | ログを表示 |
 | `health` | ヘルスチェック実行 |
 | `gpu` | GPU 情報表示 |
 
@@ -952,9 +1006,22 @@ Phase 9 では GPU を自動検出し、各モジュールの設定を最適化�
 python3 -c "from src.service.gpu_config import main; main()"
 ```
 
+Ollama は P40 のみを見せ、P5000 はPython推論用に空ける:
+
+```bash
+sudo install -D -m 0644 \
+  scripts/systemd/ollama-gpu-p40.override.conf \
+  /etc/systemd/system/ollama.service.d/10-gpu-p40.conf
+sudo systemctl daemon-reload
+sudo systemctl restart ollama.service
+ollama ps
+```
+
 | GPU | Profile | STT | Embedding | Vision ONNX | LLM推奨 |
 |-----|---------|-----|-----------|-------------|----------|
-| P40 (24GB) | `p40` | cuda / float16 / medium | cuda | CUDAExecutionProvider | 14B Q4 |
+| P40 (24GB) | `p40` | cuda / int8 / medium | cpu | CUDAExecutionProvider | 14B Q4 |
+| P40 + P5000 | `dual_gpu` | cuda:1 / int8 / medium | cpu | CUDAExecutionProvider(device_id=1) | 27B Q4 |
+| P40 + RTX 2070S以上 | `dual_gpu` | cuda:1 / float16 / medium | cuda:1 | CUDAExecutionProvider(device_id=1) | 27B Q4 |
 | GTX 1060 (6GB) | `gtx1060` | cpu / int8 / small | cpu | CPUExecutionProvider | 7B Q4 |
 | GPUなし | `cpu` | cpu / int8 / small | cpu | CPUExecutionProvider | 7B Q4 |
 
@@ -981,7 +1048,7 @@ ollama pull qwen2.5:14b-instruct-q4_K_M
 1. P40 を物理的に取り付け
 2. 電源 750W 換装済み ✅
 3. BIOS で iGPU を映像出力に設定 (P40 は映像出力なし)
-4. RTX 2070 Super を追加搭載 (推論専用、GPU 1)
+4. Quadro P5000 または RTX 2070 Super 以上を追加搭載 (推論専用、GPU 1)
 5. Ubuntu 起動後 `nvidia-smi` で両GPU認識確認
 6. `config/chat_config.json` の model を 14b に変更
 
@@ -1028,6 +1095,154 @@ python src/audio/main.py
 ```
 
 `--wakeword` を指定しない場合は従来通りの即時VADリスニングモード。
+
+---
+
+## 11. エネ化 — 自発発話・画面認識・感情TTS (Phase 11)
+
+AIを「PCに住み着いた相棒」に近づける3機能。いずれもデフォルト無効 (感情タグのみ `chat_config.json` で有効化済み)。
+
+### 11.1 Discord 自発発話 (Proactive → Discord)
+
+音声パイプライン専用だった `ProactiveEngine` (予定リマインド / 休憩提案 / 挨拶 / PC異常) を Discord に配線。トリガー発火時、定型文をLLMでペルソナ口調に言い換えてテキストチャンネルへ投稿し、通話接続中なら autoread でも読み上げる。
+
+```bash
+# config/discord.env
+DISCORD_PROACTIVE_ENABLED=true
+DISCORD_PROACTIVE_CHANNEL_ID=<投稿先チャンネルID>
+DISCORD_PROACTIVE_LLM_REWRITE=true   # ペルソナ口調への言い換え (失敗時は定型文)
+DISCORD_PROACTIVE_CHECK_INTERVAL=60  # チェック間隔 (秒)
+```
+
+実装: `src/discord_bot/proactive_bridge.py`。許可ユーザーの発言で休憩タイマーがリセットされる。
+
+### 11.2 画面認識 (Screen Context)
+
+スクリーンをキャプチャし、vision対応チャットモデル (gemma4:26b) で「ユーザーが何をしているか」を1〜2文で描写してシステムプロンプトに注入する。X11 前提 (DISPLAY 必須)。解析間隔90秒、描写が10分より古い場合は注入しない。
+
+```bash
+# 音声パイプライン
+python src/audio/main.py --screen
+
+# Web UI (env)
+WEB_SCREEN_CONTEXT_ENABLED=true      # /api/screen/status で状態確認
+
+# Discord bot (config/discord.env)
+DISCORD_SCREEN_CONTEXT_ENABLED=true
+```
+
+実装: `src/screen/` (capture=mss+Pillow / describer=Ollama VLM / context=バックグラウンドスレッド)。systemd サービスには `Environment=DISPLAY=:0` を追加済み。X接続に失敗した場合は画面情報なしで続行する (クラッシュしない)。
+
+#### remoteモード (メインPCの画面を見る)
+
+普段使うPCがサブPCと別の場合は remote モードを使う。メインPC側の軽量エージェントがスクショをpushし、サブPCのWebサーバーがVLMで1回だけ描写して `data/screen/latest.json` に保存。Discord/Web/音声の全プロセスはそのファイルを読むだけ (VLM呼び出しの重複なし)。メインPCからの push が10分途絶えると自動的にコンテキスト注入が止まる。
+
+```
+[メインPC] scripts/screen_agent.py ──POST /api/screen/ingest──▶ [サブPC web]
+   (mss+Pillow+httpx のみ、90秒毎、             │ トークン認証 → latest.jpg 保存
+    画面が変わらなければ送信スキップ)           │ → VLM描写 → latest.json
+                                                ▼
+        Discord bot / Web / 音声パイプライン: RemoteScreenContext が latest.json を読取
+```
+
+サブPC側 (`config/web.env` — subpc-web.service が読む):
+```bash
+WEB_SCREEN_CONTEXT_ENABLED=true
+SCREEN_CONTEXT_MODE=remote
+SCREEN_INGEST_TOKEN=<openssl rand -hex 24 などで生成>
+```
+Discord側 (`config/discord.env`): `DISCORD_SCREEN_CONTEXT_ENABLED=true` + `SCREEN_CONTEXT_MODE=remote`
+
+メインPC (Windows) 側:
+```powershell
+pip install mss pillow httpx
+# スクリプト入手 (サブPCのWeb UIが配信): http://<サブPC>:8000/static/screen_agent.py
+python screen_agent.py --url http://<サブPC>:8000 --token <同じトークン> --once   # 動作確認
+python screen_agent.py --url http://<サブPC>:8000 --token <同じトークン>          # 常駐
+```
+自動起動はタスクスケジューラで「ログオン時」トリガー + `pythonw.exe screen_agent.py ...` (コンソール非表示)。
+
+確認: サブPCで `curl http://localhost:8000/api/screen/status` — `ingest.description` と `age_seconds` が出ていればOK。
+
+### 11.3 感情連動TTS (Emotion Tags)
+
+LLMが応答冒頭に `[emo:happy]` 形式のタグを出力し、Style-Bert-VITS2 のスタイルを発話ごとに切り替える。タグは全経路 (履歴 / RAG / トレーニングログ / 画面表示) で除去され、ユーザーには見えない。
+
+- 有効化: `config/chat_config.json` の `"emotion_tag_enabled": true`
+- 感情: happy / sad / angry / surprise / fear / disgust / neutral → SBV2スタイル (Happy 等) に1:1マップ
+- `jvnv-F1-jp` は7スタイル対応。`tsukuyomi-chan` は常に Neutral。kokoro はスタイル指定を無視
+- タグ無し・不正タグは neutral 扱い
+
+実装: `src/chat/emotion.py` (パース / ストリーミングフィルタ / スタイルマップ)。
+
+---
+
+## 12. タスク管理 + エスカレーション催促 (Phase 12)
+
+AIにタスク管理を任せる機能。SQLite (`data/tasks/tasks.db`, WAL) にタスクを保存し、期限に応じて段階的に厳しくなる催促を Discord に自発送信する。未完了タスク (最大8件) はLLMのシステムプロンプトに常時注入され、会話の中で自然に参照・詰められる。
+
+### 登録方法 (5通り)
+1. **右クリック**: 任意のメッセージを右クリック (長押し) → アプリ → 「タスクに登録」→ 本文が入力済みのモーダルで期限だけ書いて送信
+2. **常設タスクボード**: ピン留めされたボードの【＋追加】ボタン → モーダル入力。ボードでは未完了一覧 (期限順・超過明示・最大15件) の確認と、Selectメニューからの完了/スヌーズ/削除もできる。ボタンは永続化済みで再起動後も有効。env: `TASKS_BOARD_ENABLED` (default true) / `DISCORD_TASK_BOARD_CHANNEL_ID` (未設定ならリマインド先と同じ)
+3. **slash command**: `/task add <title> [due] [priority] [note]` — due は「明日」「7/10」「7/10 15:00」に対応。ほか `/task list` `/task done <id>` `/task snooze <id> <30m|2h|明日>` `/task del <id>`
+4. **明示プレフィックス**: 「タスク: レポート提出」と発言すると確認なしで即登録 (テキスト・通話STT両方)
+5. **自然会話から**: 「明日までにレポート出さないと」と話すと、返信後に非同期でLLMが抽出し「登録する/無視」ボタンで確認 (黙って自動登録はしない)。相対日付はプロンプト内の計算済み換算表で絶対日時化
+
+### エスカレーション催促
+期限24h前 (1回) → 3h前 (1回) → 1h前 (30分毎) → 超過 (2時間毎)。状態はDBに永続化 (再起動で重複しない)。催促はペルソナ口調に言い換えられ、[完了][+30分][+2時間] ボタン付きで届く。通話中なら読み上げも。
+
+```bash
+# config/discord.env
+TASKS_REMINDER_ENABLED=true   # default true
+TASKS_QUIET_HOURS=1-8         # この時間帯 (ローカル) は超過以外の催促を抑制
+```
+
+送信先は `DISCORD_PROACTIVE_CHANNEL_ID` (未設定なら auto-reply チャンネルの先頭)。
+
+実装: `src/tasks/` (store / reminder) + `src/discord_bot/task_ui.py`。音声パイプラインもタスク一覧を読み取り専用で参照する。
+
+### Google Calendar 連携 (MCP)
+
+`@cocal/google-calendar-mcp` (stdio MCP) 経由の双方向同期。
+
+- **タスク→カレンダー**: 期限付きタスクを登録すると `📋 タイトル` のイベントを自動作成 (時刻あり=期限30分前〜期限、日付のみ=終日)。完了で `✅` に更新、削除でイベント削除。バックグラウンドワーカー処理でDiscord応答をブロックしない。マッピングは tasks テーブルの `calendar_event_id`
+- **カレンダー→bot**: `CALENDAR_SYNC_INTERVAL_MIN` (default 20分) ごとに向こう7日の予定を取得し、`data/calendar/upcoming.json` へ保存 (全プロセス共有)。LLMコンテキストに「予定 (Google Calendar)」ブロックとして注入。タスク由来イベント (`subpc-task:` マーカー) は再輸入しない
+- **予定リマインド**: プロアクティブ発話が有効 (`DISCORD_PROACTIVE_ENABLED=true`) の場合、当日の予定が UserProfile.schedule に同期され、既存の15分前リマインドが発火する
+
+```bash
+# config/discord.env
+TASKS_CALENDAR_SYNC_ENABLED=true
+# TASKS_CALENDAR_ID=primary          # default: DIARY_CALENDAR_ID → primary
+# CALENDAR_SYNC_INTERVAL_MIN=20
+```
+
+初回セットアップ: GCPでOAuthクライアント作成 → `~/.config/google-calendar-mcp/gcp-oauth.keys.json` に配置 → Calendar API を有効化 → テストユーザーに自分を追加 → `GOOGLE_OAUTH_CREDENTIALS=$HOME/.config/google-calendar-mcp/gcp-oauth.keys.json npx -y @cocal/google-calendar-mcp auth`
+
+注: `src/integrations/mcp_stdio.py` は改行区切りJSONで通信する (2026-07-04 修正。以前はLSP風Content-Lengthフレーミングでサーバーと噛み合わず全MCP呼び出しがタイムアウトしていた — 日記のカレンダー連携が動かなかった根本原因)。
+
+### 通話STT分断対策 (同時実装)
+考えながら話すと一文が断片化して断片ごとに返信が来ていた問題への対策:
+- `DISCORD_VOICE_STT_SILENCE_MS` を 700→1000ms に変更 (実config)
+- `DISCORD_VOICE_REPLY_DEBOUNCE_MS` (default 3000): 断片を待って結合し、発話が落ち着いてから1回だけ返信。最初の断片から `DISCORD_VOICE_REPLY_DEBOUNCE_MAX_MS` (default 10000) で強制発火。`0` で従来挙動
+
+---
+
+## 13. ログ管理
+
+アプリログ・サービスログ・会話履歴を一元管理する。
+
+### アプリのログ出力
+各サービス (subpc-web / subpc-discord / subpc-sbv2-tts) は Python logging に統一済み。stdout (journald) と `logs/<service>.log` (5MB×3世代ローテーション) の両方に出力する。レベルは環境変数 `LOG_LEVEL` (default INFO)。共通実装は `src/service/log_setup.py` (SBV2サーバーは別venvのためスクリプト内に同等実装)。
+
+### 会話履歴
+Webチャットは応答完了ごとに `data/chat_history/session_*.json` へ自動保存される (以前はメモリのみで再起動で消えていた)。`HISTORY_MAX_FILES` (default 200) を超えた古いファイルは自動削除。実装: `src/chat/history_admin.py`。
+
+### Web UI ログビューア (`/logs`)
+- **サービス**: journalctl のログを閲覧 (unit は `subpc-web` / `subpc-discord` / `subpc-sbv2-tts` / `subpc-gpu-powersave` のホワイトリスト制、最大1000行)
+- **アプリログ**: `logs/*.log` の一覧と末尾表示
+- **会話ログ**: 履歴の一覧 (プレビュー・ターン数・サイズ)、メッセージ閲覧、削除
+
+API: `GET /api/logs/journal?unit=&lines=` / `GET /api/logs/files` / `GET /api/logs/files/{name}` / `GET,DELETE /api/history/sessions[/{file}]`
 
 ---
 
