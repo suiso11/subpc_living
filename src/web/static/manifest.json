@@ -1,0 +1,25 @@
+{
+  "name": "subpc_living",
+  "short_name": "subpc",
+  "description": "subpc_living personal assistant",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#0b0d11",
+  "theme_color": "#0b0d11",
+  "shortcuts": [
+    {
+      "name": "タスク",
+      "short_name": "タスク",
+      "url": "/tasks"
+    }
+  ],
+  "icons": [
+    {
+      "src": "/static/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
