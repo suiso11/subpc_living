@@ -1,5 +1,6 @@
 # Python
 .venv/
+.venv-*/
 __pycache__/
 *.pyc
 *.pyo
@@ -11,6 +12,7 @@ build/
 data/
 .env
 config/discord.env
+config/web.env
 
 # モデル・バイナリ（サイズが大きいためgit管理外）
 models/
@@ -25,3 +27,6 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# アプリログ (RotatingFileHandler 出力)
+logs/
