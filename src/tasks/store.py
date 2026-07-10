@@ -26,7 +26,7 @@ DEFAULT_TZ = "Asia/Tokyo"
 VALID_PRIORITY = ("high", "normal", "low")
 VALID_STATUS = ("open", "done", "dropped")
 VALID_GRANULARITY = ("date", "datetime")
-VALID_SOURCE = ("command", "chat", "voice", "context_menu", "board")
+VALID_SOURCE = ("command", "chat", "voice", "context_menu", "board", "web")
 
 # priority の並び順 (数値が小さいほど優先)
 _PRIORITY_RANK = {"high": 0, "normal": 1, "low": 2}
