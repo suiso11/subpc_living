@@ -7,7 +7,8 @@ Web UI・Discord bot・音声パイプラインから使う。
 
 - 仮想環境: `.venv/bin/python` を使う (システムpythonではなく)
 - テスト: `.venv/bin/python -m unittest discover -s tests -q`
-- サービス: `systemctl --user restart subpc-discord.service subpc-web.service` (コード変更後に反映)
+- サービス: `systemctl --user restart subpc-discord.service subpc-web.service subpc-voice.service` (コード変更後に反映)
+  - subpc-voice も chat 設定 (config/chat_config.json) を起動時に読む。モデル差し替え時に再起動を忘れると、新旧モデルがGPUを取り合ってロードのスラッシングが起きる (P40 24GB に26b級は1つしか載らない)
 - 実設定 `config/discord.env` はgit管理外。例は `config/discord.env.example`
 
 ## Orchestration workflow

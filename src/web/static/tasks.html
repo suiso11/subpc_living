@@ -47,15 +47,21 @@
 
       <section class="task-compose" aria-label="タスク追加">
         <form id="task-add-form" class="task-compose-form" autocomplete="off">
-          <input id="task-title-input" name="title" type="text" placeholder="タスクを追加" autocomplete="off" required>
-          <input id="task-due-input" name="due" type="text" placeholder="期限: 明日 / 7/10 15:00" autocomplete="off">
-          <select id="task-priority-input" name="priority" aria-label="優先度">
-            <option value="normal">普通</option>
-            <option value="high">高</option>
-            <option value="low">低</option>
-          </select>
-          <input id="task-note-input" name="note" type="text" placeholder="メモ (任意)" autocomplete="off">
-          <button class="primary-btn" type="submit">追加</button>
+          <div class="compose-input-row">
+            <input id="task-text-input" name="text" type="text" placeholder="例: 明日18時までに牛乳を買う / 金曜 レポート提出" autocomplete="off" required>
+            <button class="secondary-btn compact" id="task-details-toggle" type="button" title="詳細を表示">詳細</button>
+            <button class="primary-btn" type="submit">追加</button>
+          </div>
+          <div id="task-preview-line" class="task-preview-line" hidden></div>
+          <div id="task-details-section" class="task-details-section" hidden>
+            <select id="task-priority-input" name="priority" aria-label="優先度">
+              <option value="normal">優先度: 普通</option>
+              <option value="high">優先度: 高</option>
+              <option value="low">優先度: 低</option>
+            </select>
+            <input id="task-note-input" name="note" type="text" placeholder="メモ (任意)" autocomplete="off">
+          </div>
+          <div class="due-quick" id="due-quick" aria-label="期限クイック入力"></div>
         </form>
       </section>
 
@@ -65,15 +71,8 @@
             <button class="segmented-btn active" data-view="list" type="button" role="tab">リスト</button>
             <button class="segmented-btn" data-view="calendar" type="button" role="tab">カレンダー</button>
           </div>
-          <div class="segmented" id="task-filter-seg" role="tablist" aria-label="絞り込み">
-            <button class="segmented-btn active" data-filter="all" type="button" role="tab">すべて</button>
-            <button class="segmented-btn" data-filter="overdue" type="button" role="tab">超過</button>
-            <button class="segmented-btn" data-filter="today" type="button" role="tab">今日</button>
-            <button class="segmented-btn" data-filter="nodue" type="button" role="tab">期限なし</button>
-          </div>
         </div>
         <div class="task-toolbar-actions">
-          <span class="task-muted" id="task-count">0 件</span>
           <button class="secondary-btn" id="task-refresh-btn" type="button">更新</button>
         </div>
       </section>
@@ -81,12 +80,6 @@
       <div class="task-error" id="task-error" role="alert" aria-live="polite"></div>
 
       <section class="task-list-shell" id="task-list-shell" aria-label="タスク一覧">
-        <div class="task-list-head">
-          <span>タスク</span>
-          <span>期限</span>
-          <span>優先度</span>
-          <span>操作</span>
-        </div>
         <div class="task-list" id="task-list"></div>
       </section>
 

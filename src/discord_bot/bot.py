@@ -1969,7 +1969,7 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
     @task_group.command(name="add", description="タスクを追加します")
     @app_commands.describe(
         title="タスク名",
-        due="期限。例: 明日 / 7/10 / 7/10 15:00 (省略可)",
+        due="期限。例: 明日 18時 / 金曜 / 来週水曜 / 7/10 15:00 (省略可)",
         priority="優先度",
         note="メモ (省略可)",
     )
@@ -1999,7 +1999,7 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
             due_at, granularity = parse_due(due, now, _tasks_tz())
             if due_at is None:
                 await interaction.response.send_message(
-                    "期限を解釈できませんでした。例: 明日 / 7/10 / 7/10 15:00", ephemeral=True
+                    "期限を解釈できませんでした。例: 明日 18時 / 金曜 / 来週水曜 / 7/10 15:00", ephemeral=True
                 )
                 return
         try:

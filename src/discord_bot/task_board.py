@@ -175,7 +175,7 @@ def resolve_task_input(
         if due_at is None:
             return None, (
                 f"期限「{due_raw}」を解釈できませんでした。登録していません。\n"
-                "例: 明日 / 7/10 / 7/10 15:00"
+                "例: 明日 18時 / 金曜 / 来週水曜 / 7/10 15:00"
             )
 
     priority = (priority_raw or "").strip().lower()
@@ -230,7 +230,7 @@ def resolve_task_edit_input(
         if due_at is None:
             return None, (
                 f"期限「{due_raw}」を解釈できませんでした。更新していません。\n"
-                "例: 明日 / 7/10 / 7/10 15:00"
+                "例: 明日 18時 / 金曜 / 来週水曜 / 7/10 15:00"
             )
 
     priority = (priority_raw or "").strip().lower()

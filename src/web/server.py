@@ -14,7 +14,7 @@ import subprocess
 import threading
 import time
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -45,7 +45,7 @@ from src.persona.summarizer import ConversationSummarizer
 from src.persona.preloader import SessionPreloader
 from src.service.healthcheck import HealthChecker
 from src.service.idle import IdleManager
-from src.discord_bot.task_ui import parse_due, parse_snooze
+from src.discord_bot.task_ui import parse_due, parse_snooze, split_quick_input
 from src.tasks.store import TaskStore
 from src.service.log_setup import setup_logging, DEFAULT_LOG_DIR
 from src.chat import history_admin
@@ -474,33 +474,105 @@ async def tasks_list(status: str = "open", limit: int = 100):
     }
 
 
-@app.post("/api/tasks")
-async def tasks_add(request: Request):
-    """タスクを追加する。body: title, due, priority, note。"""
+@app.post("/api/tasks/preview")
+async def tasks_preview(request: Request):
+    """1行テキストをパースして preview を返す。
+    
+    body: {"text": "..."}
+    response: {"title": str, "due_at": iso|null, "due_granularity": str|null, "due_display": "M/D HH:MM"|"M/D"|null, "priority": str}
+    """
     unavailable = _require_task_store()
     if unavailable is not None:
         return unavailable
     body = await request.json()
-    title = str(body.get("title") or "").strip()
-    if not title:
-        return JSONResponse({"error": "title is required"}, status_code=400)
-
+    text = str(body.get("text") or "").strip()
+    if not text:
+        return JSONResponse({"error": "text is required"}, status_code=400)
+    
     now = datetime.now(timezone.utc)
-    due_at = None
-    granularity = None
-    due = str(body.get("due") or "").strip()
-    if due:
-        due_at, granularity = parse_due(due, now, _tasks_tz())
-        if due_at is None:
-            return JSONResponse(
-                {"error": "due could not be parsed", "hint": "例: 明日 / 7/10 / 7/10 15:00"},
-                status_code=400,
-            )
-    priority = str(body.get("priority") or "normal").strip().lower()
-    if priority not in ("high", "normal", "low"):
-        priority = "normal"
-    note = str(body.get("note") or "").strip() or None
+    tz = _tasks_tz()
+    result = split_quick_input(text, now, tz)
+    
+    # due_display の計算
+    due_display = None
+    if result["due_at"] is not None:
+        local_due = result["due_at"].astimezone(tz)
+        if result["due_granularity"] == "date":
+            due_display = local_due.strftime("%-m/%-d")
+        else:  # datetime
+            due_display = local_due.strftime("%-m/%-d %H:%M")
+    
+    return JSONResponse({
+        "title": result["title"],
+        "due_at": result["due_at"].isoformat() if result["due_at"] else None,
+        "due_granularity": result["due_granularity"],
+        "due_display": due_display,
+        "priority": result["priority"],
+    }, status_code=200)
 
+
+@app.post("/api/tasks")
+async def tasks_add(request: Request):
+    """タスクを追加する。
+    
+    body: title, due, priority, note (従来形式) または text (クイック入力)
+    text キーがあれば split_quick_input で分解し、明示的な priority/note があればそちらを優先。
+    """
+    unavailable = _require_task_store()
+    if unavailable is not None:
+        return unavailable
+    body = await request.json()
+    
+    now = datetime.now(timezone.utc)
+    tz = _tasks_tz()
+    
+    # --- Quick input mode (text キーがある) ---
+    if "text" in body:
+        text = str(body.get("text") or "").strip()
+        if not text:
+            return JSONResponse({"error": "text is required"}, status_code=400)
+        
+        result = split_quick_input(text, now, tz)
+        title = result["title"]
+        if not title:
+            return JSONResponse({"error": "title is required"}, status_code=400)
+        
+        due_at = result["due_at"]
+        granularity = result["due_granularity"]
+        priority = result["priority"]
+        note = None
+        
+        # 明示的な priority/note があればそちらを優先
+        if "priority" in body:
+            p = str(body.get("priority") or "normal").strip().lower()
+            if p in ("high", "normal", "low"):
+                priority = p
+        if "note" in body:
+            n = str(body.get("note") or "").strip()
+            if n:
+                note = n
+    
+    # --- Traditional mode (title + due/priority/note) ---
+    else:
+        title = str(body.get("title") or "").strip()
+        if not title:
+            return JSONResponse({"error": "title is required"}, status_code=400)
+        
+        due_at = None
+        granularity = None
+        due = str(body.get("due") or "").strip()
+        if due:
+            due_at, granularity = parse_due(due, now, tz)
+            if due_at is None:
+                return JSONResponse(
+                    {"error": "due could not be parsed", "hint": "例: 明日 18時 / 金曜 / 来週水曜 / 7/10 15:00"},
+                    status_code=400,
+                )
+        priority = str(body.get("priority") or "normal").strip().lower()
+        if priority not in ("high", "normal", "low"):
+            priority = "normal"
+        note = str(body.get("note") or "").strip() or None
+    
     task_id = await asyncio.to_thread(
         task_store.add,
         title[:200],
@@ -545,7 +617,7 @@ async def tasks_update(task_id: int, request: Request):
             due_at, granularity = parse_due(due, datetime.now(timezone.utc), _tasks_tz())
             if due_at is None:
                 return JSONResponse(
-                    {"error": "due could not be parsed", "hint": "例: 明日 / 7/10 / 7/10 15:00"},
+                    {"error": "due could not be parsed", "hint": "例: 明日 18時 / 金曜 / 来週水曜 / 7/10 15:00"},
                     status_code=400,
                 )
             kwargs["due_at"] = due_at

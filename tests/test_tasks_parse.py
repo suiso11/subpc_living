@@ -73,6 +73,109 @@ class ParseDueTest(unittest.TestCase):
         self.assertIsNone(due)
         self.assertIsNone(gran)
 
+    # --- 拡張表現 (now = 2026-07-03 金曜 JST 10:00) ---
+
+    def test_weekday_plain_is_next_occurrence(self) -> None:
+        due, gran = parse_due("月曜", self.now, JST)
+        self.assertEqual(gran, "date")
+        local = due.astimezone(JST)
+        self.assertEqual((local.month, local.day), (7, 6))
+
+    def test_weekday_today_counts(self) -> None:
+        # 今日は金曜なので「金曜」は今日
+        due, _ = parse_due("金曜日", self.now, JST)
+        self.assertEqual(due.astimezone(JST).day, 3)
+
+    def test_next_week_weekday(self) -> None:
+        due, _ = parse_due("来週の水曜", self.now, JST)
+        local = due.astimezone(JST)
+        self.assertEqual((local.month, local.day), (7, 8))
+
+    def test_this_week_weekday(self) -> None:
+        due, _ = parse_due("今週土曜", self.now, JST)
+        self.assertEqual(due.astimezone(JST).day, 4)
+
+    def test_weekday_with_time(self) -> None:
+        due, gran = parse_due("来週月曜 15:00", self.now, JST)
+        self.assertEqual(gran, "datetime")
+        local = due.astimezone(JST)
+        self.assertEqual((local.day, local.hour), (6, 15))
+
+    def test_next_week_alone_is_end_of_next_week(self) -> None:
+        due, gran = parse_due("来週", self.now, JST)
+        self.assertEqual(gran, "date")
+        self.assertEqual(due.astimezone(JST).day, 12)  # 来週の日曜
+
+    def test_weekend(self) -> None:
+        due, _ = parse_due("週末", self.now, JST)
+        self.assertEqual(due.astimezone(JST).day, 4)  # 次の土曜
+
+    def test_pm_kanji_time(self) -> None:
+        due, gran = parse_due("明日の午後3時", self.now, JST)
+        self.assertEqual(gran, "datetime")
+        local = due.astimezone(JST)
+        self.assertEqual((local.day, local.hour), (4, 15))
+
+    def test_hour_han(self) -> None:
+        due, _ = parse_due("明日 18時半", self.now, JST)
+        local = due.astimezone(JST)
+        self.assertEqual((local.hour, local.minute), (18, 30))
+
+    def test_hour_kanji_minute(self) -> None:
+        due, _ = parse_due("明日 18時15分", self.now, JST)
+        local = due.astimezone(JST)
+        self.assertEqual((local.hour, local.minute), (18, 15))
+
+    def test_time_word_morning(self) -> None:
+        due, gran = parse_due("明日の朝", self.now, JST)
+        self.assertEqual(gran, "datetime")
+        local = due.astimezone(JST)
+        self.assertEqual((local.day, local.hour), (4, 9))
+
+    def test_konya(self) -> None:
+        due, gran = parse_due("今夜", self.now, JST)
+        self.assertEqual(gran, "datetime")
+        local = due.astimezone(JST)
+        self.assertEqual((local.day, local.hour), (3, 20))
+
+    def test_day_only_this_month(self) -> None:
+        due, gran = parse_due("10日", self.now, JST)
+        self.assertEqual(gran, "date")
+        local = due.astimezone(JST)
+        self.assertEqual((local.month, local.day), (7, 10))
+
+    def test_day_only_past_rolls_to_next_month(self) -> None:
+        due, _ = parse_due("1日", self.now, JST)
+        local = due.astimezone(JST)
+        self.assertEqual((local.month, local.day), (8, 1))
+
+    def test_ymd_hyphen(self) -> None:
+        due, _ = parse_due("2026-09-01", self.now, JST)
+        local = due.astimezone(JST)
+        self.assertEqual((local.year, local.month, local.day), (2026, 9, 1))
+
+    def test_ymd_kanji(self) -> None:
+        due, _ = parse_due("2026年9月1日 10:00", self.now, JST)
+        local = due.astimezone(JST)
+        self.assertEqual((local.month, local.day, local.hour), (9, 1, 10))
+
+    def test_relative_weeks(self) -> None:
+        due, gran = parse_due("2週間後", self.now, JST)
+        self.assertEqual(gran, "date")
+        self.assertEqual(due.astimezone(JST).day, 17)
+
+    def test_hiragana_alias(self) -> None:
+        due, _ = parse_due("あさって", self.now, JST)
+        self.assertEqual(due.astimezone(JST).day, 5)
+        due, _ = parse_due("あしたの15時", self.now, JST)
+        local = due.astimezone(JST)
+        self.assertEqual((local.day, local.hour), (4, 15))
+
+    def test_zenkaku_digits(self) -> None:
+        due, _ = parse_due("７/１０ １５:００", self.now, JST)
+        local = due.astimezone(JST)
+        self.assertEqual((local.month, local.day, local.hour), (7, 10, 15))
+
 
 class ParseSnoozeTest(unittest.TestCase):
     def setUp(self) -> None:
