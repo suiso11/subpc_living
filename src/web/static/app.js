@@ -1,6 +1,6 @@
 // ============================================
 //  subpc_living Web UI — Frontend JS
-//  WebSocket ストリーミングチャット + TTS
+//  WebSocket ストリーミングチャット + TTS + STT
 // ============================================
 
 const $ = (sel) => document.querySelector(sel);
@@ -11,6 +11,13 @@ let ws = null;
 let isStreaming = false;
 let sessionId = `web_${Date.now()}`;
 let currentAudio = null;
+let sttAvailable = false;
+
+// --- 音声録音状態 ---
+let mediaRecorder = null;
+let audioChunks = [];
+let isRecording = false;
+let recordingStream = null;
 
 // --- DOM要素 ---
 const chatArea = $('#chat-area');
@@ -20,6 +27,8 @@ const statusDot = $('#status-dot');
 const ttsToggle = $('#tts-toggle');
 const settingsPanel = $('#settings-panel');
 const voiceSelect = $('#voice-select');
+const micBtn = $('#mic-btn');
+const sttStatus = $('#stt-status');
 
 // ============================================
 //  WebSocket 接続
@@ -70,11 +79,43 @@ function handleMessage(data) {
       playAudio(data.data);
       break;
 
+    case 'stt_result':
+      handleSTTResult(data);
+      break;
+
     case 'error':
       showError(data.message);
       isStreaming = false;
+      setMicState('idle');
       updateUI();
       break;
+  }
+}
+
+function handleSTTResult(data) {
+  if (data.text) {
+    // 認識テキストをステータスに表示
+    sttStatus.textContent = `🎤 "${data.text}"`;
+    setTimeout(() => { sttStatus.textContent = ''; }, 5000);
+
+    // 「🎤 (音声入力)」プレースホルダーを認識テキストに更新
+    const userMsgs = chatArea.querySelectorAll('.message.user .message-bubble');
+    if (userMsgs.length > 0) {
+      const lastBubble = userMsgs[userMsgs.length - 1];
+      if (lastBubble.textContent === '🎤 (音声入力)') {
+        lastBubble.textContent = `🎤 ${data.text}`;
+      }
+    }
+  } else {
+    sttStatus.textContent = data.message || '音声を認識できませんでした';
+    setTimeout(() => { sttStatus.textContent = ''; }, 3000);
+    setMicState('idle');
+    isStreaming = false;
+    updateUI();
+
+    // プレースホルダー削除
+    const streamingMsg = document.getElementById('streaming-msg');
+    if (streamingMsg) streamingMsg.remove();
   }
 }
 
@@ -179,6 +220,7 @@ function finishResponse(fullText) {
   }
 
   isStreaming = false;
+  setMicState('idle');
   updateUI();
   scrollToBottom();
 }
@@ -278,6 +320,206 @@ async function replayTTS(btn) {
 }
 
 // ============================================
+//  音声録音 (STT)
+// ============================================
+
+function setMicState(state) {
+  micBtn.classList.remove('recording', 'processing', 'disabled');
+  switch (state) {
+    case 'recording':
+      micBtn.classList.add('recording');
+      sttStatus.textContent = '🎤 録音中... タップで停止';
+      break;
+    case 'processing':
+      micBtn.classList.add('processing');
+      sttStatus.textContent = '⏳ 音声認識中...';
+      break;
+    case 'disabled':
+      micBtn.classList.add('disabled');
+      sttStatus.textContent = '';
+      break;
+    case 'idle':
+    default:
+      sttStatus.textContent = '';
+      break;
+  }
+}
+
+async function toggleRecording() {
+  if (!sttAvailable) {
+    sttStatus.textContent = '⚠️ STTが利用できません';
+    setTimeout(() => { sttStatus.textContent = ''; }, 3000);
+    return;
+  }
+
+  if (isStreaming) return;
+
+  if (isRecording) {
+    stopRecording();
+  } else {
+    await startRecording();
+  }
+}
+
+async function startRecording() {
+  try {
+    // マイク権限を要求
+    recordingStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: 1,
+        sampleRate: 16000,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      }
+    });
+
+    audioChunks = [];
+
+    // MediaRecorder の MIME タイプを選択
+    const mimeType = getPreferredMimeType();
+    const options = mimeType ? { mimeType } : {};
+
+    mediaRecorder = new MediaRecorder(recordingStream, options);
+
+    mediaRecorder.ondataavailable = (e) => {
+      if (e.data.size > 0) {
+        audioChunks.push(e.data);
+      }
+    };
+
+    mediaRecorder.onstop = () => {
+      processRecordedAudio();
+    };
+
+    mediaRecorder.start();
+    isRecording = true;
+    setMicState('recording');
+
+    // 振動フィードバック (モバイル)
+    if (navigator.vibrate) {
+      navigator.vibrate(50);
+    }
+
+  } catch (err) {
+    console.error('[Mic] Error:', err);
+    if (err.name === 'NotAllowedError') {
+      sttStatus.textContent = '⚠️ マイクの使用が許可されていません';
+    } else {
+      sttStatus.textContent = `⚠️ マイクエラー: ${err.message}`;
+    }
+    setTimeout(() => { sttStatus.textContent = ''; }, 5000);
+  }
+}
+
+function stopRecording() {
+  if (mediaRecorder && mediaRecorder.state === 'recording') {
+    mediaRecorder.stop();
+  }
+  isRecording = false;
+
+  // ストリームを停止
+  if (recordingStream) {
+    recordingStream.getTracks().forEach(t => t.stop());
+    recordingStream = null;
+  }
+
+  // 振動フィードバック (モバイル)
+  if (navigator.vibrate) {
+    navigator.vibrate([30, 30, 30]);
+  }
+}
+
+function getPreferredMimeType() {
+  // ブラウザ対応順にチェック
+  const types = [
+    'audio/webm;codecs=opus',
+    'audio/webm',
+    'audio/ogg;codecs=opus',
+    'audio/mp4',
+  ];
+  for (const t of types) {
+    if (MediaRecorder.isTypeSupported(t)) {
+      return t;
+    }
+  }
+  return '';
+}
+
+function getAudioFormat(mimeType) {
+  if (mimeType.includes('webm')) return 'webm';
+  if (mimeType.includes('ogg')) return 'ogg';
+  if (mimeType.includes('mp4') || mimeType.includes('m4a')) return 'mp4';
+  return 'wav';
+}
+
+async function processRecordedAudio() {
+  if (audioChunks.length === 0) {
+    setMicState('idle');
+    return;
+  }
+
+  setMicState('processing');
+
+  const mimeType = mediaRecorder?.mimeType || 'audio/webm';
+  const blob = new Blob(audioChunks, { type: mimeType });
+  audioChunks = [];
+
+  // 最小サイズチェック (録音が短すぎないか)
+  if (blob.size < 1000) {
+    sttStatus.textContent = '⚠️ 録音が短すぎます';
+    setTimeout(() => { sttStatus.textContent = ''; }, 3000);
+    setMicState('idle');
+    return;
+  }
+
+  try {
+    // Base64に変換
+    const arrayBuffer = await blob.arrayBuffer();
+    const base64 = arrayBufferToBase64(arrayBuffer);
+    const format = getAudioFormat(mimeType);
+
+    // WebSocketで送信
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      // ユーザーメッセージのプレースホルダー (音声アイコン表示)
+      addMessage('user', '🎤 (音声入力)');
+
+      isStreaming = true;
+      updateUI();
+
+      ws.send(JSON.stringify({
+        type: 'audio_message',
+        data: base64,
+        format: format,
+        session_id: sessionId,
+        tts: ttsToggle.checked,
+      }));
+
+      // AI応答プレースホルダー
+      createAssistantBubble();
+    } else {
+      sttStatus.textContent = '⚠️ 接続が切れています';
+      setTimeout(() => { sttStatus.textContent = ''; }, 3000);
+      setMicState('idle');
+    }
+  } catch (err) {
+    console.error('[STT] Process error:', err);
+    sttStatus.textContent = `⚠️ エラー: ${err.message}`;
+    setTimeout(() => { sttStatus.textContent = ''; }, 5000);
+    setMicState('idle');
+  }
+}
+
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  for (let i = 0; i < bytes.byteLength; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+// ============================================
 //  設定パネル
 // ============================================
 
@@ -322,6 +564,12 @@ async function init() {
     const resp = await fetch('/api/status');
     const status = await resp.json();
 
+    // STT 利用可能かチェック
+    sttAvailable = !!status.stt;
+    if (!sttAvailable) {
+      setMicState('disabled');
+    }
+
     if (status.tts_voices && voiceSelect) {
       voiceSelect.innerHTML = '';
       for (const [key, desc] of Object.entries(status.tts_voices)) {
@@ -341,6 +589,7 @@ async function init() {
 
   // イベント
   sendBtn.addEventListener('click', sendMessage);
+  micBtn.addEventListener('click', toggleRecording);
 
   messageInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {

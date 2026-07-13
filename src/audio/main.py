@@ -26,6 +26,26 @@ def main():
     parser.add_argument("--stt-model", default="small", help="Whisperモデルサイズ (tiny/base/small/medium)")
     parser.add_argument("--tts-voice", default="jf_alpha", help="kokoro-onnx 音声名 (jf_alpha/jm_kumo等)")
     parser.add_argument("--text-mode", action="store_true", help="テキスト入力モード (マイクなし)")
+    parser.add_argument("--vad", default="auto", choices=["auto", "silero", "energy"],
+                        help="VAD方式: auto(Silero優先), silero, energy (default: auto)")
+    parser.add_argument("--no-streaming-tts", action="store_true",
+                        help="ストリーミングTTSを無効化 (全文完了後に音声合成)")
+    parser.add_argument("--no-rag", action="store_true",
+                        help="RAG (長期記憶) を無効化")
+    parser.add_argument("--no-vision", action="store_true",
+                        help="Vision (映像入力) を無効化")
+    parser.add_argument("--camera-id", type=int, default=0,
+                        help="カメラデバイスID (default: 0)")
+    parser.add_argument("--no-monitor", action="store_true",
+                        help="Monitor (PCログ収集) を無効化")
+    parser.add_argument("--no-persona", action="store_true",
+                        help="Persona (パーソナライズ) を無効化")
+    parser.add_argument("--wakeword", action="store_true",
+                        help="ウェイクワードモードを有効化 (呼びかけで起動)")
+    parser.add_argument("--wakeword-model", default="hey_jarvis",
+                        help="ウェイクワードモデル名 (default: hey_jarvis)")
+    parser.add_argument("--wakeword-threshold", type=float, default=0.5,
+                        help="ウェイクワード検知の閾値 (0.0〜1.0, default: 0.5)")
     args = parser.parse_args()
 
     print(f"""
@@ -48,10 +68,24 @@ def run_voice_mode(args):
     from src.chat.config import ChatConfig
 
     config = ChatConfig.load(PROJECT_ROOT / "config" / "chat_config.json")
+
+    # ウェイクワードモデル名をリストに変換
+    wakeword_models = [args.wakeword_model] if args.wakeword else None
+
     pipeline = VoicePipeline(
         chat_config=config,
         stt_model=args.stt_model,
         tts_voice=args.tts_voice,
+        vad_type=args.vad,
+        streaming_tts=not args.no_streaming_tts,
+        enable_rag=not args.no_rag,
+        enable_vision=not args.no_vision,
+        camera_id=args.camera_id,
+        enable_monitor=not args.no_monitor,
+        enable_persona=not args.no_persona,
+        enable_wakeword=args.wakeword,
+        wakeword_models=wakeword_models,
+        wakeword_threshold=args.wakeword_threshold,
     )
 
     if not pipeline.initialize():

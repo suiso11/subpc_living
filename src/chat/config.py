@@ -2,7 +2,7 @@
 チャット設定モジュール
 Phase 2: テキスト対話用の設定を管理する
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 import json
 
@@ -19,8 +19,8 @@ class ChatConfig:
     temperature: float = 0.7
     top_p: float = 0.9
     top_k: int = 40
-    num_ctx: int = 4096  # コンテキスト長（VRAM節約のため制限）
     repeat_penalty: float = 1.1
+    num_ctx: int = 8192  # コンテキスト長
 
     # --- システムプロンプト ---
     system_prompt: str = (

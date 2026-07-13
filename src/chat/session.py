@@ -1,11 +1,20 @@
 """
 チャットセッション管理
 Phase 2: 会話履歴の管理・永続化を担当するモジュール
+Phase 4: RAG統合 — ベクトルDBから関連文脈をプロンプトに注入
+Phase 5: Vision統合 — カメラ映像の解析結果をプロンプトに注入
+Phase 7: パーソナライズ統合 — プリロードコンテキストをプロンプトに注入
 """
 from datetime import datetime
 from pathlib import Path
 import json
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.memory.rag import RAGRetriever
+    from src.vision.context import VisionContext
+    from src.monitor.context import MonitorContext
+    from src.persona.preloader import SessionPreloader
 
 
 class ChatSession:
@@ -16,6 +25,10 @@ class ChatSession:
         system_prompt: str = "",
         max_history_turns: int = 20,
         history_dir: str = "data/chat_history",
+        rag: Optional["RAGRetriever"] = None,
+        vision_context: Optional["VisionContext"] = None,
+        monitor_context: Optional["MonitorContext"] = None,
+        preloader: Optional["SessionPreloader"] = None,
     ):
         self.system_prompt = system_prompt
         self.max_history_turns = max_history_turns
@@ -25,6 +38,10 @@ class ChatSession:
         self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._messages: list[dict] = []  # {"role": "user"|"assistant", "content": "..."}
         self._created_at = datetime.now()
+        self.rag = rag
+        self.vision_context = vision_context
+        self.monitor_context = monitor_context
+        self.preloader = preloader
 
     def add_user_message(self, content: str) -> None:
         """ユーザーのメッセージを追加"""
@@ -32,24 +49,87 @@ class ChatSession:
         self._trim_history()
 
     def add_assistant_message(self, content: str) -> None:
-        """アシスタントの応答を追加"""
+        """アシスタントの応答を追加（RAG有効時はベクトルDBにも保存）"""
         self._messages.append({"role": "assistant", "content": content})
         self._trim_history()
 
+        # RAG: 直前のuser+assistantをベクトルDBに保存
+        if self.rag is not None and len(self._messages) >= 2:
+            user_msg = self._messages[-2]
+            if user_msg.get("role") == "user":
+                self.rag.store_turn(
+                    user_message=user_msg["content"],
+                    assistant_message=content,
+                    session_id=self.session_id,
+                )
+
     def build_messages(self) -> list[dict]:
-        """Ollama APIに渡すメッセージリストを構築"""
+        """
+        Ollama APIに渡すメッセージリストを構築
+
+        RAGが有効な場合、最新のユーザーメッセージで長期記憶を検索し、
+        関連する過去の文脈をシステムプロンプトに注入する。
+        """
         messages = []
-        if self.system_prompt:
-            messages.append({"role": "system", "content": self.system_prompt})
+
+        # システムプロンプト + プリロード + RAGコンテキスト + Visionコンテキスト
+        system_content = self.system_prompt or ""
+
+        # Preload: プロフィール・スケジュール・最近の会話要約・時刻 (Phase 7)
+        if self.preloader is not None:
+            preload_text = self.preloader.build_preload_context()
+            if preload_text:
+                system_content = system_content + preload_text
+
+        if self.rag is not None and self._messages:
+            # 最新のユーザーメッセージで検索
+            last_user = None
+            for msg in reversed(self._messages):
+                if msg["role"] == "user":
+                    last_user = msg["content"]
+                    break
+            if last_user:
+                rag_context = self.rag.build_context_prompt(last_user)
+                if rag_context:
+                    system_content = system_content + rag_context
+
+        # Vision: カメラ映像の現在の状態を注入
+        if self.vision_context is not None:
+            vision_text = self.vision_context.get_context_text()
+            if vision_text:
+                system_content = system_content + vision_text
+
+        # Monitor: サブPCの状態を注入 (Phase 6)
+        if self.monitor_context is not None:
+            monitor_text = self.monitor_context.get_context_text()
+            if monitor_text:
+                system_content = system_content + monitor_text
+
+        if system_content:
+            messages.append({"role": "system", "content": system_content})
+
         messages.extend(self._messages)
         return messages
 
     def _trim_history(self) -> None:
-        """履歴をmax_history_turnsに収める（古いものから削除）"""
-        # 1ターン = user + assistant の2メッセージ
-        max_messages = self.max_history_turns * 2
-        if len(self._messages) > max_messages:
-            self._messages = self._messages[-max_messages:]
+        """履歴をターン単位で max_history_turns に収める"""
+        if self.max_history_turns <= 0:
+            self._messages.clear()
+            return
+
+        # 以前の不整合で先頭に assistant が来ている履歴を補正する。
+        while self._messages and self._messages[0]["role"] != "user":
+            self._messages.pop(0)
+
+        while sum(1 for m in self._messages if m["role"] == "user") > self.max_history_turns:
+            if not self._messages:
+                break
+
+            if self._messages[0]["role"] == "user":
+                self._messages.pop(0)
+
+            if self._messages and self._messages[0]["role"] == "assistant":
+                self._messages.pop(0)
 
     @property
     def turn_count(self) -> int:

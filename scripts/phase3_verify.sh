@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # Phase 3: 音声対話 検証スクリプト
-# STT / TTS (kokoro-onnx) / Audio I/O / パイプラインの検証
+# STT / TTS (kokoro-onnx) / Audio I/O / VAD (Energy + Silero) / パイプラインの検証
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -127,7 +127,7 @@ fi
 # --- VAD テスト ---
 echo ""
 echo "[VADテスト]"
-check "VAD初期化" "python3 -c \"
+check "Energy VAD初期化" "python3 -c \"
 import sys; sys.path.insert(0, '${PROJECT_ROOT}')
 from src.audio.vad import EnergyVAD
 import numpy as np
@@ -137,6 +137,52 @@ frame = np.zeros(vad.frame_size, dtype=np.float32)
 result = vad.process_frame(frame)
 assert result is None
 print('OK')
+\""
+
+# Silero VAD テスト (torch が利用可能な場合のみ)
+echo -n "  Silero VAD (torch依存)... "
+SILERO_RESULT=$(python3 -c "
+import sys; sys.path.insert(0, '${PROJECT_ROOT}')
+try:
+    import torch
+    from src.audio.vad import SileroVAD
+    import numpy as np
+    vad = SileroVAD()
+    frame = np.zeros(vad.frame_size, dtype=np.float32)
+    result = vad.process_frame(frame)
+    assert result is None
+    print('OK')
+except ImportError:
+    print('SKIP: torch未インストール')
+" 2>&1)
+if echo "$SILERO_RESULT" | grep -q "OK"; then
+    echo "✅ OK"
+    ((PASS++))
+elif echo "$SILERO_RESULT" | grep -q "SKIP"; then
+    echo "⏭️  SKIP (torch未インストール — Energy VADにフォールバック)"
+    ((PASS++))
+else
+    echo "❌ FAIL"
+    echo "    $SILERO_RESULT"
+    ((FAIL++))
+fi
+
+check "VADファクトリ (create_vad)" "python3 -c \"
+import sys; sys.path.insert(0, '${PROJECT_ROOT}')
+from src.audio.vad import create_vad
+vad = create_vad(vad_type='auto')
+print(f'OK: {type(vad).__name__}')
+\""
+
+# --- ストリーミングTTS テスト ---
+echo ""
+echo "[ストリーミングTTSテスト]"
+check "文分割ロジック" "python3 -c \"
+import sys; sys.path.insert(0, '${PROJECT_ROOT}')
+from src.audio.pipeline import VoicePipeline
+result = VoicePipeline._split_sentences('こんにちは。今日はいい天気ですね！明日はどうでしょう？')
+assert len(result) == 3, f'Expected 3 sentences, got {len(result)}: {result}'
+print(f'OK: {result}')
 \""
 
 # --- 結果サマリー ---
@@ -155,6 +201,14 @@ if [ $FAIL -eq 0 ]; then
     echo ""
     echo "テキスト→音声モード (マイクなし):"
     echo "  python ${PROJECT_ROOT}/src/audio/main.py --text-mode"
+    echo ""
+    echo "VADオプション:"
+    echo "  --vad auto     Silero VAD優先、なければEnergy VAD (デフォルト)"
+    echo "  --vad silero   Silero VADを強制使用"
+    echo "  --vad energy   Energy VADを強制使用"
+    echo ""
+    echo "ストリーミングTTS無効化:"
+    echo "  --no-streaming-tts   全文完了後に音声合成"
     exit 0
 else
     echo ""

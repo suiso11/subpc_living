@@ -1,0 +1,6 @@
+[Unit]
+Description=Restart tailscaled
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl restart tailscaled

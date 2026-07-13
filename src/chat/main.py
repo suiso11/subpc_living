@@ -143,7 +143,6 @@ def main():
             elif cmd == "/model":
                 print(f"\n{Color.DIM}モデル: {config.model}")
                 print(f"Temperature: {config.temperature}")
-                print(f"Top-P: {config.top_p}")
                 print(f"コンテキスト長: {config.num_ctx}")
                 print(f"最大履歴ターン: {config.max_history_turns}{Color.RESET}")
                 continue
@@ -166,8 +165,8 @@ def main():
                     temperature=config.temperature,
                     top_p=config.top_p,
                     top_k=config.top_k,
-                    num_ctx=config.num_ctx,
                     repeat_penalty=config.repeat_penalty,
+                    num_ctx=config.num_ctx,
                 ):
                     print(token, end="", flush=True)
                     full_response += token
@@ -184,8 +183,8 @@ def main():
                     temperature=config.temperature,
                     top_p=config.top_p,
                     top_k=config.top_k,
-                    num_ctx=config.num_ctx,
                     repeat_penalty=config.repeat_penalty,
+                    num_ctx=config.num_ctx,
                 )
                 print(response)
                 session.add_assistant_message(response)
