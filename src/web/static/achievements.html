@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#120B0A">
+  <title>実績 | SUBPC BUDDY</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+  <link rel="manifest" href="/static/manifest.json">
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/pop-theme.css">
+  <link rel="stylesheet" href="/static/shell-theme.css">
+</head>
+<body class="tasks-page achievements-page">
+  <div class="task-app">
+    <header class="task-header site-header">
+      <div class="task-brand site-brand">
+        <span class="task-brand-mark"></span>
+        <span>SUBPC BUDDY</span>
+      </div>
+      <nav class="top-nav" aria-label="画面切替">
+        <a class="top-nav-link" href="/">話す</a>
+        <a class="top-nav-link" href="/tasks">やること</a>
+        <a class="top-nav-link" href="/logs">記録</a>
+        <a class="top-nav-link active" href="/achievements">実績</a>
+      </nav>
+      <div class="site-actions">
+        <a class="utility-btn achievement-back" href="/" title="会話に戻る">
+          <span aria-hidden="true">←</span><span class="utility-label">話すに戻る</span>
+        </a>
+      </div>
+    </header>
+
+    <main class="task-workspace achievement-workspace">
+      <section class="page-heading" aria-labelledby="achievements-page-title">
+        <div>
+          <span class="page-label">相棒とのあゆみ</span>
+          <h1 id="achievements-page-title">実績</h1>
+          <p>話したこと、覚えたこと、続けたことの記録です。</p>
+        </div>
+      </section>
+
+      <div class="achievement-error" id="achievement-error" role="alert" aria-live="polite"></div>
+
+      <section class="achievement-overview" id="achievement-overview" aria-label="相棒ランク" hidden>
+        <div class="achievement-rank-card">
+          <span class="achievement-rank-mark" aria-hidden="true">✦</span>
+          <div>
+            <span class="achievement-eyebrow">現在の相棒ランク</span>
+            <h2 id="achievement-rank-name">—</h2>
+            <p id="achievement-next-rank">読み込み中</p>
+          </div>
+        </div>
+        <div class="achievement-score-card">
+          <span>育ちポイント</span>
+          <strong id="achievement-points">—</strong>
+          <small>GP</small>
+        </div>
+        <div class="achievement-score-card unlocked-count-card">
+          <span>解除した実績</span>
+          <strong id="achievement-unlocked">—</strong>
+          <small id="achievement-total">/ —</small>
+        </div>
+      </section>
+
+      <section class="achievement-next" id="achievement-next" aria-labelledby="achievement-next-title" hidden>
+        <div>
+          <span class="achievement-eyebrow">いちばん近い実績</span>
+          <h2 id="achievement-next-title">—</h2>
+          <p id="achievement-next-detail"></p>
+        </div>
+        <div class="achievement-next-action">
+          <strong id="achievement-next-progress"></strong>
+          <a class="primary-btn" href="/">会話を続ける</a>
+        </div>
+      </section>
+
+      <section class="achievement-collection" aria-labelledby="achievement-collection-title">
+        <div class="section-heading achievement-collection-heading">
+          <div>
+            <h2 id="achievement-collection-title">コレクション</h2>
+            <span>未解除でも条件を確認できます</span>
+          </div>
+          <div class="achievement-filter" role="group" aria-label="実績の表示切替">
+            <button class="achievement-filter-btn active" type="button" data-filter="all" aria-pressed="true">すべて</button>
+            <button class="achievement-filter-btn" type="button" data-filter="unlocked" aria-pressed="false">解除済み</button>
+            <button class="achievement-filter-btn" type="button" data-filter="locked" aria-pressed="false">挑戦中</button>
+          </div>
+        </div>
+        <div class="achievement-grid" id="achievement-grid" aria-live="polite"></div>
+        <p class="achievement-empty" id="achievement-empty" hidden>この条件の実績はありません。</p>
+      </section>
+    </main>
+  </div>
+
+  <script src="/static/achievements.js"></script>
+  <script src="/static/shell-ui.js"></script>
+</body>
+</html>

@@ -130,7 +130,7 @@ async function loadHistory() {
   try {
     const data = await requestJSON('/api/history/sessions');
     if (!data.sessions.length) {
-      historyList.innerHTML = '<div class="task-empty-row"><span class="empty-title">会話ログはありません</span><span class="empty-hint">チャットすると自動で保存されます。</span></div>';
+      historyList.innerHTML = '<div class="task-empty-row"><span class="empty-title">会話の記録はまだありません</span><span class="empty-hint">話した内容はここから振り返れます。</span></div>';
       historyDetail.hidden = true;
       return;
     }
@@ -138,7 +138,7 @@ async function loadHistory() {
       <div class="history-row ${s.file === currentSession ? 'active' : ''}" data-file="${escapeHtml(s.file)}">
         <button class="history-open" data-file="${escapeHtml(s.file)}" type="button">
           <span class="history-preview">${escapeHtml(s.preview || '(発言なし)')}</span>
-          <span class="history-meta">${formatDate(s.saved_at)} ・ ${s.turn_count ?? '?'}ターン ・ ${formatSize(s.size_bytes)}</span>
+          <span class="history-meta">${formatDate(s.saved_at)}・${s.turn_count ?? '?'}往復・${formatSize(s.size_bytes)}</span>
         </button>
         <button class="action-btn danger" data-delete="${escapeHtml(s.file)}" type="button">削除</button>
       </div>
@@ -165,7 +165,7 @@ async function openSession(file) {
     historyDetail.innerHTML = `
       <div class="cal-day-head">
         ${escapeHtml(data.session_id || file)}
-        <span class="task-muted">${formatDate(data.created_at)} 開始 ・ ${data.turn_count ?? '?'}ターン</span>
+        <span class="task-muted">${formatDate(data.created_at)}から・${data.turn_count ?? '?'}往復</span>
       </div>
       <div class="history-messages">${messages || '<div class="task-empty-row"><span class="empty-hint">メッセージなし</span></div>'}</div>
     `;
@@ -176,7 +176,7 @@ async function openSession(file) {
 }
 
 async function deleteSession(file) {
-  if (!confirm(`会話ログ ${file} を削除しますか？`)) return;
+  if (!confirm('この会話の記録を削除しますか？')) return;
   try {
     await requestJSON(`/api/history/sessions/${encodeURIComponent(file)}`, { method: 'DELETE' });
     if (currentSession === file) {

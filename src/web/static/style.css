@@ -203,6 +203,107 @@ button {
   color: var(--text);
 }
 
+/* --- 適応成長 --- */
+.growth-panel {
+  margin: 10px 14px 0;
+  padding: 11px 13px 9px;
+  flex-shrink: 0;
+  border: 1px solid rgba(63, 198, 179, 0.23);
+  border-radius: var(--radius-sm);
+  background:
+    linear-gradient(115deg, rgba(63, 198, 179, 0.09), rgba(75, 157, 222, 0.04)),
+    var(--bg-surface);
+  box-shadow: var(--shadow-1);
+  transition: border-color 0.2s, box-shadow 0.2s, opacity 0.2s;
+}
+
+.growth-head,
+.growth-title,
+.growth-score {
+  display: flex;
+  align-items: center;
+}
+
+.growth-head { justify-content: space-between; gap: 10px; }
+.growth-title { gap: 6px; font-size: 0.82rem; font-weight: 650; }
+.growth-mark { color: var(--primary); }
+.growth-level {
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--primary-soft);
+  color: var(--primary);
+  font-size: 0.7rem;
+}
+
+.growth-score { color: var(--text-dim); font-size: 0.72rem; gap: 4px; }
+.growth-score strong { color: var(--text); font-size: 0.98rem; font-variant-numeric: tabular-nums; }
+.growth-delta { color: var(--success); font-weight: 700; }
+
+.growth-progress {
+  height: 4px;
+  margin-top: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--bg-input);
+}
+
+.growth-progress span {
+  display: block;
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--grad-accent);
+  transition: width 0.55s ease;
+}
+
+.growth-stats {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  margin-top: 7px;
+}
+
+.growth-stats > span {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: 4px;
+  border-right: 1px solid var(--border-soft);
+}
+
+.growth-stats > span:last-child { border-right: 0; }
+.growth-stats strong { font-size: 0.78rem; font-variant-numeric: tabular-nums; }
+.growth-stats small { color: var(--text-faint); font-size: 0.62rem; }
+
+.growth-chart {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 13px;
+  margin-top: 7px;
+}
+
+.growth-chart span {
+  flex: 1;
+  min-height: 1px;
+  border-radius: 2px 2px 0 0;
+  background: var(--border);
+}
+
+.growth-chart span.active { background: rgba(63, 198, 179, 0.7); }
+.growth-panel.growth-unavailable { opacity: 0.46; }
+
+.growth-panel.growth-pulse {
+  border-color: var(--success);
+  box-shadow: 0 0 0 3px var(--success-soft), 0 8px 25px -12px rgba(87, 215, 137, 0.7);
+  animation: growth-pulse 0.7s ease-out;
+}
+
+@keyframes growth-pulse {
+  0% { transform: scale(0.99); }
+  55% { transform: scale(1.006); }
+  100% { transform: scale(1); }
+}
+
 /* --- チャットエリア --- */
 .chat-area {
   flex: 1;
@@ -1274,7 +1375,82 @@ button {
 .cal-dot.high, .cal-dot.overdue { background: var(--error); }
 .cal-dot.low { background: var(--accent); }
 
+/* Google Calendar の予定 (タスクと区別する青系) */
+.cal-chip.gcal {
+  background: rgba(90, 169, 230, 0.13);
+  border-color: rgba(90, 169, 230, 0.35);
+  color: var(--info);
+}
+
+.cal-dot.gcal { background: var(--info); }
+
+.cal-event-list {
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.cal-event-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 16px;
+  font-size: 0.88rem;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.cal-event-row:last-child { border-bottom: 0; }
+
+.cal-event-time {
+  flex: 0 0 auto;
+  min-width: 44px;
+  font-size: 0.8rem;
+  color: var(--info);
+  font-variant-numeric: tabular-nums;
+}
+
+.cal-event-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.cal-event-actions {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 6px;
+}
+
+.cal-event-row.editing {
+  gap: 8px;
+}
+
+.cal-event-row.editing input {
+  min-height: 34px;
+  padding: 4px 10px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  color: var(--text);
+  font: inherit;
+  font-size: 0.86rem;
+  outline: none;
+}
+
+.cal-event-row.editing input[name="title"] { flex: 1 1 auto; min-width: 0; }
+
+.cal-event-time-input { flex: 0 0 110px; }
+
+.cal-day-head-actions {
+  display: flex;
+  gap: 6px;
+}
+
 .cal-day-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   padding: 9px 16px;
   background: var(--bg-elevated);
   border-top: 1px solid var(--border-soft);
@@ -1860,6 +2036,59 @@ button {
   line-height: 1.45;
   overflow-wrap: anywhere;
 }
+
+.task-first-step {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin: 7px 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  background: var(--primary-soft);
+  color: var(--text);
+  font-size: 0.85rem;
+  line-height: 1.45;
+}
+
+.task-first-step-label {
+  flex: 0 0 auto;
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: var(--primary);
+}
+
+.task-start-link {
+  margin-left: auto;
+  padding: 4px 9px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text);
+  background: var(--bg-surface);
+  font-size: 0.76rem;
+  font-weight: 650;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.task-breakdown {
+  margin: 5px 0 8px;
+  color: var(--text-dim);
+  font-size: 0.8rem;
+}
+
+.task-breakdown summary {
+  cursor: pointer;
+  width: fit-content;
+}
+
+.task-breakdown ol {
+  margin: 7px 0 0 20px;
+  padding: 0;
+}
+
+.task-breakdown li + li { margin-top: 4px; }
 
 .task-meta {
   display: flex;

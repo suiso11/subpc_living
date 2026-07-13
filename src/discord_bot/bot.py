@@ -69,7 +69,9 @@ from src.integrations.google_calendar import GoogleCalendarMCPClient
 from src.persona.daily_personalizer import DailyPersonalizer, PersonalizationResult
 from src.service.healthcheck import HealthChecker
 from src.tasks.reminder import TaskReminderEngine, parse_quiet_hours
+from src.tasks.prioritizer import PriorityController, format_focus_decision
 from src.tasks.store import TaskStore
+from src.growth.tracker import GrowthTracker
 
 from src.service.log_setup import setup_logging
 logger = setup_logging("subpc-discord")
@@ -264,6 +266,7 @@ class DiscordConsoleState:
     allow_terminal: bool = False
     tts_lock: threading.Lock = field(default_factory=threading.Lock)
     training_log: DiscordTrainingLog | None = None
+    growth_tracker: GrowthTracker | None = None
     terminal: DiscordTerminal | None = None
     diary_enabled: bool = False
     diary_channel_id: int | None = None
@@ -285,12 +288,17 @@ class DiscordConsoleState:
     screen_context: ScreenContext | None = None
     task_store: TaskStore | None = None
     task_reminder_engine: TaskReminderEngine | None = None
+    event_reminder_engine: Any | None = None
+    event_remind_enabled: bool = True
+    event_remind_lead_min: float = 15.0
     tasks_reminder_enabled: bool = True
     tasks_quiet_hours: tuple[int, int] = (1, 8)
     tasks_timezone: str = "Asia/Tokyo"
     tasks_board_enabled: bool = True
     task_board_channel_id: int | None = None
     task_board: Any | None = None
+    priority_enabled: bool = True
+    priority_controller: PriorityController | None = None
 
     def initialize(self) -> None:
         self.config = ChatConfig.load(PROJECT_ROOT / "config" / "chat_config.json")
@@ -314,10 +322,22 @@ class DiscordConsoleState:
         training_dir = Path(os.environ.get("DISCORD_TRAINING_DIR", "data/discord_training"))
         if not training_dir.is_absolute():
             training_dir = PROJECT_ROOT / training_dir
+        try:
+            self.growth_tracker = GrowthTracker(
+                PROJECT_ROOT / "data" / "growth" / "growth.db",
+                timezone_name=(
+                    os.environ.get("DIARY_TIMEZONE", "Asia/Tokyo").strip()
+                    or "Asia/Tokyo"
+                ),
+            )
+        except Exception as e:
+            logger.error("[Discord] growth tracker 初期化失敗: %s", e)
+            self.growth_tracker = None
         self.training_log = DiscordTrainingLog(
             training_dir,
             enabled=parse_bool(os.environ.get("DISCORD_TRAINING_LOG_ENABLED"), default=True),
             system_prompt=self.config.system_prompt,
+            growth_tracker=self.growth_tracker,
         )
         self.web_search = create_web_search_context(self.config)
         if parse_bool(os.environ.get("DISCORD_SCREEN_CONTEXT_ENABLED"), default=False):
@@ -374,6 +394,12 @@ class DiscordConsoleState:
         self.tasks_quiet_hours = parse_quiet_hours(
             os.environ.get("TASKS_QUIET_HOURS"), default=(1, 8)
         )
+        self.event_remind_enabled = parse_bool(
+            os.environ.get("EVENT_REMIND_ENABLED"), default=True
+        )
+        self.event_remind_lead_min = parse_float(
+            os.environ.get("EVENT_REMIND_LEAD_MIN"), default=15.0
+        )
         self.tasks_timezone = self.diary_timezone
         self.tasks_board_enabled = parse_bool(
             os.environ.get("TASKS_BOARD_ENABLED"), default=True
@@ -389,6 +415,37 @@ class DiscordConsoleState:
         except Exception as e:
             logger.error("[Discord] task store 初期化失敗 (タスク機能なしで続行): %s", e)
             self.task_store = None
+        self.priority_enabled = parse_bool(
+            os.environ.get("PRIORITY_ENABLED"), default=True
+        )
+        self.priority_controller = None
+        if self.priority_enabled and self.task_store is not None:
+            try:
+                state_path = Path(
+                    os.environ.get("PRIORITY_STATE_PATH", "data/tasks/priority_state.json")
+                )
+                upcoming_path = Path(
+                    os.environ.get("PRIORITY_UPCOMING_PATH", "data/calendar/upcoming.json")
+                )
+                if not state_path.is_absolute():
+                    state_path = PROJECT_ROOT / state_path
+                if not upcoming_path.is_absolute():
+                    upcoming_path = PROJECT_ROOT / upcoming_path
+                self.priority_controller = PriorityController(
+                    self.task_store,
+                    state_path=state_path,
+                    upcoming_path=upcoming_path,
+                    timezone_name=self.tasks_timezone,
+                    skip_hours=parse_float(
+                        os.environ.get("PRIORITY_SKIP_HOURS"), default=2.0
+                    ),
+                    calendar_buffer_min=int(parse_float(
+                        os.environ.get("PRIORITY_CALENDAR_BUFFER_MIN"), default=10.0
+                    )),
+                )
+            except Exception as e:
+                logger.error("[Discord] priority controller 初期化失敗: %s", e)
+                self.priority_controller = None
         # タスク ⇔ Google Calendar 同期
         self.tasks_calendar_sync_enabled = parse_bool(
             os.environ.get("TASKS_CALENDAR_SYNC_ENABLED"), default=False
@@ -399,6 +456,12 @@ class DiscordConsoleState:
         self.calendar_sync_interval_min = parse_float(
             os.environ.get("CALENDAR_SYNC_INTERVAL_MIN"), default=20.0
         )
+        self.calendar_sync_days_ahead = int(parse_float(
+            os.environ.get("CALENDAR_SYNC_DAYS_AHEAD"), default=45.0
+        ))
+        self.calendar_pull_past_days = int(parse_float(
+            os.environ.get("CALENDAR_PULL_PAST_DAYS"), default=14.0
+        ))
         self.task_calendar_sync = None
         self.calendar_pull_worker = None
         # CalendarContext は upcoming.json を読むだけなので同期無効でも常に注入可
@@ -474,6 +537,8 @@ class DiscordConsoleState:
                 store=self.task_store,
                 timezone=self.tasks_timezone,
                 interval_min=self.calendar_sync_interval_min,
+                days_ahead=self.calendar_sync_days_ahead,
+                past_days=self.calendar_pull_past_days,
                 upcoming_path=str(PROJECT_ROOT / "data" / "calendar" / "upcoming.json"),
             )
             pull.start()
@@ -506,6 +571,11 @@ class DiscordConsoleState:
         if self.task_reminder_engine is not None:
             try:
                 self.task_reminder_engine.stop()
+            except Exception:
+                pass
+        if self.event_reminder_engine is not None:
+            try:
+                self.event_reminder_engine.stop()
             except Exception:
                 pass
         if self.task_board is not None:
@@ -699,6 +769,8 @@ class DiscordConsoleState:
                     screen_context=self.screen_context,
                     task_store=self.task_store,
                     calendar_context=self.calendar_context,
+                    growth_tracker=self.growth_tracker,
+                    conversation_source="discord",
                     emotion_tags=self.config.emotion_tag_enabled,
                 )
             else:
@@ -790,6 +862,15 @@ class DiscordConsoleState:
             num_predict=profile.num_predict,
             temperature=profile.temperature,
         )
+
+    def record_direct_reply(
+        self, message: discord.Message, user_text: str, assistant_text: str
+    ) -> None:
+        """LLMを介さない予定登録なども会話履歴・成長台帳へ1往復として残す。"""
+        session, lock, _profile = self.get_message_session(message)
+        with lock:
+            session.add_user_message(user_text)
+            session.add_assistant_message(assistant_text)
 
     def record_feedback(
         self,
@@ -993,6 +1074,31 @@ class DiscordConsoleState:
             logger.error("[Discord] quick task add failed: %s", e)
             return None
 
+    def try_register_event_text(self, text: str) -> str | None:
+        """予定登録の意図があれば Google Calendar に登録し結果文を返す。
+
+        意図が無ければ None (呼び出し側は通常の LLM 応答へ)。
+        ブロッキング (MCP 呼び出しで数秒) なので to_thread 経由で呼ぶこと。
+        """
+        try:
+            from src.tasks.event_intent import try_register_event
+
+            client = (
+                self.task_calendar_sync.client
+                if self.task_calendar_sync is not None
+                else None
+            )
+            return try_register_event(
+                text,
+                client=client,
+                calendar_id=self.tasks_calendar_id,
+                timezone_name=self.tasks_timezone,
+                upcoming_path=str(PROJECT_ROOT / "data" / "calendar" / "upcoming.json"),
+            )
+        except Exception as e:
+            logger.error("[Discord] event register failed: %s", e)
+            return None
+
     def status_text(self) -> str:
         assert self.config is not None
         checker = HealthChecker(ollama_url=self.config.ollama_base_url)
@@ -1026,6 +1132,9 @@ class DiscordConsoleState:
             f"tasks_reminder: {self.task_reminder_engine.is_running if self.task_reminder_engine else False}\n"
             f"tasks_open: {len(self.task_store.list('open')) if self.task_store else 0}\n"
             f"tasks_quiet_hours: {self.tasks_quiet_hours[0]}-{self.tasks_quiet_hours[1]}\n"
+            f"priority_controller: {self.priority_controller is not None}\n"
+            f"proactive_conversation: "
+            f"{self.proactive_bridge.conversation_status() if self.proactive_bridge else 'disabled'}\n"
             f"service_control: {self.allow_service_control}\n"
             f"{self.training_log.summary_text() if self.training_log else 'training_log: unavailable'}\n"
             f"checks: {health['checks']}"
@@ -1388,10 +1497,20 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
                 state.proactive_bridge.start()
                 cfg = state.proactive_bridge.config
                 logger.info(
-                    "[Discord] proactive started: channel=%s rewrite=%s interval=%ss",
+                    "[Discord] proactive started: channel=%s rewrite=%s interval=%ss "
+                    "chat=%s chat_interval=%sh idle=%smin daily_limit=%s "
+                    "max_backoff=%sh autoread=%s quiet=%s-%s",
                     cfg.channel_id,
                     cfg.llm_rewrite,
                     cfg.check_interval,
+                    cfg.conversation_enabled,
+                    cfg.conversation_interval_hours,
+                    cfg.conversation_idle_minutes,
+                    cfg.conversation_daily_limit,
+                    cfg.conversation_max_backoff_hours,
+                    cfg.conversation_autoread,
+                    cfg.quiet_hours[0],
+                    cfg.quiet_hours[1],
                 )
             _start_task_reminder()
             # カレンダー同期: schedule 洗い替えは ProactiveEngine と同じ
@@ -1405,6 +1524,7 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
                 state.start_calendar_sync(profile=shared_profile)
             except Exception as e:
                 logger.error("[Discord] calendar sync 起動失敗: %s", e)
+            _start_event_reminder()
         if not board_setup_started and board_manager.enabled:
             board_setup_started = True
             asyncio.create_task(board_manager.setup())
@@ -1436,6 +1556,93 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
         except Exception as e:
             logger.error("[Discord] task reminder 起動失敗 (タスク通知なしで続行): %s", e)
             state.task_reminder_engine = None
+
+    def _start_event_reminder() -> None:
+        """予定 (Google Calendar イベント) の開始前リマインドエンジンを起動する。
+
+        upcoming.json は calendar pull ワーカーが更新するため、カレンダー同期が
+        有効なときだけ意味を持つ。二重通知を防ぐため、起動時に ProactiveEngine の
+        gcal 由来 schedule リマインド (15分前) をスキップさせる。
+        """
+        if not state.event_remind_enabled or not state.tasks_calendar_sync_enabled:
+            logger.info(
+                "[Discord] event reminder disabled (enabled=%s, calendar_sync=%s)",
+                state.event_remind_enabled,
+                state.tasks_calendar_sync_enabled,
+            )
+            return
+        if state.event_reminder_engine is not None:
+            return
+        try:
+            from src.tasks.event_reminder import EventReminderEngine
+
+            engine = EventReminderEngine(
+                callback=event_reminder_callback,
+                upcoming_path=str(PROJECT_ROOT / "data" / "calendar" / "upcoming.json"),
+                db_path=str(PROJECT_ROOT / "data" / "tasks" / "tasks.db"),
+                lead_min=state.event_remind_lead_min,
+                timezone_name=state.tasks_timezone,
+                quiet_hours=state.tasks_quiet_hours,
+                check_interval=60.0,
+            )
+            engine.start()
+            state.event_reminder_engine = engine
+            if state.proactive_bridge is not None:
+                try:
+                    state.proactive_bridge.engine.skip_gcal_schedule = True
+                except Exception:
+                    pass
+            logger.info(
+                "[Discord] event reminder started: lead=%smin quiet_hours=%s-%s",
+                state.event_remind_lead_min,
+                state.tasks_quiet_hours[0],
+                state.tasks_quiet_hours[1],
+            )
+        except Exception as e:
+            logger.error("[Discord] event reminder 起動失敗 (予定通知なしで続行): %s", e)
+            state.event_reminder_engine = None
+
+    def event_reminder_callback(*, trigger_type: str, message: str, event_id: str, title: str) -> None:
+        """EventReminderEngine のスレッドから呼ばれる。bot ループへブリッジする。"""
+        loop = getattr(bot, "loop", None)
+        if loop is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(deliver_event_reminder(message), loop)
+        except Exception as e:
+            logger.error("[Discord] event reminder bridge error: %s", e)
+
+    async def deliver_event_reminder(message: str) -> None:
+        channel_id = state.resolve_task_channel_id()
+        if channel_id is None:
+            logger.warning("[Discord] event reminder: 配送先チャンネルが未設定")
+            return
+        channel = bot.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(channel_id)
+            except discord.HTTPException:
+                logger.warning("[Discord] event reminder: チャンネル取得失敗 %s", channel_id)
+                return
+        # 定型文をペルソナ口調へ言い換え (失敗時は原文)
+        try:
+            text = await asyncio.to_thread(state.rewrite_task_text, message)
+        except Exception:
+            text = message
+        emotion, text = parse_emotion_tag(text)
+        if not text:
+            text = message
+        try:
+            await channel.send(text)
+        except Exception as e:
+            logger.error("[Discord] event reminder send failed: %s", e)
+            return
+        # 通話接続中なら音声でも読み上げる (既存パターン)
+        if state.voice_tts is not None:
+            try:
+                asyncio.create_task(state.voice_tts.autoread(text, emotion=emotion))
+            except Exception:
+                pass
 
     def task_reminder_callback(*, trigger_type: str, message: str, task_id: int, stage: str) -> None:
         """リマインドエンジンのスレッドから呼ばれる。bot ループへブリッジする。"""
@@ -1585,6 +1792,18 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
             if task_match and state.task_store is not None:
                 await register_quick_task(message, task_match.group("body"), source="voice")
                 return
+            # 「予定〜入れて」も通話から直接 Google Calendar に登録する。
+            event_reply = await asyncio.to_thread(
+                state.try_register_event_text, transcript_text.strip()
+            )
+            if event_reply is not None:
+                await message.reply(event_reply, mention_author=False)
+                if state.voice_tts is not None:
+                    try:
+                        asyncio.create_task(state.voice_tts.autoread(event_reply))
+                    except Exception:
+                        pass
+                return
             # 話者ごとにバッファし、デバウンス満了で結合テキストを1回返信する。
             voice_reply_debouncer.submit(speaker, message, transcript_text)
             return
@@ -1630,6 +1849,14 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
         if not content:
             return
 
+        if state.proactive_bridge is not None:
+            control_reply = state.proactive_bridge.handle_conversation_control(
+                message.channel.id, content
+            )
+            if control_reply is not None:
+                await message.reply(control_reply, mention_author=False)
+                return
+
         correction = parse_correction(content)
         if correction is not None:
             result_text = state.record_correction(message, correction)
@@ -1642,9 +1869,29 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
             await register_quick_task(message, task_match.group("body"), source="command")
             return
 
+        # 「予定: ...」や「〜の予定入れて」は Google Calendar に登録する。
+        event_reply = await asyncio.to_thread(state.try_register_event_text, content)
+        if event_reply is not None:
+            await message.reply(event_reply, mention_author=False)
+            state.record_direct_reply(message, content, event_reply)
+            return
+
+        # 自発質問の直後なら質問文も一緒にLLM・学習ログへ渡す。
+        # 「カレーかな」のような短い返答でも、何への回答かを失わない。
+        llm_content = content
+        reply_source = "discord_auto_reply"
+        if state.proactive_bridge is not None:
+            llm_content, was_proactive_reply = state.proactive_bridge.contextualize_reply(
+                message.channel.id, content
+            )
+            if was_proactive_reply:
+                reply_source = "discord_proactive_reply"
+
         async with message.channel.typing():
             try:
-                response, _emotion = await asyncio.to_thread(state.ask_message, message)
+                response, _emotion = await asyncio.to_thread(
+                    state.ask_message_text, message, llm_content
+                )
             except Exception as e:
                 await message.reply(f"LLM error: `{e}`", mention_author=False)
                 return
@@ -1652,7 +1899,13 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
         for chunk in split_message(response):
             sent = await message.reply(chunk, mention_author=False)
             reply_messages.append(sent)
-        state.record_auto_reply(message, response, reply_messages)
+        state.record_auto_reply(
+            message,
+            response,
+            reply_messages,
+            user_text=llm_content,
+            source=reply_source,
+        )
         # 返信送信後に非同期でタスク抽出 (レイテンシに影響させない)。自動登録はしない。
         asyncio.create_task(maybe_offer_task_from_chat(message, content))
         if reply_messages:
@@ -2092,6 +2345,102 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
             state.refresh_task_board()
 
     bot.tree.add_command(task_group)
+
+    focus_group = app_commands.Group(
+        name="focus",
+        description="システムに次の1件を決めてもらいます",
+    )
+
+    async def _require_priority(interaction: discord.Interaction) -> PriorityController | None:
+        if not await require_allowed(interaction, state):
+            return None
+        if state.priority_controller is None:
+            await interaction.response.send_message(
+                "優先順位オーケストレーターが無効です。", ephemeral=True
+            )
+            return None
+        return state.priority_controller
+
+    @focus_group.command(name="now", description="今やる1件と、その決定理由を表示します")
+    async def focus_now(interaction: discord.Interaction) -> None:
+        controller = await _require_priority(interaction)
+        if controller is None:
+            return
+        decision = await asyncio.to_thread(controller.recommend)
+        await interaction.response.send_message(
+            format_focus_decision(decision, _tasks_tz()), ephemeral=True
+        )
+
+    @focus_group.command(name="start", description="今の1件を開始し、選択を固定します")
+    async def focus_start(interaction: discord.Interaction) -> None:
+        controller = await _require_priority(interaction)
+        if controller is None:
+            return
+        decision = await asyncio.to_thread(controller.start)
+        await interaction.response.send_message(
+            format_focus_decision(decision, _tasks_tz()), ephemeral=True
+        )
+
+    @focus_group.command(name="done", description="今の1件を完了し、次の1件を選びます")
+    async def focus_done(interaction: discord.Interaction) -> None:
+        controller = await _require_priority(interaction)
+        if controller is None:
+            return
+        completed, decision = await asyncio.to_thread(controller.complete)
+        prefix = "✅ 完了を記録しました。\n" if completed else "完了対象がなかったため、現在の推奨を表示します。\n"
+        await interaction.response.send_message(
+            prefix + format_focus_decision(decision, _tasks_tz()), ephemeral=True
+        )
+        if completed:
+            state.refresh_task_board()
+
+    @focus_group.command(name="next", description="今の1件を一時的に見送り、次を選びます")
+    async def focus_next(interaction: discord.Interaction) -> None:
+        controller = await _require_priority(interaction)
+        if controller is None:
+            return
+        decision = await asyncio.to_thread(controller.next)
+        await interaction.response.send_message(
+            "今の候補を一時的に見送りました。\n"
+            + format_focus_decision(decision, _tasks_tz()),
+            ephemeral=True,
+        )
+
+    @focus_group.command(name="pick", description="タスクIDを指定して今やる1件を上書きします")
+    @app_commands.describe(task_id="タスクID (/task list で確認)")
+    async def focus_pick(interaction: discord.Interaction, task_id: int) -> None:
+        controller = await _require_priority(interaction)
+        if controller is None:
+            return
+        decision = await asyncio.to_thread(controller.pick, task_id)
+        if decision is None:
+            await interaction.response.send_message(
+                f"未完了のタスク #{task_id} が見つかりません。", ephemeral=True
+            )
+            return
+        await interaction.response.send_message(
+            "手動指定を優先しました。\n" + format_focus_decision(decision, _tasks_tz()),
+            ephemeral=True,
+        )
+
+    @focus_group.command(name="status", description="委任状態と継続の記録を表示します")
+    async def focus_status(interaction: discord.Interaction) -> None:
+        controller = await _require_priority(interaction)
+        if controller is None:
+            return
+        status = await asyncio.to_thread(controller.status)
+        active = status["active_task_id"] or "-"
+        text = (
+            f"active_task: {active}\n"
+            f"started: {status['started']}\n"
+            f"completed_today: {status['completed_today']}\n"
+            f"streak_days: {status['streak_days']}\n"
+            f"decisions_delegated: {status['decision_count']}\n"
+            f"state_error: {status['last_error'] or '-'}"
+        )
+        await interaction.response.send_message(f"```text\n{text}\n```", ephemeral=True)
+
+    bot.tree.add_command(focus_group)
 
     async def correction_menu_callback(
         interaction: discord.Interaction,

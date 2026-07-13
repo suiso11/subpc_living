@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import sqlite3
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -28,6 +29,56 @@ class TaskStoreTest(unittest.TestCase):
         self.assertEqual(t["priority"], "high")
         self.assertEqual(t["status"], "open")
         self.assertEqual(t["action_hint"], "序論")
+        self.assertEqual(t["steps"][0], "序論")
+
+    def test_add_automatically_creates_first_step_and_three_or_fewer_steps(self) -> None:
+        tid = self.store.add("実験レポートを書く", now=self.now)
+        task = self.store.get(tid)
+        self.assertTrue(task["action_hint"])
+        self.assertEqual(task["steps"][0], task["action_hint"])
+        self.assertGreaterEqual(len(task["steps"]), 1)
+        self.assertLessEqual(len(task["steps"]), 3)
+
+    def test_regenerate_breakdown_uses_current_title(self) -> None:
+        tid = self.store.add("部屋の掃除", now=self.now)
+        self.store.update(tid, title="友人へメールを送る", now=self.now)
+        self.assertTrue(self.store.regenerate_breakdown(tid, now=self.now))
+        task = self.store.get(tid)
+        self.assertIn("要点", task["action_hint"])
+
+    def test_initialize_backfills_existing_open_task_idempotently(self) -> None:
+        legacy_path = str(Path(self._tmp.name) / "legacy.db")
+        conn = sqlite3.connect(legacy_path)
+        conn.execute(
+            """CREATE TABLE tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, note TEXT,
+                action_hint TEXT, due_at TEXT, due_granularity TEXT,
+                priority TEXT NOT NULL DEFAULT 'normal', status TEXT NOT NULL DEFAULT 'open',
+                source TEXT NOT NULL DEFAULT 'command', created_at TEXT NOT NULL,
+                completed_at TEXT
+            )"""
+        )
+        conn.execute(
+            "INSERT INTO tasks (title, status, source, created_at) VALUES (?, 'open', 'command', ?)",
+            ("部屋を掃除する", self.now.isoformat()),
+        )
+        conn.commit()
+        conn.close()
+
+        legacy = TaskStore(legacy_path, timezone_name="Asia/Tokyo").initialize()
+        try:
+            first = legacy.get(1)
+            self.assertTrue(first["action_hint"])
+            self.assertGreaterEqual(len(first["steps"]), 1)
+            before = list(first["steps"])
+        finally:
+            legacy.close()
+
+        legacy = TaskStore(legacy_path, timezone_name="Asia/Tokyo").initialize()
+        try:
+            self.assertEqual(legacy.get(1)["steps"], before)
+        finally:
+            legacy.close()
 
     def test_list_orders_by_due(self) -> None:
         far = self.store.add("far", due_at=self.now + timedelta(days=5), due_granularity="datetime", now=self.now)

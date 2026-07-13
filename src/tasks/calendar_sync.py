@@ -254,7 +254,8 @@ class CalendarPullWorker:
         store: Any = None,
         timezone: str = "Asia/Tokyo",
         interval_min: float = 20.0,
-        days_ahead: int = 7,
+        days_ahead: int = 45,
+        past_days: int = 14,
         upcoming_path: str | Path = "data/calendar/upcoming.json",
     ):
         self.client = calendar_client
@@ -264,6 +265,7 @@ class CalendarPullWorker:
         self.timezone = timezone
         self.interval_sec = max(60.0, interval_min * 60.0)
         self.days_ahead = max(1, days_ahead)
+        self.past_days = max(0, past_days)
         self.upcoming_path = Path(upcoming_path)
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
@@ -299,10 +301,11 @@ class CalendarPullWorker:
         tz = ZoneInfo(self.timezone)
         now = now or datetime.now(tz)
         today = now.astimezone(tz).date()
+        start_date = today - timedelta(days=self.past_days)
         end_date = today + timedelta(days=self.days_ahead - 1)
 
         result = self.client.list_events_range(
-            today, end_date, timezone=self.timezone, calendar_id=self.calendar_id
+            start_date, end_date, timezone=self.timezone, calendar_id=self.calendar_id
         )
         if not result.ok:
             _log(f"list_events_range failed: {result.error}")
@@ -313,7 +316,7 @@ class CalendarPullWorker:
         external = [e for e in all_events if TASK_MARKER_PREFIX not in (e.description or "")]
 
         self._reconcile_markers(all_events)
-        self._write_upcoming(external, now)
+        self._write_upcoming(external, now, start_date, end_date)
         if self.profile is not None:
             self._sync_profile_schedule(external, today, tz)
         return True
@@ -349,16 +352,28 @@ class CalendarPullWorker:
                 except Exception:
                     pass
 
-    def _write_upcoming(self, events: list[Any], now: datetime) -> None:
+    def _write_upcoming(
+        self,
+        events: list[Any],
+        now: datetime,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+    ) -> None:
         payload = {
             "generated_at": now.isoformat(),
             "timezone": self.timezone,
+            # 取得済み範囲 (UI 側で「この月はデータがある/ない」を判定するため)
+            "range": {
+                "start": start_date.isoformat() if start_date else "",
+                "end": end_date.isoformat() if end_date else "",
+            },
             "events": [
                 {
                     "title": e.title,
                     "start": e.start,
                     "end": e.end,
                     "location": e.location,
+                    "description": e.description,
                     "event_id": e.event_id,
                 }
                 for e in sorted(events, key=lambda x: x.sort_key)

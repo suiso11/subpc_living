@@ -7,6 +7,10 @@ from pathlib import Path
 import json
 import threading
 import uuid
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.growth.tracker import GrowthTracker
 
 
 GOOD_REACTION = "\N{THUMBS UP SIGN}"
@@ -31,10 +35,12 @@ class DiscordTrainingLog:
         *,
         enabled: bool = True,
         system_prompt: str = "",
+        growth_tracker: "GrowthTracker | None" = None,
     ):
         self.root_dir = Path(root_dir)
         self.enabled = enabled
         self.system_prompt = system_prompt
+        self.growth_tracker = growth_tracker
         self.conversations_path = self.root_dir / "conversations.jsonl"
         self.feedback_path = self.root_dir / "feedback.jsonl"
         self.candidates_path = self.root_dir / "training_candidates.jsonl"
@@ -132,6 +138,15 @@ class DiscordTrainingLog:
             self._last_turn_by_channel_id[channel_id] = turn
             for message_id in assistant_message_ids:
                 self._turns_by_assistant_message_id[message_id] = turn
+        if self.growth_tracker is not None:
+            try:
+                self.growth_tracker.record_signal(
+                    kind="training_turn",
+                    source=source,
+                    event_key=f"training:{turn['turn_id']}",
+                )
+            except Exception:
+                pass
         return turn["turn_id"]
 
     def get_turn_by_assistant_message_id(self, assistant_message_id: int) -> dict | None:
@@ -171,6 +186,16 @@ class DiscordTrainingLog:
             }
             self._append_jsonl(self.feedback_path, record)
             self._feedback_count += 1
+        if self.growth_tracker is not None:
+            try:
+                self.growth_tracker.record_signal(
+                    kind="feedback",
+                    source="discord",
+                    event_key=f"feedback:{record['feedback_id']}",
+                    metadata={"value": value},
+                )
+            except Exception:
+                pass
         return True
 
     def record_correction(
@@ -224,6 +249,15 @@ class DiscordTrainingLog:
             }
             self._append_jsonl(self.candidates_path, candidate)
             self._candidate_count += 1
+        if self.growth_tracker is not None:
+            try:
+                self.growth_tracker.record_signal(
+                    kind="correction",
+                    source="discord",
+                    event_key=f"correction:{candidate['candidate_id']}",
+                )
+            except Exception:
+                pass
         return CorrectionResult(True, "saved", turn_id=turn["turn_id"])
 
     def _build_sft_messages(self, user_text: str, assistant_text: str) -> list[dict]:

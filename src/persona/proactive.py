@@ -10,13 +10,29 @@ AI側から能動的に話しかけるトリガーを管理する
 - 長時間作業の休憩提案（2時間連続PC使用）
 - 時間帯の挨拶（朝の挨拶、深夜の声かけ）
 - PC異常の通知（高温、メモリ逼迫）
+- プロフィール学習につながる会話のきっかけ
 """
 import time
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional, Callable
 
 from src.persona.profile import UserProfile
+
+
+CONVERSATION_PROMPTS = (
+    "最近、時間を忘れてやってしまうくらいハマっていることってある？",
+    "作業するとき、静かな方が集中しやすい？ それとも音がある方がいい？",
+    "疲れているとき、どんなふうに声をかけられると一番助かる？",
+    "逆に、私にしてほしくない話し方や対応ってある？",
+    "最近よく聴く音楽や、つい選んでしまう音ってある？",
+    "一日の中で、いちばん頭が動きやすいのはだいたい何時ごろ？",
+    "今後、私に覚えておいてほしいことを一つ挙げるなら何？",
+    "気分転換したいとき、普段は何をすることが多い？",
+)
+
+# この時間以上ユーザーの操作が空いたら、前の作業は終了したとみなす。
+WORK_SESSION_GAP_SECONDS = 30 * 60
 
 
 class ProactiveEngine:
@@ -32,16 +48,34 @@ class ProactiveEngine:
         profile: UserProfile,
         check_interval: float = 60.0,
         monitor_context=None,
+        conversation_enabled: bool = False,
+        conversation_interval: float = 21600.0,
+        conversation_idle: float = 3600.0,
+        quiet_hours: tuple[int, int] = (1, 9),
+        conversation_gate: Optional[Callable[[], bool]] = None,
     ):
         """
         Args:
             profile: ユーザープロファイル
             check_interval: チェック間隔 (秒)
             monitor_context: MonitorContext (Phase 6) — PC状態チェック用
+            conversation_enabled: 学習向けの会話開始を有効にする
+            conversation_interval: 会話開始の最短間隔 (秒)
+            conversation_idle: 最後のユーザー活動から発話までの待機時間 (秒)
+            quiet_hours: 会話を開始しない時間帯 (開始時, 終了時)
+            conversation_gate: 永続状態や日次上限による追加の送信判定
         """
         self.profile = profile
         self.check_interval = check_interval
         self.monitor_context = monitor_context
+        self.conversation_enabled = conversation_enabled
+        self.conversation_idle = max(0.0, conversation_idle)
+        self.quiet_hours = quiet_hours
+        self.conversation_gate = conversation_gate
+        # EventReminderEngine (src/tasks/event_reminder.py) が有効なとき True。
+        # gcal: 由来の schedule エントリはそちらが通知するため、ここでは
+        # スキップして二重通知を防ぐ。
+        self.skip_gcal_schedule = False
 
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -54,11 +88,14 @@ class ProactiveEngine:
             "break_suggest": 3600,      # 1時間
             "greeting": 43200,          # 12時間
             "pc_alert": 600,            # 10分
+            "conversation_start": max(60.0, conversation_interval),
         }
 
         # 作業開始時刻の追跡
         self._session_start_time: Optional[float] = None
+        self._started_at: Optional[float] = None
         self._last_user_activity: float = time.time()
+        self._conversation_prompt_index = datetime.now().toordinal() % len(CONVERSATION_PROMPTS)
 
     def start(self, callback: Callable[[str, str], None]) -> None:
         """
@@ -66,12 +103,13 @@ class ProactiveEngine:
 
         Args:
             callback: トリガー発火時に呼ばれる callback(trigger_type, message)
-                trigger_type: "schedule_remind", "break_suggest", "greeting", "pc_alert"
+                trigger_type: "schedule_remind", "break_suggest", "greeting",
+                    "pc_alert", "conversation_start"
                 message: AIが発話すべきメッセージテキスト
         """
         self._callback = callback
         self._running = True
-        self._session_start_time = time.time()
+        self._started_at = time.time()
         self._thread = threading.Thread(target=self._check_loop, daemon=True)
         self._thread.start()
 
@@ -87,8 +125,19 @@ class ProactiveEngine:
         return self._running
 
     def notify_user_activity(self) -> None:
-        """ユーザーの操作を通知（休憩タイマーリセット）"""
-        self._last_user_activity = time.time()
+        """ユーザーの操作を通知し、連続作業セッションを更新する。
+
+        30分以上操作が空いた後の最初の操作は新しいセッションとする。
+        サービス起動時刻を作業開始としないことで、Bot の長時間稼働を
+        「数十時間の連続作業」と誤認するのを防ぐ。
+        """
+        now = time.time()
+        if (
+            self._session_start_time is None
+            or now - self._last_user_activity >= WORK_SESSION_GAP_SECONDS
+        ):
+            self._session_start_time = now
+        self._last_user_activity = now
 
     def _can_fire(self, trigger_type: str) -> bool:
         """クールダウン中でなければTrue"""
@@ -116,6 +165,7 @@ class ProactiveEngine:
                 self._check_break_suggest()
                 self._check_greeting()
                 self._check_pc_alert()
+                self._check_conversation_start()
             except Exception:
                 pass
 
@@ -135,6 +185,8 @@ class ProactiveEngine:
             time_str = item.get("time", "")
             title = item.get("title", "")
             if not time_str or not title:
+                continue
+            if self.skip_gcal_schedule and str(item.get("note", "")).startswith("gcal:"):
                 continue
 
             try:
@@ -176,10 +228,10 @@ class ProactiveEngine:
         now = datetime.now()
         hour = now.hour
 
-        # セッション開始直後（60秒以内）のみ挨拶
-        if self._session_start_time is None:
+        # エンジン開始直後（60秒以内）のみ挨拶
+        if self._started_at is None:
             return
-        if (time.time() - self._session_start_time) > 60:
+        if (time.time() - self._started_at) > 60:
             return
 
         # 時間帯に応じた挨拶
@@ -233,6 +285,40 @@ class ProactiveEngine:
             msg = "PCの状態に注意が必要です。" + "、".join(alerts) + "。"
             self._fire("pc_alert", msg)
 
+    def _check_conversation_start(self) -> None:
+        """会話が途切れているとき、プロフィール学習につながる質問を一つ送る。"""
+        if not self.conversation_enabled or not self._can_fire("conversation_start"):
+            return
+        now = datetime.now()
+        if self._is_quiet_hour(now.hour):
+            return
+        if (time.time() - self._last_user_activity) < self.conversation_idle:
+            return
+        if self.conversation_gate is not None:
+            try:
+                if not self.conversation_gate():
+                    return
+            except Exception:
+                # 状態ストア障害時は通知を増やさない側に倒す。
+                return
+
+        prompt = CONVERSATION_PROMPTS[
+            self._conversation_prompt_index % len(CONVERSATION_PROMPTS)
+        ]
+        self._conversation_prompt_index += 1
+        self._fire("conversation_start", prompt)
+
+    def _is_quiet_hour(self, hour: int) -> bool:
+        """日跨ぎにも対応した quiet hours 判定。start == end は無効扱い。"""
+        start, end = self.quiet_hours
+        start %= 24
+        end %= 24
+        if start == end:
+            return False
+        if start < end:
+            return start <= hour < end
+        return hour >= start or hour < end
+
     def get_status(self) -> dict:
         """APIレスポンス用"""
         now = time.time()
@@ -241,6 +327,9 @@ class ProactiveEngine:
             "check_interval": self.check_interval,
             "session_duration_min": round((now - self._session_start_time) / 60, 1) if self._session_start_time else 0,
             "last_activity_sec_ago": round(now - self._last_user_activity, 0),
+            "conversation_enabled": self.conversation_enabled,
+            "conversation_idle_sec": self.conversation_idle,
+            "quiet_hours": list(self.quiet_hours),
             "fired_triggers": {
                 k: round(now - v, 0) for k, v in self._last_fired.items()
             },

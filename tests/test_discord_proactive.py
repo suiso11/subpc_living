@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
+from src.persona.proactive import CONVERSATION_PROMPTS, ProactiveEngine
+from src.persona.conversation_loop import ConversationLoopStore
 from src.discord_bot.proactive_bridge import (
     ProactiveBridge,
     ProactiveConfig,
@@ -62,6 +65,13 @@ def _bridge(*, config, state, bot) -> ProactiveBridge:
         profile=None,
         monitor_context=None,
         engine=MagicMock(),
+        conversation_store=ConversationLoopStore(
+            None,
+            base_interval_sec=config.conversation_interval_hours * 3600,
+            reply_timeout_sec=config.conversation_reply_timeout_hours * 3600,
+            daily_limit=config.conversation_daily_limit,
+            max_backoff_sec=config.conversation_max_backoff_hours * 3600,
+        ),
     )
 
 
@@ -72,6 +82,13 @@ class ProactiveConfigTest(unittest.TestCase):
         self.assertIsNone(cfg.channel_id)
         self.assertTrue(cfg.llm_rewrite)
         self.assertEqual(cfg.check_interval, 60.0)
+        self.assertFalse(cfg.conversation_enabled)
+        self.assertEqual(cfg.conversation_interval_hours, 6.0)
+        self.assertEqual(cfg.conversation_idle_minutes, 60.0)
+        self.assertEqual(cfg.conversation_daily_limit, 1)
+        self.assertEqual(cfg.conversation_max_backoff_hours, 72.0)
+        self.assertFalse(cfg.conversation_autoread)
+        self.assertEqual(cfg.quiet_hours, (1, 9))
 
     def test_parses_values(self) -> None:
         cfg = ProactiveConfig.from_env(
@@ -80,22 +97,40 @@ class ProactiveConfigTest(unittest.TestCase):
                 "DISCORD_PROACTIVE_CHANNEL_ID": "12345",
                 "DISCORD_PROACTIVE_LLM_REWRITE": "false",
                 "DISCORD_PROACTIVE_CHECK_INTERVAL": "15",
+                "DISCORD_PROACTIVE_CHAT_ENABLED": "true",
+                "DISCORD_PROACTIVE_CHAT_INTERVAL_HOURS": "4",
+                "DISCORD_PROACTIVE_CHAT_IDLE_MINUTES": "30",
+                "DISCORD_PROACTIVE_CHAT_REPLY_TIMEOUT_HOURS": "8",
+                "DISCORD_PROACTIVE_CHAT_DAILY_LIMIT": "2",
+                "DISCORD_PROACTIVE_CHAT_MAX_BACKOFF_HOURS": "48",
+                "DISCORD_PROACTIVE_CHAT_AUTOREAD": "true",
+                "DISCORD_PROACTIVE_QUIET_HOURS": "23-7",
             }
         )
         self.assertTrue(cfg.enabled)
         self.assertEqual(cfg.channel_id, 12345)
         self.assertFalse(cfg.llm_rewrite)
         self.assertEqual(cfg.check_interval, 15.0)
+        self.assertTrue(cfg.conversation_enabled)
+        self.assertEqual(cfg.conversation_interval_hours, 4.0)
+        self.assertEqual(cfg.conversation_idle_minutes, 30.0)
+        self.assertEqual(cfg.conversation_reply_timeout_hours, 8.0)
+        self.assertEqual(cfg.conversation_daily_limit, 2)
+        self.assertEqual(cfg.conversation_max_backoff_hours, 48.0)
+        self.assertTrue(cfg.conversation_autoread)
+        self.assertEqual(cfg.quiet_hours, (23, 7))
 
     def test_invalid_channel_and_interval_fall_back(self) -> None:
         cfg = ProactiveConfig.from_env(
             {
                 "DISCORD_PROACTIVE_CHANNEL_ID": "not-an-int",
                 "DISCORD_PROACTIVE_CHECK_INTERVAL": "abc",
+                "DISCORD_PROACTIVE_QUIET_HOURS": "25-7",
             }
         )
         self.assertIsNone(cfg.channel_id)
         self.assertEqual(cfg.check_interval, 60.0)
+        self.assertEqual(cfg.quiet_hours, (1, 9))
 
 
 class RewriteMessageTest(unittest.TestCase):
@@ -164,6 +199,113 @@ class DeliverTest(unittest.TestCase):
 
         self.assertEqual(channel.sent, ["PCが高温です"])
 
+    def test_conversation_reply_keeps_prompt_context_once(self) -> None:
+        channel = _FakeChannel()
+        state = _state()
+        cfg = ProactiveConfig(
+            enabled=True,
+            channel_id=1,
+            llm_rewrite=False,
+            conversation_enabled=True,
+        )
+        bridge = _bridge(config=cfg, state=state, bot=_FakeBot(channel))
+
+        asyncio.run(bridge._deliver("conversation_start", "好きな音楽は？"))
+        contextualized, found = bridge.contextualize_reply(1, "ジャズかな")
+        plain, found_again = bridge.contextualize_reply(1, "もう一度")
+
+        self.assertTrue(found)
+        self.assertIn("好きな音楽は？", contextualized)
+        self.assertIn("ジャズかな", contextualized)
+        self.assertFalse(found_again)
+        self.assertEqual(plain, "もう一度")
+
+    def test_pending_conversation_survives_bridge_recreation(self) -> None:
+        store = ConversationLoopStore(
+            None,
+            base_interval_sec=3600,
+            reply_timeout_sec=3600,
+        )
+        cfg = ProactiveConfig(
+            enabled=True,
+            channel_id=1,
+            llm_rewrite=False,
+            conversation_enabled=True,
+        )
+        first = ProactiveBridge(
+            bot=_FakeBot(_FakeChannel()),
+            state=_state(),
+            config=cfg,
+            profile=None,
+            engine=MagicMock(),
+            conversation_store=store,
+        )
+        second = ProactiveBridge(
+            bot=_FakeBot(None),
+            state=_state(),
+            config=cfg,
+            profile=None,
+            engine=MagicMock(),
+            conversation_store=store,
+        )
+
+        asyncio.run(first._deliver("conversation_start", "最近の趣味は？"))
+        contextualized, found = second.contextualize_reply(1, "カメラ")
+
+        self.assertTrue(found)
+        self.assertIn("最近の趣味は？", contextualized)
+        self.assertIn("掘り下げ質問を1つまで", contextualized)
+
+    def test_conversation_start_is_not_autoread_by_default(self) -> None:
+        channel = _FakeChannel()
+        voice_tts = MagicMock()
+        cfg = ProactiveConfig(
+            enabled=True,
+            channel_id=1,
+            llm_rewrite=False,
+            conversation_enabled=True,
+            conversation_autoread=False,
+        )
+        bridge = _bridge(
+            config=cfg,
+            state=_state(voice_tts=voice_tts),
+            bot=_FakeBot(channel),
+        )
+
+        asyncio.run(bridge._deliver("conversation_start", "話す？"))
+
+        voice_tts.autoread.assert_not_called()
+
+    def test_pending_conversation_can_be_snoozed(self) -> None:
+        channel = _FakeChannel()
+        cfg = ProactiveConfig(
+            enabled=True,
+            channel_id=1,
+            llm_rewrite=False,
+            conversation_enabled=True,
+        )
+        bridge = _bridge(config=cfg, state=_state(), bot=_FakeBot(channel))
+        asyncio.run(bridge._deliver("conversation_start", "話す？"))
+
+        response = bridge.handle_conversation_control(1, "あとで")
+
+        self.assertIn("3時間", response)
+        self.assertFalse(bridge.conversation_store.has_pending(1))
+
+    def test_expired_conversation_context_is_discarded(self) -> None:
+        cfg = ProactiveConfig(
+            enabled=True,
+            channel_id=1,
+            conversation_reply_timeout_hours=1.0,
+        )
+        bridge = _bridge(config=cfg, state=_state(), bot=_FakeBot(None))
+        bridge.conversation_store.record_prompt(1, "古い質問", now=time.time() - 3601)
+
+        text, found = bridge.contextualize_reply(1, "返答")
+
+        self.assertFalse(found)
+        self.assertEqual(text, "返答")
+
     def test_deliver_missing_channel_does_not_raise(self) -> None:
         state = _state()
         cfg = ProactiveConfig(enabled=True, channel_id=999, llm_rewrite=False)
@@ -209,6 +351,113 @@ class OnTriggerBridgeTest(unittest.TestCase):
         bridge = _bridge(config=cfg, state=_state(), bot=_FakeBot(None, loop=None))
         # loop が無くても例外を出さない
         bridge._on_trigger("greeting", "hi")
+
+
+class ConversationStartTest(unittest.TestCase):
+    def test_fires_after_idle_and_respects_cooldown(self) -> None:
+        engine = ProactiveEngine(
+            profile=SimpleNamespace(),
+            conversation_enabled=True,
+            conversation_interval=3600,
+            conversation_idle=60,
+            quiet_hours=(0, 0),
+        )
+        fired: list[tuple[str, str]] = []
+        engine._callback = lambda trigger, message: fired.append((trigger, message))
+        engine._last_user_activity = time.time() - 61
+
+        engine._check_conversation_start()
+        engine._check_conversation_start()
+
+        self.assertEqual(len(fired), 1)
+        self.assertEqual(fired[0][0], "conversation_start")
+        self.assertIn(fired[0][1], CONVERSATION_PROMPTS)
+
+    def test_waits_for_idle_time(self) -> None:
+        engine = ProactiveEngine(
+            profile=SimpleNamespace(),
+            conversation_enabled=True,
+            conversation_idle=60,
+            quiet_hours=(0, 0),
+        )
+        fired = []
+        engine._callback = lambda trigger, message: fired.append((trigger, message))
+
+        engine._check_conversation_start()
+
+        self.assertEqual(fired, [])
+
+    def test_persistent_gate_can_suppress_conversation(self) -> None:
+        gate = MagicMock(return_value=False)
+        engine = ProactiveEngine(
+            profile=SimpleNamespace(),
+            conversation_enabled=True,
+            conversation_idle=0,
+            quiet_hours=(0, 0),
+            conversation_gate=gate,
+        )
+        fired = []
+        engine._callback = lambda trigger, message: fired.append((trigger, message))
+
+        engine._check_conversation_start()
+
+        gate.assert_called_once_with()
+        self.assertEqual(fired, [])
+
+    def test_quiet_hours_support_day_wrap(self) -> None:
+        engine = ProactiveEngine(
+            profile=SimpleNamespace(),
+            conversation_enabled=True,
+            quiet_hours=(23, 7),
+        )
+
+        self.assertTrue(engine._is_quiet_hour(23))
+        self.assertTrue(engine._is_quiet_hour(3))
+        self.assertFalse(engine._is_quiet_hour(12))
+
+
+class WorkSessionTest(unittest.TestCase):
+    def test_first_activity_starts_session_at_activity_time(self) -> None:
+        engine = ProactiveEngine(profile=SimpleNamespace())
+
+        with patch("src.persona.proactive.time.time", return_value=1000.0):
+            engine.notify_user_activity()
+
+        self.assertEqual(engine._session_start_time, 1000.0)
+        self.assertEqual(engine._last_user_activity, 1000.0)
+
+    def test_activity_after_30_minute_gap_starts_new_session(self) -> None:
+        engine = ProactiveEngine(profile=SimpleNamespace())
+        engine._session_start_time = 1000.0
+        engine._last_user_activity = 1100.0
+
+        with patch("src.persona.proactive.time.time", return_value=3000.0):
+            engine.notify_user_activity()
+
+        self.assertEqual(engine._session_start_time, 3000.0)
+        self.assertEqual(engine._last_user_activity, 3000.0)
+
+    def test_recent_activity_keeps_existing_session(self) -> None:
+        engine = ProactiveEngine(profile=SimpleNamespace())
+        engine._session_start_time = 1000.0
+        engine._last_user_activity = 2000.0
+
+        with patch("src.persona.proactive.time.time", return_value=2500.0):
+            engine.notify_user_activity()
+
+        self.assertEqual(engine._session_start_time, 1000.0)
+        self.assertEqual(engine._last_user_activity, 2500.0)
+
+    def test_service_uptime_alone_does_not_trigger_break(self) -> None:
+        engine = ProactiveEngine(profile=SimpleNamespace())
+        fired = []
+        engine._callback = lambda trigger, message: fired.append((trigger, message))
+        engine._last_user_activity = 200000.0
+
+        with patch("src.persona.proactive.time.time", return_value=200100.0):
+            engine._check_break_suggest()
+
+        self.assertEqual(fired, [])
 
 
 class NotifyActivityTest(unittest.TestCase):

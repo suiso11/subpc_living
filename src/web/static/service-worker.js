@@ -1,15 +1,21 @@
-const CACHE_NAME = 'subpc-living-v10';
+const CACHE_NAME = 'subpc-living-v22';
 const STATIC_ASSETS = [
   '/',
   '/tasks',
   '/logs',
+  '/achievements',
   '/static/index.html',
   '/static/tasks.html',
   '/static/logs.html',
+  '/static/achievements.html',
   '/static/style.css',
+  '/static/pop-theme.css',
+  '/static/shell-theme.css',
   '/static/app.js',
   '/static/tasks.js',
   '/static/logs.js',
+  '/static/achievements.js',
+  '/static/shell-ui.js',
   '/static/favicon.svg',
   '/static/manifest.json',
 ];

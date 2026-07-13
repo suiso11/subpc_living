@@ -9,9 +9,13 @@ const $$ = (sel) => document.querySelectorAll(sel);
 // --- 状態 ---
 let ws = null;
 let isStreaming = false;
-let sessionId = `web_${Date.now()}`;
+let sessionId = null;
 let currentAudio = null;
 let sttAvailable = false;
+let micUnavailableReason = '';
+let secureWebUrl = '';
+
+const SESSION_STORAGE_KEY = 'subpc_chat_session_id';
 
 // --- 音声録音状態 ---
 let mediaRecorder = null;
@@ -29,6 +33,201 @@ const settingsPanel = $('#settings-panel');
 const voiceSelect = $('#voice-select');
 const micBtn = $('#mic-btn');
 const sttStatus = $('#stt-status');
+const growthPanel = $('#growth-panel');
+const growthProgress = growthPanel?.querySelector('.growth-progress');
+let lastGrowthPoints = null;
+const gameHub = $('#game-hub');
+const gameToggle = $('#game-toggle');
+const gameDetails = $('#game-details');
+const GAME_PANEL_KEY = 'subpc_game_panel_open';
+let lastClaimableMissions = null;
+
+function formatCount(value) {
+  return Number(value || 0).toLocaleString('ja-JP');
+}
+
+async function loadGrowth({ animate = false } = {}) {
+  if (!growthPanel) return;
+  try {
+    const resp = await fetch('/api/growth?days=14', { cache: 'no-store' });
+    if (!resp.ok) throw new Error(`growth ${resp.status}`);
+    const data = await resp.json();
+    if (!data.enabled) throw new Error('growth disabled');
+    growthPanel.classList.remove('growth-unavailable');
+
+    const points = Number(data.growth_points || 0);
+    const previous = lastGrowthPoints;
+    lastGrowthPoints = points;
+    $('#growth-level').textContent = `Lv.${data.level || 1}`;
+    $('#growth-points').textContent = formatCount(points);
+    $('#growth-today').textContent = `+${formatCount(data.today_points)}`;
+    $('#growth-streak').textContent = formatCount(data.streak_days);
+    $('#growth-memory').textContent = formatCount(data.asset_counts?.retrievable_memories);
+    $('#growth-corrections').textContent = formatCount(data.asset_counts?.correction_candidates);
+    growthPanel.title = data.metric_note || growthPanel.title;
+
+    const progress = Math.max(0, Math.min(100, Number(data.level_progress || 0)));
+    $('#growth-progress-bar').style.width = `${progress}%`;
+    if (growthProgress) growthProgress.setAttribute('aria-valuenow', String(progress));
+
+    const daily = Array.isArray(data.daily) ? data.daily : [];
+    const maxPoints = Math.max(1, ...daily.map((day) => Number(day.points || 0)));
+    const chart = $('#growth-chart');
+    chart.replaceChildren(...daily.map((day) => {
+      const bar = document.createElement('span');
+      const value = Number(day.points || 0);
+      bar.style.height = `${Math.max(value > 0 ? 18 : 4, Math.round(value / maxPoints * 100))}%`;
+      bar.className = value > 0 ? 'active' : '';
+      bar.title = `${day.date}：${value} pt・${day.turns || 0}往復`;
+      return bar;
+    }));
+
+    if (animate && previous !== null && points > previous) {
+      const delta = points - previous;
+      const badge = $('#growth-delta');
+      badge.textContent = `+${formatCount(delta)}`;
+      badge.hidden = false;
+      growthPanel.classList.remove('growth-pulse');
+      void growthPanel.offsetWidth;
+      growthPanel.classList.add('growth-pulse');
+      setTimeout(() => { badge.hidden = true; }, 2400);
+    }
+  } catch (e) {
+    growthPanel.classList.add('growth-unavailable');
+    console.warn('[Growth] Fetch failed:', e);
+  }
+}
+
+function setGameOpen(open) {
+  if (!gameDetails || !gameToggle) return;
+  gameDetails.hidden = !open;
+  gameToggle.setAttribute('aria-expanded', String(open));
+  $('#game-toggle-icon').textContent = open ? '−' : '＋';
+  try { localStorage.setItem(GAME_PANEL_KEY, open ? 'open' : 'closed'); } catch (e) {}
+}
+
+function missionCard(mission) {
+  const card = document.createElement('article');
+  card.className = `mission-card${mission.complete ? ' complete' : ''}${mission.claimed ? ' claimed' : ''}`;
+
+  const name = document.createElement('strong');
+  name.textContent = mission.name;
+  const detail = document.createElement('span');
+  detail.className = 'mission-detail';
+  detail.textContent = mission.detail;
+
+  const progress = document.createElement('div');
+  progress.className = 'mission-progress';
+  progress.setAttribute('aria-label', `${mission.current}/${mission.target}`);
+  const progressBar = document.createElement('span');
+  progressBar.style.width = `${Math.min(100, mission.current / mission.target * 100)}%`;
+  progress.appendChild(progressBar);
+
+  const action = document.createElement('button');
+  action.type = 'button';
+  action.className = mission.complete && !mission.claimed
+    ? 'primary-btn compact mission-claim'
+    : 'secondary-btn compact mission-claim';
+  if (mission.claimed) {
+    action.textContent = '受取済み';
+    action.disabled = true;
+  } else if (mission.complete) {
+    action.textContent = `+${mission.reward} pt 受け取る`;
+    action.addEventListener('click', () => claimMission(mission.id, action));
+  } else {
+    action.textContent = `${mission.current} / ${mission.target}`;
+    action.disabled = true;
+  }
+
+  card.append(name, detail, progress, action);
+  return card;
+}
+
+function badgeCard(badge) {
+  const card = document.createElement('div');
+  card.className = `badge-card${badge.unlocked ? ' unlocked' : ' locked'}`;
+  card.title = badge.detail;
+  const mark = document.createElement('span');
+  mark.className = 'badge-mark';
+  mark.textContent = badge.unlocked ? badge.mark : '？';
+  const name = document.createElement('strong');
+  name.textContent = badge.name;
+  card.append(mark, name);
+  return card;
+}
+
+function starterButton(starter) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'starter-btn';
+  button.textContent = starter.label;
+  button.addEventListener('click', () => {
+    messageInput.value = starter.prompt;
+    messageInput.dispatchEvent(new Event('input'));
+    setGameOpen(false);
+    messageInput.focus();
+  });
+  return button;
+}
+
+function renderGame(data, { animate = false } = {}) {
+  if (!gameHub || !data?.enabled) return;
+  gameHub.classList.remove('game-unavailable');
+  $('#game-rank').textContent = `相棒ランク：${data.rank.name}`;
+  const claimable = Number(data.claimable_missions || 0);
+  $('#game-quest-summary').textContent = claimable > 0
+    ? `報酬 ${claimable}個` : `${data.completed_missions || 0} / 3 達成`;
+  $('#game-next-rank').textContent = data.rank.next
+    ? `次は Lv.${data.rank.next.level}「${data.rank.next.name}」` : '最高ランク';
+  $('#game-badge-summary').textContent = `${data.unlocked_badges || 0} / ${data.badges.length}`;
+  $('#game-mission-list').replaceChildren(...data.missions.map(missionCard));
+  $('#game-badge-list').replaceChildren(...data.badges.map(badgeCard));
+  $('#game-starter-list').replaceChildren(...data.starters.map(starterButton));
+
+  if (animate && lastClaimableMissions !== null && claimable > lastClaimableMissions) {
+    gameHub.classList.remove('game-ready');
+    void gameHub.offsetWidth;
+    gameHub.classList.add('game-ready');
+  }
+  lastClaimableMissions = claimable;
+}
+
+async function loadGame({ animate = false } = {}) {
+  if (!gameHub) return;
+  try {
+    const resp = await fetch('/api/game', { cache: 'no-store' });
+    if (!resp.ok) throw new Error(`game ${resp.status}`);
+    renderGame(await resp.json(), { animate });
+  } catch (e) {
+    gameHub.classList.add('game-unavailable');
+    console.warn('[Game] Fetch failed:', e);
+  }
+}
+
+async function claimMission(missionId, button) {
+  button.disabled = true;
+  try {
+    const resp = await fetch('/api/game/claim', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mission_id: missionId }),
+    });
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) throw new Error(data.error || `claim ${resp.status}`);
+    renderGame(data.state);
+    const toast = $('#game-toast');
+    toast.textContent = data.claimed_now
+      ? `報酬 +${data.reward} pt を受け取りました！` : 'この報酬は受取済みです。';
+    gameHub.classList.remove('game-reward');
+    void gameHub.offsetWidth;
+    gameHub.classList.add('game-reward');
+    await loadGrowth({ animate: true });
+  } catch (e) {
+    $('#game-toast').textContent = '報酬を受け取れませんでした。もう一度お試しください。';
+    button.disabled = false;
+    console.warn('[Game] Claim failed:', e);
+  }
+}
 
 // ============================================
 //  WebSocket 接続
@@ -209,7 +408,7 @@ function finishResponse(fullText) {
     if (ttsToggle.checked) {
       const playBtn = document.createElement('button');
       playBtn.className = 'tts-play-btn';
-      playBtn.innerHTML = '🔊 再生';
+      playBtn.textContent = 'もう一度読む';
       playBtn.dataset.text = fullText;
       playBtn.addEventListener('click', () => replayTTS(playBtn));
       currentBubble.appendChild(document.createElement('br'));
@@ -223,6 +422,8 @@ function finishResponse(fullText) {
   setMicState('idle');
   updateUI();
   scrollToBottom();
+  loadGrowth({ animate: true });
+  loadGame({ animate: true });
 }
 
 function showError(message) {
@@ -286,7 +487,7 @@ async function replayTTS(btn) {
   if (!text) return;
 
   btn.classList.add('playing');
-  btn.innerHTML = '🔊 再生中...';
+  btn.textContent = '読んでいます…';
 
   try {
     const resp = await fetch('/api/tts', {
@@ -310,12 +511,12 @@ async function replayTTS(btn) {
       URL.revokeObjectURL(url);
       currentAudio = null;
       btn.classList.remove('playing');
-      btn.innerHTML = '🔊 再生';
+      btn.textContent = 'もう一度読む';
     };
   } catch (e) {
     console.error('[TTS]', e);
     btn.classList.remove('playing');
-    btn.innerHTML = '🔊 再生';
+    btn.textContent = 'もう一度読む';
   }
 }
 
@@ -325,14 +526,15 @@ async function replayTTS(btn) {
 
 function setMicState(state) {
   micBtn.classList.remove('recording', 'processing', 'disabled');
+  sttStatus.classList.remove('actionable');
   switch (state) {
     case 'recording':
       micBtn.classList.add('recording');
-      sttStatus.textContent = '🎤 録音中... タップで停止';
+      sttStatus.textContent = '聞いています。もう一度押すと止まります';
       break;
     case 'processing':
       micBtn.classList.add('processing');
-      sttStatus.textContent = '⏳ 音声認識中...';
+      sttStatus.textContent = 'ことばにしています…';
       break;
     case 'disabled':
       micBtn.classList.add('disabled');
@@ -345,10 +547,54 @@ function setMicState(state) {
   }
 }
 
-async function toggleRecording() {
+function showMicStatus(message, linkUrl = '') {
+  sttStatus.replaceChildren(document.createTextNode(message));
+  sttStatus.classList.toggle('actionable', Boolean(linkUrl));
+  if (linkUrl) {
+    const link = document.createElement('a');
+    link.href = linkUrl;
+    link.textContent = '安全な接続で開く';
+    sttStatus.appendChild(link);
+  }
+}
+
+function showMicUnavailable() {
+  if (micUnavailableReason === 'secure_context') {
+    showMicStatus('マイクはHTTPS接続で使えます。', secureWebUrl);
+  } else if (micUnavailableReason === 'unsupported_browser') {
+    showMicStatus('このブラウザは音声入力に対応していません。');
+  } else {
+    showMicStatus('いま音声入力は使えません。');
+  }
+}
+
+function configureMicAvailability(status) {
+  sttAvailable = Boolean(status.stt);
+  secureWebUrl = typeof status.secure_web_url === 'string' ? status.secure_web_url : '';
   if (!sttAvailable) {
-    sttStatus.textContent = '⚠️ STTが利用できません';
-    setTimeout(() => { sttStatus.textContent = ''; }, 3000);
+    micUnavailableReason = 'stt_unavailable';
+  } else if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
+    micUnavailableReason = 'secure_context';
+  } else if (typeof window.MediaRecorder === 'undefined') {
+    micUnavailableReason = 'unsupported_browser';
+  } else {
+    micUnavailableReason = '';
+  }
+  if (micUnavailableReason) {
+    setMicState('disabled');
+    micBtn.title = micUnavailableReason === 'secure_context'
+      ? 'HTTPSで開くと音声入力できます'
+      : '音声入力は使えません';
+  } else {
+    setMicState('idle');
+    micBtn.title = '音声入力';
+  }
+  micBtn.setAttribute('aria-label', micBtn.title);
+}
+
+async function toggleRecording() {
+  if (!sttAvailable || micUnavailableReason) {
+    showMicUnavailable();
     return;
   }
 
@@ -362,6 +608,12 @@ async function toggleRecording() {
 }
 
 async function startRecording() {
+  if (!navigator.mediaDevices?.getUserMedia || typeof window.MediaRecorder === 'undefined') {
+    micUnavailableReason = window.isSecureContext ? 'unsupported_browser' : 'secure_context';
+    setMicState('disabled');
+    showMicUnavailable();
+    return;
+  }
   try {
     // マイク権限を要求
     recordingStream = await navigator.mediaDevices.getUserMedia({
@@ -404,11 +656,18 @@ async function startRecording() {
   } catch (err) {
     console.error('[Mic] Error:', err);
     if (err.name === 'NotAllowedError') {
-      sttStatus.textContent = '⚠️ マイクの使用が許可されていません';
+      showMicStatus('ブラウザのサイト設定でマイクを許可してください。');
+    } else if (err.name === 'NotFoundError') {
+      showMicStatus('使えるマイクが見つかりません。');
+    } else if (err.name === 'NotReadableError') {
+      showMicStatus('マイクが別のアプリで使用中です。');
+    } else if (err.name === 'SecurityError') {
+      micUnavailableReason = 'secure_context';
+      setMicState('disabled');
+      showMicUnavailable();
     } else {
-      sttStatus.textContent = `⚠️ マイクエラー: ${err.message}`;
+      showMicStatus(`マイクを開けません: ${err.message}`);
     }
-    setTimeout(() => { sttStatus.textContent = ''; }, 5000);
   }
 }
 
@@ -467,7 +726,7 @@ async function processRecordedAudio() {
 
   // 最小サイズチェック (録音が短すぎないか)
   if (blob.size < 1000) {
-    sttStatus.textContent = '⚠️ 録音が短すぎます';
+    sttStatus.textContent = 'もう少し長く話してみてください';
     setTimeout(() => { sttStatus.textContent = ''; }, 3000);
     setMicState('idle');
     return;
@@ -498,7 +757,7 @@ async function processRecordedAudio() {
       // AI応答プレースホルダー
       createAssistantBubble();
     } else {
-      sttStatus.textContent = '⚠️ 接続が切れています';
+      sttStatus.textContent = '接続が切れています';
       setTimeout(() => { sttStatus.textContent = ''; }, 3000);
       setMicState('idle');
     }
@@ -544,14 +803,21 @@ async function changeVoice() {
   }
 }
 
+function saveSessionId() {
+  try { localStorage.setItem(SESSION_STORAGE_KEY, sessionId); } catch (e) {}
+}
+
 function newSession() {
+  if (isStreaming) return;
   sessionId = `web_${Date.now()}`;
+  saveSessionId();
+  currentBubble = null;
   chatArea.innerHTML = `
     <div class="welcome">
       <div class="welcome-orb">✦</div>
-      <h2>subpc_living</h2>
-      <p>会話、音声入力、読み上げ</p>
-      <a class="welcome-link" href="/tasks">タスクを見る →</a>
+      <h2>新しい話をしよう！</h2>
+      <p>ここからは別の話題です。</p>
+      <a class="welcome-link" href="/tasks">やることを見る →</a>
     </div>
   `;
 }
@@ -561,16 +827,15 @@ function newSession() {
 // ============================================
 
 async function init() {
+  await Promise.all([loadGrowth(), loadGame()]);
+
   // 状態取得
   try {
     const resp = await fetch('/api/status');
     const status = await resp.json();
 
-    // STT 利用可能かチェック
-    sttAvailable = !!status.stt;
-    if (!sttAvailable) {
-      setMicState('disabled');
-    }
+    // STTサーバーと、ブラウザ側のHTTPS/録音APIを別々に確認する
+    configureMicAvailability(status);
 
     if (status.tts_voices && voiceSelect) {
       voiceSelect.innerHTML = '';
@@ -584,6 +849,41 @@ async function init() {
     }
   } catch (e) {
     console.warn('[Init] Status fetch failed:', e);
+  }
+
+  // セッション復元: localStorage に保存IDがあればそれを、無ければ最新履歴を引継ぎ
+  let savedId = null;
+  try { savedId = localStorage.getItem(SESSION_STORAGE_KEY); } catch (e) {}
+
+  try {
+    const resumeUrl = savedId
+      ? `/api/chat/resume?session_id=${encodeURIComponent(savedId)}`
+      : '/api/chat/resume';
+    const resp = await fetch(resumeUrl, { cache: 'no-store' });
+    if (resp.ok) {
+      const data = await resp.json();
+      if (data.session_id) {
+        sessionId = data.session_id;
+        try { localStorage.setItem(SESSION_STORAGE_KEY, sessionId); } catch (e) {}
+      }
+      if (data.messages && data.messages.length > 0) {
+        for (const m of data.messages) {
+          if (m.role === 'user' || m.role === 'assistant') {
+            addMessage(m.role, m.content);
+          }
+        }
+      }
+    } else if (savedId && resp.status === 404) {
+      // 保存IDはあるが履歴未作成 → 空セッションを維持し最新へは勝手に戻らない
+      sessionId = savedId;
+    }
+  } catch (e) {
+    console.warn('[Init] Resume failed:', e);
+  }
+
+  if (!sessionId) {
+    sessionId = `web_${Date.now()}`;
+    try { localStorage.setItem(SESSION_STORAGE_KEY, sessionId); } catch (e) {}
   }
 
   // WebSocket接続
@@ -610,6 +910,10 @@ async function init() {
   $('#settings-btn').addEventListener('click', openSettings);
   $('#settings-close').addEventListener('click', closeSettings);
   $('#new-session-btn').addEventListener('click', newSession);
+  gameToggle?.addEventListener('click', () => setGameOpen(gameDetails.hidden));
+  let savedGamePanel = 'closed';
+  try { savedGamePanel = localStorage.getItem(GAME_PANEL_KEY) || 'closed'; } catch (e) {}
+  setGameOpen(savedGamePanel === 'open');
   voiceSelect.addEventListener('change', changeVoice);
 
   settingsPanel.addEventListener('click', (e) => {
@@ -620,6 +924,14 @@ async function init() {
     navigator.serviceWorker.register('/static/service-worker.js').catch((e) => {
       console.warn('[PWA] Service worker registration failed:', e);
     });
+  }
+
+  // 「やること」の最初の一歩を、現在の会話へ持ち込む。自動送信はせず確認できる状態にする。
+  const prompt = new URLSearchParams(window.location.search).get('prompt');
+  if (prompt) {
+    messageInput.value = prompt.slice(0, 1000);
+    messageInput.dispatchEvent(new Event('input'));
+    window.history.replaceState({}, '', window.location.pathname);
   }
 
   messageInput.focus();

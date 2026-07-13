@@ -1,0 +1,7 @@
+# Lightweight Windows-native client. The AI backend keeps using requirements.txt.
+# Keep the native shell on the Qt 6.8 LTS ABI we build and smoke-test.
+# Later Qt 6.x releases can add new Windows system-DLL requirements.
+PySide6>=6.8.3,<6.9
+httpx>=0.27.0
+sounddevice>=0.4.6
+numpy>=1.26.4,<2

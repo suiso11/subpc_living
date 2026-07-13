@@ -5,37 +5,50 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <meta name="theme-color" content="#0b0d11">
-  <title>ログ - subpc_living</title>
+  <meta name="theme-color" content="#120B0A">
+  <title>記録 | SUBPC BUDDY</title>
   <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
   <link rel="manifest" href="/static/manifest.json">
   <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/pop-theme.css">
+  <link rel="stylesheet" href="/static/shell-theme.css">
 </head>
 <body class="tasks-page">
   <div class="task-app">
-    <header class="task-header">
-      <div class="task-brand">
+    <header class="task-header site-header">
+      <div class="task-brand site-brand">
         <span class="task-brand-mark"></span>
-        <span>subpc_living</span>
+        <span>SUBPC BUDDY</span>
       </div>
       <nav class="top-nav" aria-label="画面切替">
-        <a class="top-nav-link" href="/">会話</a>
-        <a class="top-nav-link" href="/tasks">タスク</a>
-        <a class="top-nav-link active" href="/logs">ログ</a>
+        <a class="top-nav-link" href="/">話す</a>
+        <a class="top-nav-link" href="/tasks">やること</a>
+        <a class="top-nav-link active" href="/logs">記録</a>
+        <a class="top-nav-link" href="/achievements">実績</a>
       </nav>
+      <div class="site-actions">
+        <button class="utility-btn" id="log-refresh-btn" type="button" title="表示中の記録を読み直す">
+          <span aria-hidden="true">↻</span><span class="utility-label">読み直す</span>
+        </button>
+      </div>
     </header>
 
     <main class="task-workspace">
+      <section class="page-heading" aria-labelledby="logs-page-title">
+        <div>
+          <span class="page-label">ふりかえり</span>
+          <h1 id="logs-page-title">記録をみる</h1>
+          <p>会話やシステムの動きを、ここから確認できます。</p>
+        </div>
+      </section>
+
       <section class="task-controlbar log-controlbar" aria-label="ログ切替">
         <div class="controlbar-left">
           <div class="segmented" id="log-tab-seg" role="tablist" aria-label="ログ種別">
-            <button class="segmented-btn active" data-tab="journal" type="button" role="tab">サービス</button>
-            <button class="segmented-btn" data-tab="files" type="button" role="tab">アプリログ</button>
-            <button class="segmented-btn" data-tab="history" type="button" role="tab">会話ログ</button>
+            <button class="segmented-btn active" data-tab="journal" type="button" role="tab">システム</button>
+            <button class="segmented-btn" data-tab="files" type="button" role="tab">アプリ</button>
+            <button class="segmented-btn" data-tab="history" type="button" role="tab">会話</button>
           </div>
-        </div>
-        <div class="task-toolbar-actions">
-          <button class="secondary-btn" id="log-refresh-btn" type="button">更新</button>
         </div>
       </section>
 
@@ -69,5 +82,6 @@
   </div>
 
   <script src="/static/logs.js"></script>
+  <script src="/static/shell-ui.js"></script>
 </body>
 </html>

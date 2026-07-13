@@ -1,17 +1,22 @@
 {
-  "name": "subpc_living",
-  "short_name": "subpc",
-  "description": "subpc_living personal assistant",
+  "name": "SUBPC BUDDY",
+  "short_name": "BUDDY",
+  "description": "いつもの続きを話せるパーソナルアシスタント",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
-  "background_color": "#0b0d11",
-  "theme_color": "#0b0d11",
+  "background_color": "#120B0A",
+  "theme_color": "#120B0A",
   "shortcuts": [
     {
-      "name": "タスク",
-      "short_name": "タスク",
+      "name": "やること",
+      "short_name": "やること",
       "url": "/tasks"
+    },
+    {
+      "name": "実績",
+      "short_name": "実績",
+      "url": "/achievements"
     }
   ],
   "icons": [
