@@ -8,13 +8,18 @@ Item {
     id: page
     property var backend
     function focusComposer() { composer.forceActiveFocus() }
+    function setComposer(value) { composer.text = value; composer.forceActiveFocus() }
+    function maxDailyPoints() {
+        const days = backend.growth.daily || []
+        return Math.max(1, ...days.map(day => Number(day.points || 0)))
+    }
 
     ColumnLayout {
         anchors.fill: parent
         spacing: 12
         Rectangle {
             Layout.fillWidth: true
-            implicitHeight: 88
+            implicitHeight: 112
             radius: Theme.radius
             color: Theme.panel
             border.color: Theme.lineSoft
@@ -31,9 +36,36 @@ Item {
                         color: Theme.text; font.family: Theme.uiFont; font.bold: true; font.pixelSize: 24
                     }
                 }
-                Label { text: Number(backend.game.points || 0).toLocaleString() + " GP"; color: Theme.text; font.family: Theme.monoFont; font.bold: true; font.pixelSize: 18 }
+                ColumnLayout {
+                    spacing: 3
+                    Label { text: "Lv." + Number(backend.growth.level || 1) + "  ·  " + Number(backend.growth.growth_points || backend.game.points || 0).toLocaleString() + " GP"; color: Theme.text; font.family: Theme.monoFont; font.bold: true; font.pixelSize: 15 }
+                    Label { text: "今日 +" + Number(backend.growth.today_points || 0) + "  /  " + Number(backend.growth.streak_days || 0) + "日連続"; color: Theme.textMuted; font.family: Theme.uiFont; font.pixelSize: 10 }
+                    RowLayout {
+                        spacing: 3
+                        Repeater {
+                            model: backend.growth.daily || []
+                            delegate: Rectangle {
+                                id: growthBar
+                                required property var modelData
+                                implicitWidth: 5
+                                implicitHeight: 24
+                                color: "transparent"
+                                Rectangle {
+                                    anchors.bottom: parent.bottom
+                                    width: parent.width
+                                    height: Math.max(3, 24 * Number(growthBar.modelData.points || 0) / page.maxDailyPoints())
+                                    radius: 2
+                                    color: Number(growthBar.modelData.points || 0) > 0 ? Theme.accent : Theme.lineSoft
+                                }
+                            }
+                        }
+                    }
+                }
                 Rectangle { implicitWidth: 1; Layout.fillHeight: true; color: Theme.lineSoft }
-                Label { text: backend.connected ? "● ONLINE" : "○ OFFLINE"; color: backend.connected ? Theme.green : Theme.warning; font.family: Theme.monoFont; font.pixelSize: 11 }
+                ColumnLayout {
+                    Label { text: backend.connected ? "● ONLINE" : "○ OFFLINE"; color: backend.connected ? Theme.green : Theme.warning; font.family: Theme.monoFont; font.pixelSize: 11 }
+                    BuddyButton { text: "＋ 新しい会話"; onClicked: backend.newSession() }
+                }
             }
         }
 
@@ -59,7 +91,7 @@ Item {
                     height: bubble.implicitHeight
                     Rectangle {
                         id: bubble
-                        implicitHeight: messageText.implicitHeight + 28
+                        implicitHeight: Math.max(48, messageText.implicitHeight + 28)
                         width: Math.min(messageList.width * 0.78, Math.max(200, messageText.implicitWidth + 30))
                         x: modelData.role === "user" ? messageList.width - width : 0
                         radius: Theme.radius
@@ -68,12 +100,29 @@ Item {
                         Label {
                             id: messageText
                             anchors.fill: parent
-                            anchors.margins: 14
+                            anchors.leftMargin: 14
+                            anchors.topMargin: 14
+                            anchors.bottomMargin: 14
+                            anchors.rightMargin: modelData.role === "assistant" ? 46 : 14
                             text: modelData.content || ""
                             color: modelData.role === "user" ? Theme.background : Theme.text
                             font.family: Theme.uiFont
                             font.pixelSize: 15
                             wrapMode: Text.Wrap
+                        }
+                        Button {
+                            id: replayButton
+                            visible: modelData.role === "assistant" && String(modelData.content || "").length > 0
+                            anchors.right: parent.right
+                            anchors.bottom: parent.bottom
+                            anchors.margins: 8
+                            implicitWidth: 30; implicitHeight: 30
+                            text: "▶"
+                            ToolTip.visible: hovered
+                            ToolTip.text: "この返答を読み上げる"
+                            onClicked: backend.replayText(modelData.content || "")
+                            background: Rectangle { radius: 15; color: replayButton.hovered ? Theme.accent : "transparent"; border.color: Theme.lineSoft }
+                            contentItem: Label { text: replayButton.text; color: replayButton.hovered ? Theme.background : Theme.textMuted; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter; font.pixelSize: 10 }
                         }
                     }
                 }
@@ -86,6 +135,21 @@ Item {
                     font.pixelSize: 15
                 }
                 ScrollBar.vertical: ScrollBar {}
+            }
+        }
+
+        RowLayout {
+            Layout.fillWidth: true
+            visible: messageList.count === 0 && (backend.game.starters || []).length > 0
+            spacing: 6
+            Repeater {
+                model: backend.game.starters || []
+                delegate: BuddyButton {
+                    required property var modelData
+                    Layout.fillWidth: true
+                    text: modelData.label
+                    onClicked: page.setComposer(modelData.prompt)
+                }
             }
         }
 

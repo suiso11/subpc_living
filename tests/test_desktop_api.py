@@ -25,16 +25,38 @@ class DesktopApiTest(unittest.TestCase):
 
         def handler(request: httpx.Request) -> httpx.Response:
             self.requests.append(request)
-            if request.url.path == "/api/status":
+            path = request.url.path
+            method = request.method
+            if path == "/api/status":
                 return httpx.Response(200, json={"model": "test-model", "tasks": True})
-            if request.url.path == "/api/tasks" and request.method == "GET":
+            if path == "/api/tasks" and method == "GET":
                 return httpx.Response(200, json={"tasks": [{"id": 1, "title": "一歩"}]})
-            if request.url.path == "/api/tasks" and request.method == "POST":
+            if path == "/api/tasks" and method == "POST":
                 return httpx.Response(201, json={"task": {"id": 2, "title": "追加"}})
-            if request.url.path == "/api/game":
+            if path == "/api/tasks/preview" and method == "POST":
+                return httpx.Response(200, json={"title": json.loads(request.content)["text"], "due_at": None, "priority": "normal"})
+            if path.endswith("/snooze") and method == "POST":
+                return httpx.Response(200, json={"ok": True, "until": "2026-01-01T00:00:00+00:00"})
+            if path == "/api/growth":
+                return httpx.Response(200, json={"enabled": True, "growth_points": 5})
+            if path == "/api/game":
                 return httpx.Response(200, json={"enabled": True, "badges": []})
-            if request.url.path == "/api/chat/resume":
+            if path == "/api/chat/resume":
                 return httpx.Response(200, json={"session_id": "desktop_1", "messages": []})
+            if path == "/api/calendar/events" and method == "GET":
+                return httpx.Response(200, json={"events": [{"event_id": "evt1"}], "writable": True})
+            if path == "/api/calendar/events" and method == "POST":
+                return httpx.Response(201, json={"event": {"event_id": "new1"}})
+            if path.startswith("/api/calendar/events/"):
+                return httpx.Response(200, json={"ok": True})
+            if path == "/api/tts" and method == "POST":
+                return httpx.Response(200, content=b"RIFF..WAV", headers={"Content-Type": "audio/wav"})
+            if path == "/api/tts/voice" and method == "POST":
+                return httpx.Response(200, json={"voice": json.loads(request.content)["voice"], "description": "声"})
+            if path == "/api/logs/files" and method == "GET":
+                return httpx.Response(200, json={"files": [{"name": "subpc-web.log"}]})
+            if path.startswith("/api/logs/files/") and method == "GET":
+                return httpx.Response(200, json={"name": path.rsplit("/", 1)[-1], "lines": ["line1"]})
             return httpx.Response(200, json={"ok": True})
 
         self.api = DesktopApi(
@@ -80,6 +102,35 @@ class DesktopApiTest(unittest.TestCase):
                 api.add_task("")
         finally:
             api.close()
+
+    def test_growth_preview_and_snooze_contracts(self) -> None:
+        self.assertEqual(self.api.growth(30)["growth_points"], 5)
+        self.assertEqual(self.requests[-1].url.params["days"], "30")
+        self.assertEqual(self.api.preview_task("明日18時 資料")["title"], "明日18時 資料")
+        self.assertEqual(json.loads(self.requests[-1].content), {"text": "明日18時 資料"})
+        self.assertTrue(self.api.snooze_task(5, "30m")["ok"])
+        self.assertEqual(self.requests[-1].url.path, "/api/tasks/5/snooze")
+        self.assertEqual(json.loads(self.requests[-1].content), {"when": "30m"})
+
+    def test_calendar_event_crud_contracts(self) -> None:
+        result = self.api.calendar_events("2026-01-01", "2026-01-31")
+        self.assertTrue(result["writable"])
+        self.assertEqual(dict(self.requests[-1].url.params), {"start": "2026-01-01", "end": "2026-01-31"})
+        self.api.create_calendar_event("会議", "2026-01-02", time="10:00", duration_min=45, location="A", description="資料")
+        self.assertEqual(json.loads(self.requests[-1].content), {"title": "会議", "date": "2026-01-02", "time": "10:00", "duration_min": 45, "location": "A", "description": "資料"})
+        self.api.update_calendar_event("event/a", {"title": "変更"})
+        self.assertEqual(self.requests[-1].method, "PATCH")
+        self.assertEqual(self.requests[-1].url.path, "/api/calendar/events/event/a")
+        self.api.delete_calendar_event("event/a")
+        self.assertEqual(self.requests[-1].method, "DELETE")
+
+    def test_tts_and_application_log_contracts(self) -> None:
+        self.assertTrue(self.api.synthesize("こんにちは").startswith(b"RIFF"))
+        self.assertEqual(json.loads(self.requests[-1].content), {"text": "こんにちは"})
+        self.assertEqual(self.api.set_tts_voice("ja-A")["voice"], "ja-A")
+        self.assertEqual(self.api.log_files()["files"][0]["name"], "subpc-web.log")
+        self.assertEqual(self.api.log_file("subpc-web.log", 5)["lines"], ["line1"])
+        self.assertEqual(self.requests[-1].url.params["lines"], "10")
 
 
 class DesktopSettingsTest(unittest.TestCase):

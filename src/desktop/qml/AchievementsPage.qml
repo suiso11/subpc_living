@@ -7,6 +7,13 @@ import "."
 Item {
     id: page
     property var backend
+    property string badgeFilter: "all"
+    function filteredBadges() {
+        const badges = backend.game.badges || []
+        if (badgeFilter === "unlocked") return badges.filter(badge => badge.unlocked)
+        if (badgeFilter === "locked") return badges.filter(badge => !badge.unlocked)
+        return badges
+    }
 
     Flickable {
         anchors.fill: parent
@@ -98,14 +105,26 @@ Item {
                 }
             }
 
-            Label { text: "コレクション"; color: Theme.text; font.family: Theme.uiFont; font.bold: true; font.pixelSize: 18 }
+            RowLayout {
+                Layout.fillWidth: true
+                Label { Layout.fillWidth: true; text: "コレクション"; color: Theme.text; font.family: Theme.uiFont; font.bold: true; font.pixelSize: 18 }
+                Repeater {
+                    model: [{ label: "すべて", value: "all" }, { label: "解除済み", value: "unlocked" }, { label: "挑戦中", value: "locked" }]
+                    delegate: BuddyButton {
+                        required property var modelData
+                        text: modelData.label
+                        accent: page.badgeFilter === modelData.value
+                        onClicked: page.badgeFilter = modelData.value
+                    }
+                }
+            }
             GridLayout {
                 Layout.fillWidth: true
                 columns: width > 900 ? 3 : 2
                 columnSpacing: 10
                 rowSpacing: 10
                 Repeater {
-                    model: backend.game.badges || []
+                    model: page.filteredBadges()
                     delegate: Rectangle {
                         id: badgeCard
                         required property var modelData

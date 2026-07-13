@@ -24,13 +24,14 @@ ApplicationWindow {
         serverInput.forceActiveFocus()
     }
     function refreshCurrentPage() {
-        if (currentPage === 0) bridge.resumeChat()
-        else if (currentPage === 1) bridge.loadTasks()
+        if (currentPage === 0) { bridge.resumeChat(); bridge.loadGame(); bridge.loadGrowth() }
+        else if (currentPage === 1) { bridge.loadTasks(); if (taskPage.mode === 1) taskPage.openCalendar() }
         else if (currentPage === 2) logsPage.activate()
         else bridge.loadGame()
     }
     onCurrentPageChanged: {
-        if (currentPage === 1) bridge.loadTasks()
+        if (currentPage === 0) { bridge.loadGame(); bridge.loadGrowth() }
+        else if (currentPage === 1) bridge.loadTasks()
         else if (currentPage === 2) logsPage.activate()
         else if (currentPage === 3) bridge.loadGame()
     }
@@ -218,10 +219,10 @@ ApplicationWindow {
             Layout.fillWidth: true
             Layout.fillHeight: true
             currentIndex: root.currentPage
-            ChatPage { id: chatPage; backend: bridge }
-            TasksPage { id: taskPage; backend: bridge }
-            LogsPage { id: logsPage; backend: bridge }
-            AchievementsPage { id: achievementsPage; backend: bridge }
+            ChatPage { id: chatPage; objectName: "chatPage"; backend: bridge }
+            TasksPage { id: taskPage; objectName: "taskPage"; backend: bridge }
+            LogsPage { id: logsPage; objectName: "logsPage"; backend: bridge }
+            AchievementsPage { id: achievementsPage; objectName: "achievementsPage"; backend: bridge }
         }
     }
 
@@ -286,6 +287,22 @@ ApplicationWindow {
                 }
                 Switch { checked: bridge.ttsEnabled; onToggled: bridge.setTtsEnabled(checked) }
             }
+            RowLayout {
+                Layout.fillWidth: true
+                ColumnLayout {
+                    Layout.fillWidth: true; spacing: 2
+                    Label { text: "読み上げる声"; color: Theme.text; font.family: Theme.uiFont; font.bold: true; font.pixelSize: 13 }
+                    Label { text: "返答の自動読み上げと再生ボタンに使います"; color: Theme.textMuted; font.family: Theme.uiFont; font.pixelSize: 10 }
+                }
+                BuddyComboBox {
+                    id: voiceSelector
+                    Layout.preferredWidth: 220
+                    model: (bridge.ttsVoices || []).map(voice => voice.label)
+                    currentIndex: Math.max(0, (bridge.ttsVoices || []).findIndex(voice => voice.id === bridge.ttsVoice))
+                    enabled: count > 0
+                    onActivated: function(index) { bridge.setTtsVoice(bridge.ttsVoices[index].id) }
+                }
+            }
             Rectangle { Layout.fillWidth: true; implicitHeight: 1; color: Theme.lineSoft }
             Label { text: "グローバル呼び出し  Ctrl + Alt + Space"; color: Theme.accent; font.family: Theme.monoFont; font.pixelSize: 11 }
             RowLayout {
@@ -306,6 +323,7 @@ ApplicationWindow {
     }
 
     Shortcut { sequence: "Ctrl+K"; onActivated: commandPalette.openPalette() }
+    Shortcut { sequence: "Ctrl+N"; onActivated: { root.currentPage = 0; bridge.newSession() } }
     Shortcut { sequence: "Alt+1"; onActivated: root.currentPage = 0 }
     Shortcut { sequence: "Alt+2"; onActivated: root.currentPage = 1 }
     Shortcut { sequence: "Alt+3"; onActivated: root.currentPage = 2 }
