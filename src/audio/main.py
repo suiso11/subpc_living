@@ -36,6 +36,8 @@ def main():
                         help="Vision (映像入力) を無効化")
     parser.add_argument("--camera-id", type=int, default=0,
                         help="カメラデバイスID (default: 0)")
+    parser.add_argument("--screen", action="store_true",
+                        help="Screen (画面認識: スクリーンショット→VLM描写) を有効化")
     parser.add_argument("--no-monitor", action="store_true",
                         help="Monitor (PCログ収集) を無効化")
     parser.add_argument("--no-persona", action="store_true",
@@ -81,6 +83,7 @@ def run_voice_mode(args):
         enable_rag=not args.no_rag,
         enable_vision=not args.no_vision,
         camera_id=args.camera_id,
+        enable_screen=args.screen,
         enable_monitor=not args.no_monitor,
         enable_persona=not args.no_persona,
         enable_wakeword=args.wakeword,
@@ -97,16 +100,18 @@ def run_voice_mode(args):
 
 def run_text_to_speech_mode(args):
     """テキスト入力 → LLM応答 → TTS再生モード"""
-    from src.audio.tts import KokoroTTS
     from src.audio.audio_io import AudioPlayer
+    from src.audio.tts_factory import backend_name, create_tts_backend
     from src.chat.client import OllamaClient
     from src.chat.session import ChatSession
     from src.chat.config import ChatConfig
+    from src.chat.web_search import create_web_search_context
 
     config = ChatConfig.load(PROJECT_ROOT / "config" / "chat_config.json")
+    web_search = create_web_search_context(config)
 
-    # TTS初期化 (kokoro-onnx)
-    tts = KokoroTTS(
+    # TTS初期化
+    tts = create_tts_backend(
         models_dir=PROJECT_ROOT / "models" / "tts" / "kokoro",
         voice=args.tts_voice,
     )
@@ -124,10 +129,12 @@ def run_text_to_speech_mode(args):
         system_prompt=config.system_prompt,
         max_history_turns=config.max_history_turns,
         history_dir=str(PROJECT_ROOT / config.history_dir),
+        web_search=web_search,
     )
 
     print(f"{Color.DIM}テキスト入力 → LLM応答 → 音声再生モード{Color.RESET}")
     print(f"{Color.DIM}モデル: {config.model}{Color.RESET}")
+    print(f"{Color.DIM}TTS: {backend_name(tts)} / {tts.voice}{Color.RESET}")
     print(f"{Color.YELLOW}Ctrl+C で終了{Color.RESET}\n")
 
     try:
@@ -151,6 +158,7 @@ def run_text_to_speech_mode(args):
                 top_k=config.top_k,
                 num_ctx=config.num_ctx,
                 repeat_penalty=config.repeat_penalty,
+                num_predict=config.num_predict,
             ):
                 print(token, end="", flush=True)
                 response += token

@@ -45,8 +45,12 @@ class IdleManager:
         self.deep_idle_timeout = deep_idle_timeout
         self.check_interval = check_interval
 
-        self._state = self.STATE_ACTIVE
-        self._last_activity: float = time.time()
+        # 起動直後は daemon が --initial-mode idle で GPU を idle にしているため、
+        # IdleManager 側も IDLE から始める。最初の推論で active に遷移して wake が走る。
+        self._state = self.STATE_IDLE
+        # idle_timeout を過ぎた過去時刻にしておくことで、active 遷移後の
+        # notify_inference_end → すぐ idle 判定される誤動作を防ぐ
+        self._last_activity: float = time.time() - idle_timeout
         self._lock = threading.Lock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -55,6 +59,10 @@ class IdleManager:
         self._gpu_managers: list[GpuPowerManager] = []
         self._gpu_power_control_enabled = False
         self._gpu_power_control_reason = "GPU なし"
+
+        # GPU復帰処理の重複抑制 (同じ wake を連打しない)
+        self._wake_lock = threading.Lock()
+        self._wake_in_progress = False
 
         # 外部コンポーネント参照 (任意で設定)
         self._monitor_context = None
@@ -84,7 +92,7 @@ class IdleManager:
         self._gpu_managers = create_all_managers()
         if self._gpu_managers:
             names = [m.get_gpu_info().get("name", f"GPU{m.gpu_id}") for m in self._gpu_managers]
-            logger.info(f"IdleManager: GPU電力管理対象: {', '.join(names)}")
+            print(f"[IdleManager] GPU電力管理対象: {', '.join(names)}", flush=True)
             ok, msg = self._gpu_managers[0].probe_power_control()
             if ok:
                 self._gpu_power_control_enabled = True
@@ -92,7 +100,7 @@ class IdleManager:
             else:
                 self._gpu_power_control_enabled = False
                 self._gpu_power_control_reason = msg
-                logger.info("IdleManager: GPU電力制御は無効 (%s)", self._gpu_power_control_reason)
+                print(f"[IdleManager] GPU電力制御は無効 ({self._gpu_power_control_reason})", flush=True)
         else:
             self._gpu_power_control_enabled = False
             self._gpu_power_control_reason = "nvidia-smi 未検出"
@@ -100,8 +108,7 @@ class IdleManager:
         self._running = True
         self._thread = threading.Thread(target=self._check_loop, daemon=True)
         self._thread.start()
-        logger.info("IdleManager: 起動 (idle=%ds, deep_idle=%ds)",
-                     int(self.idle_timeout), int(self.deep_idle_timeout))
+        print(f"[IdleManager] 起動 (idle={int(self.idle_timeout)}s, deep_idle={int(self.deep_idle_timeout)}s)", flush=True)
 
     def stop(self) -> None:
         """アイドルマネージャーを停止"""
@@ -109,7 +116,7 @@ class IdleManager:
         if self._thread:
             self._thread.join(timeout=5)
             self._thread = None
-        logger.info("IdleManager: 停止")
+        print("[IdleManager] 停止", flush=True)
 
     @property
     def state(self) -> str:
@@ -141,10 +148,34 @@ class IdleManager:
                 self._state = self.STATE_ACTIVE
                 self._on_become_active(old_state)
 
-    def notify_inference_start(self) -> None:
-        """LLM 推論開始を通知 → GPU をアクティブモードに"""
-        self.notify_activity()
-        self._set_gpu_active()
+    def notify_inference_start(self, wait_for_gpu: bool = False) -> None:
+        """LLM 推論開始を通知 → GPU をアクティブモードに
+
+        ホットパスをブロックしないため、GPU 電力切替は別スレッドで実行する。
+        daemon 呼び出し + nvidia-smi が数秒かかっても推論開始は待たされない。
+        既にアクティブ状態なら GPU 切替は発行しない (冗長呼び出し抑制)。
+
+        Args:
+            wait_for_gpu: True の場合は GPU 電力切替の完了を待つ。
+                STT のように直後に GPU を使う処理で指定する。
+        """
+        with self._lock:
+            self._last_activity = time.time()
+            transitioned = self._state != self.STATE_ACTIVE
+            if transitioned:
+                old_state = self._state
+                self._state = self.STATE_ACTIVE
+                print(f"[IdleManager] {old_state} → active (推論開始)", flush=True)
+                self._restore_monitor_vision()
+        wake_running = False
+        if wait_for_gpu:
+            with self._wake_lock:
+                wake_running = self._wake_in_progress
+
+        if wait_for_gpu and (transitioned or wake_running):
+            self._set_gpu_active_blocking()
+        elif transitioned:
+            self._set_gpu_active_async()
 
     def notify_inference_end(self) -> None:
         """LLM 推論終了を通知 (アクティビティタイマーリセット)"""
@@ -157,7 +188,7 @@ class IdleManager:
             try:
                 self._check_idle_state()
             except Exception as e:
-                logger.error(f"IdleManager チェックエラー: {e}")
+                print(f"[IdleManager] チェックエラー: {e}", flush=True)
             time.sleep(self.check_interval)
 
     def _check_idle_state(self) -> None:
@@ -177,45 +208,44 @@ class IdleManager:
 
     def _on_become_idle(self) -> None:
         """アイドル状態に遷移した時の処理"""
-        logger.info("IdleManager: → idle (GPU省電力モード)")
+        print("[IdleManager] active → idle (GPU省電力モード)", flush=True)
         self._set_gpu_idle()
 
     def _on_become_deep_idle(self) -> None:
         """ディープアイドル状態に遷移した時の処理"""
-        logger.info("IdleManager: → deep_idle (リソース縮小)")
+        print("[IdleManager] idle → deep_idle (リソース縮小)", flush=True)
         # Monitor 収集間隔を延長
         if self._monitor_context is not None:
             try:
                 self._monitor_context.collector.interval = self._monitor_idle_interval
-                logger.info(f"  Monitor 収集間隔: {self._monitor_idle_interval}s")
             except Exception as e:
-                logger.warning(f"  Monitor 間隔変更失敗: {e}")
+                print(f"[IdleManager] Monitor 間隔変更失敗: {e}", flush=True)
 
         # Vision 解析を一時停止
         if self._vision_context is not None:
             try:
                 self._vision_context.pause()
-                logger.info("  Vision 解析: 一時停止")
             except AttributeError:
                 pass  # pause メソッドがない場合は無視
             except Exception as e:
-                logger.warning(f"  Vision 一時停止失敗: {e}")
+                print(f"[IdleManager] Vision 一時停止失敗: {e}", flush=True)
 
     def _on_become_active(self, from_state: str) -> None:
-        """アクティブ状態に復帰した時の処理"""
-        logger.info(f"IdleManager: {from_state} → active")
+        """アクティブ状態に復帰した時の処理 (notify_activity 経由)
 
-        # GPU アクティブモードに復帰
-        self._set_gpu_active()
+        GPU 復帰は非同期化し、Monitor/Vision のみ同期で戻す。
+        """
+        print(f"[IdleManager] {from_state} → active", flush=True)
+        self._restore_monitor_vision()
+        self._set_gpu_active_async()
 
-        # Monitor 収集間隔を戻す
+    def _restore_monitor_vision(self) -> None:
+        """Monitor 収集間隔と Vision 解析をアクティブ設定に戻す"""
         if self._monitor_context is not None:
             try:
                 self._monitor_context.collector.interval = self._monitor_default_interval
             except Exception:
                 pass
-
-        # Vision 解析を再開
         if self._vision_context is not None:
             try:
                 self._vision_context.resume()
@@ -223,6 +253,47 @@ class IdleManager:
                 pass
             except Exception:
                 pass
+
+    def _set_gpu_active_async(self) -> None:
+        """GPU アクティブ化をバックグラウンドスレッドで実行 (重複抑制付き)"""
+        if not self._gpu_power_control_enabled:
+            return
+        with self._wake_lock:
+            if self._wake_in_progress:
+                return  # 既に wake 中
+            self._wake_in_progress = True
+
+        def _worker() -> None:
+            try:
+                self._set_gpu_active()
+            finally:
+                with self._wake_lock:
+                    self._wake_in_progress = False
+
+        threading.Thread(target=_worker, daemon=True, name="gpu-wake").start()
+
+    def _set_gpu_active_blocking(self) -> None:
+        """GPU アクティブ化を同期実行する。
+
+        STT 開始直前など、GPU が省電力のまま走ると初回処理が遅くなる経路で使う。
+        """
+        if not self._gpu_power_control_enabled:
+            return
+        waited_existing_wake = False
+        while True:
+            with self._wake_lock:
+                if not self._wake_in_progress:
+                    if waited_existing_wake:
+                        return
+                    self._wake_in_progress = True
+                    break
+            waited_existing_wake = True
+            time.sleep(0.05)
+        try:
+            self._set_gpu_active()
+        finally:
+            with self._wake_lock:
+                self._wake_in_progress = False
 
     def _set_gpu_idle(self) -> None:
         """全 GPU をアイドルモードに設定"""
@@ -233,14 +304,14 @@ class IdleManager:
                 continue
             ok, msg = mgr.set_idle_mode()
             if ok:
-                logger.info(f"  GPU{mgr.gpu_id}: idle ({mgr.idle_watts}W)")
+                print(f"[IdleManager] GPU{mgr.gpu_id}: idle ({mgr.idle_watts}W)", flush=True)
             else:
-                logger.warning(f"  GPU{mgr.gpu_id}: idle設定失敗 ({msg})")
-                if (not mgr.power_control_available
-                        or "権限" in msg or "permission" in msg.lower()):
+                print(f"[IdleManager] GPU{mgr.gpu_id}: idle設定失敗 ({msg})", flush=True)
+                # 明示的な権限エラーのみ恒久無効化 (一時エラーは次回再試行)
+                if "権限" in msg or "permission" in msg.lower() or "Insufficient" in msg:
                     self._gpu_power_control_enabled = False
                     self._gpu_power_control_reason = msg
-                    logger.info("IdleManager: GPU電力制御を無効化 (%s)", msg)
+                    print(f"[IdleManager] GPU電力制御を無効化 ({msg})", flush=True)
                     return
 
     def _set_gpu_active(self) -> None:
@@ -252,14 +323,14 @@ class IdleManager:
                 continue
             ok, msg = mgr.set_active_mode()
             if ok:
-                logger.info(f"  GPU{mgr.gpu_id}: active ({mgr.active_watts}W)")
+                print(f"[IdleManager] GPU{mgr.gpu_id}: active ({mgr.active_watts}W)", flush=True)
             else:
-                logger.warning(f"  GPU{mgr.gpu_id}: active設定失敗 ({msg})")
-                if (not mgr.power_control_available
-                        or "権限" in msg or "permission" in msg.lower()):
+                print(f"[IdleManager] GPU{mgr.gpu_id}: active設定失敗 ({msg})", flush=True)
+                # 明示的な権限エラーのみ恒久無効化 (一時エラーは次回再試行)
+                if "権限" in msg or "permission" in msg.lower() or "Insufficient" in msg:
                     self._gpu_power_control_enabled = False
                     self._gpu_power_control_reason = msg
-                    logger.info("IdleManager: GPU電力制御を無効化 (%s)", msg)
+                    print(f"[IdleManager] GPU電力制御を無効化 ({msg})", flush=True)
                     return
 
     def get_status(self) -> dict:

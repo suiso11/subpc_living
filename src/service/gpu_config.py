@@ -1,11 +1,12 @@
 """
 GPU 検出・デバイス自動設定モジュール
 Phase 9: GPU換装に伴い、VRAM容量に応じて最適なデバイス設定を自動決定する。
-Phase 10: デュアルGPU対応 (P40 + RTX 2070 Super)
+Phase 10: デュアルGPU対応
 
 構成:
 - P40 (24GB, Compute 6.1): LLM専用 (Ollama)
-- RTX 2070 Super (8GB, Compute 7.5, Tensor Cores): 推論用 (STT/Embedding/Vision)
+- RTX 2070 Super 等の Tensor Core GPU: 推論用 (STT/Embedding/Vision)
+- P5000 等の Pascal GPU: 推論用にできるが float16 は避ける
 - 単GPU: 従来のプロファイルで動作
 - GPUなし: 全てCPU
 """
@@ -31,6 +32,7 @@ class GpuInfo:
     driver_version: str = ""
     index: int = 0
     compute_capability: str = ""
+    torch_compatible: bool = True
 
 
 @dataclass
@@ -85,17 +87,37 @@ def detect_all_gpus() -> list[GpuInfo]:
             return []
 
         gpus = []
-        # CUDA利用可能かチェック (1回だけ)
         cuda_available = False
+        torch_supported_caps: list[tuple[int, int]] = []
         try:
             import torch
             cuda_available = torch.cuda.is_available()
+            if cuda_available and hasattr(torch.cuda, 'get_arch_list'):
+                for arch in torch.cuda.get_arch_list():
+                    if arch.startswith("sm_"):
+                        try:
+                            num = int(arch[3:])
+                            torch_supported_caps.append((num // 10, num % 10))
+                        except ValueError:
+                            pass
         except ImportError:
-            cuda_available = True  # nvidia-smiがあればCUDA利用可能と推定
+            cuda_available = True
+        except Exception:
+            pass
 
         for line in result.stdout.strip().splitlines():
             parts = [p.strip() for p in line.split(",")]
             if len(parts) >= 4:
+                compute_cap = parts[4] if len(parts) >= 5 else ""
+                torch_ok = True
+                if compute_cap and cuda_available and torch_supported_caps:
+                    try:
+                        major, minor = map(int, compute_cap.split("."))
+                        if (major, minor) not in torch_supported_caps:
+                            torch_ok = False
+                    except (ValueError, TypeError):
+                        pass
+
                 info = GpuInfo(
                     available=True,
                     index=int(parts[0]),
@@ -103,8 +125,9 @@ def detect_all_gpus() -> list[GpuInfo]:
                     vram_mb=int(float(parts[2])),
                     vram_gb=round(int(float(parts[2])) / 1024, 1),
                     driver_version=parts[3],
-                    compute_capability=parts[4] if len(parts) >= 5 else "",
+                    compute_capability=compute_cap,
                     cuda_available=cuda_available,
+                    torch_compatible=torch_ok,
                 )
                 gpus.append(info)
 
@@ -128,6 +151,32 @@ def _classify_gpu(gpu: GpuInfo) -> str:
     return "basic"
 
 
+def _compute_capability_tuple(gpu: GpuInfo) -> tuple[int, int]:
+    try:
+        major, minor = gpu.compute_capability.split(".", 1)
+        return int(major), int(minor)
+    except (AttributeError, ValueError, TypeError):
+        return (0, 0)
+
+
+def _has_fast_fp16(gpu: GpuInfo) -> bool:
+    """Tensor Core 世代なら STT の float16 を優先する。"""
+    major, _minor = _compute_capability_tuple(gpu)
+    return major >= 7
+
+
+def _configure_stt_for_gpu(config: DeviceConfig, gpu: GpuInfo) -> None:
+    """STT設定をGPU世代に合わせる。
+
+    Pascal (sm_61) は CTranslate2 CUDA で float16 非対応になりやすく、
+    対応していても低速なので int8 を使う。
+    """
+    config.stt_device = "cuda"
+    config.stt_device_index = gpu.index
+    config.stt_model_size = "medium"
+    config.stt_compute_type = "float16" if _has_fast_fp16(gpu) else "int8"
+
+
 def get_device_config(gpu: Optional[GpuInfo] = None) -> DeviceConfig:
     """GPU情報に基づいて最適なデバイス設定を返す
 
@@ -145,6 +194,8 @@ def get_device_config(gpu: Optional[GpuInfo] = None) -> DeviceConfig:
 
     if not gpus or not any(g.cuda_available for g in gpus):
         return DeviceConfig(profile="cpu")
+
+    torch_gpus = [g for g in gpus if g.torch_compatible]
 
     config = DeviceConfig(
         gpu=gpus[0],
@@ -169,14 +220,11 @@ def get_device_config(gpu: Optional[GpuInfo] = None) -> DeviceConfig:
 
             inf_gpu = gpus[inf_idx]
 
-            # STT: 推論GPU + float16 (Tensor Core活用) + mediumモデル
-            config.stt_device = "cuda"
-            config.stt_device_index = inf_gpu.index
-            config.stt_compute_type = "float16"
-            config.stt_model_size = "medium"
+            # STT: Tensor Core GPU は float16、Pascal GPU は int8
+            _configure_stt_for_gpu(config, inf_gpu)
 
-            # Embedding: 推論GPU
-            config.embedding_device = f"cuda:{inf_gpu.index}"
+            # Embedding: 推論GPU (PyTorch非対応ならCPU)
+            config.embedding_device = f"cuda:{inf_gpu.index}" if inf_gpu.torch_compatible else "cpu"
 
             # Vision ONNX: 推論GPU (device_id指定)
             config.onnx_providers = [
@@ -204,12 +252,9 @@ def get_device_config(gpu: Optional[GpuInfo] = None) -> DeviceConfig:
         config.llm_gpu_index = llm_gpu.index
         config.inference_gpu_index = inf_gpu.index
 
-        config.stt_device = "cuda"
-        config.stt_device_index = inf_gpu.index
-        config.stt_compute_type = "float16"
-        config.stt_model_size = "medium"
+        _configure_stt_for_gpu(config, inf_gpu)
 
-        config.embedding_device = f"cuda:{inf_gpu.index}"
+        config.embedding_device = f"cuda:{inf_gpu.index}" if inf_gpu.torch_compatible else "cpu"
 
         config.onnx_providers = [
             ("CUDAExecutionProvider", {"device_id": str(inf_gpu.index)}),
@@ -230,12 +275,9 @@ def get_device_config(gpu: Optional[GpuInfo] = None) -> DeviceConfig:
         # === P40クラス (24GB) ===
         config.profile = "p40"
 
-        config.stt_device = "cuda"
-        config.stt_device_index = gpu.index
-        config.stt_compute_type = "float16"
-        config.stt_model_size = "medium"
+        _configure_stt_for_gpu(config, gpu)
 
-        config.embedding_device = f"cuda:{gpu.index}"
+        config.embedding_device = f"cuda:{gpu.index}" if gpu.torch_compatible else "cpu"
 
         config.onnx_providers = [
             ("CUDAExecutionProvider", {"device_id": str(gpu.index)}),

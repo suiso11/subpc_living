@@ -65,8 +65,11 @@ class MonitorContext:
         """メトリクス収集時のコールバック — DBに保存"""
         try:
             self.storage.store_metrics(metrics)
-        except Exception:
-            pass  # DB書込失敗は無視（ログ欠損は許容）
+        except Exception as e:
+            # ログ欠損自体は許容するが、初回失敗と周期的に通知して異常を検知可能に
+            self._db_error_count = getattr(self, "_db_error_count", 0) + 1
+            if self._db_error_count == 1 or self._db_error_count % 100 == 0:
+                print(f"⚠️  メトリクスDB書込失敗 ({self._db_error_count}件目): {e}")
 
     def get_context_text(self) -> str:
         """

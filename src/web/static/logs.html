@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#0b0d11">
+  <title>ログ - subpc_living</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+  <link rel="manifest" href="/static/manifest.json">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="tasks-page">
+  <div class="task-app">
+    <header class="task-header">
+      <div class="task-brand">
+        <span class="task-brand-mark"></span>
+        <span>subpc_living</span>
+      </div>
+      <nav class="top-nav" aria-label="画面切替">
+        <a class="top-nav-link" href="/">会話</a>
+        <a class="top-nav-link" href="/tasks">タスク</a>
+        <a class="top-nav-link active" href="/logs">ログ</a>
+      </nav>
+    </header>
+
+    <main class="task-workspace">
+      <section class="task-controlbar log-controlbar" aria-label="ログ切替">
+        <div class="controlbar-left">
+          <div class="segmented" id="log-tab-seg" role="tablist" aria-label="ログ種別">
+            <button class="segmented-btn active" data-tab="journal" type="button" role="tab">サービス</button>
+            <button class="segmented-btn" data-tab="files" type="button" role="tab">アプリログ</button>
+            <button class="segmented-btn" data-tab="history" type="button" role="tab">会話ログ</button>
+          </div>
+        </div>
+        <div class="task-toolbar-actions">
+          <button class="secondary-btn" id="log-refresh-btn" type="button">更新</button>
+        </div>
+      </section>
+
+      <div class="task-error" id="log-error" role="alert" aria-live="polite"></div>
+
+      <!-- サービスログ (journalctl) -->
+      <section class="log-shell" id="log-journal-pane" aria-label="サービスログ">
+        <div class="log-toolbar">
+          <select id="journal-unit" aria-label="サービス"></select>
+          <select id="journal-lines" aria-label="行数">
+            <option value="100">100行</option>
+            <option value="300" selected>300行</option>
+            <option value="1000">1000行</option>
+          </select>
+        </div>
+        <pre class="log-output" id="journal-output">読み込み中...</pre>
+      </section>
+
+      <!-- アプリログファイル -->
+      <section class="log-shell" id="log-files-pane" aria-label="アプリログ" hidden>
+        <div class="log-file-list" id="log-file-list"></div>
+        <pre class="log-output" id="file-output" hidden></pre>
+      </section>
+
+      <!-- 会話ログ -->
+      <section class="log-shell" id="log-history-pane" aria-label="会話ログ" hidden>
+        <div class="history-list" id="history-list"></div>
+        <div class="history-detail" id="history-detail" hidden></div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/static/logs.js"></script>
+</body>
+</html>

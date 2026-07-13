@@ -3,7 +3,7 @@
 Phase 4: テキストをベクトルに変換する
 multilingual-e5-small を使用（日本語対応、ローカル実行）
 Phase 9: device="auto" でGPU自動検出
-Phase 10: デュアルGPU対応 — cuda:N で推論GPU (2070S) を指定
+Phase 10: デュアルGPU対応 — cuda:N で推論GPUを指定
 """
 import time
 import numpy as np
@@ -65,7 +65,15 @@ class EmbeddingModel:
         kwargs = {"device": self.device}
         if self.cache_dir:
             kwargs["cache_folder"] = self.cache_dir
-        self._model = SentenceTransformer(self.model_name, **kwargs)
+        try:
+            self._model = SentenceTransformer(self.model_name, **kwargs)
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
+                print(f"[Embedding] ⚠️  GPU ロード失敗 (OOM)、CPU にフォールバック: {e}")
+                self._model = SentenceTransformer(self.model_name, device="cpu")
+                self.device = "cpu"
+            else:
+                raise
         elapsed = time.time() - start
         dim = self._model.get_sentence_embedding_dimension()
         print(f"[Embedding] モデルロード完了 ({elapsed:.1f}秒, {dim}次元)")

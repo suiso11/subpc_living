@@ -3,7 +3,7 @@ GPU 省電力制御モジュール
 nvidia-smi を使って GPU の電力制限を動的に変更する。
 常時稼働時のアイドル消費電力を抑え、推論時にフルパワーへ復帰させる。
 Phase 9: GPU名を検出して適切なデフォルト値を自動設定。
-Phase 10: マルチGPU対応 (P40 + RTX 2070 Super)
+Phase 10: マルチGPU対応
 """
 import json
 import os
@@ -22,6 +22,8 @@ GPU_POWER_PRESETS: dict[str, tuple[int, int]] = {
     "GTX 1060":        (80, 120),    # TDP 120W
     "GTX 1070":        (80, 150),    # TDP 150W
     "GTX 1080":        (80, 180),    # TDP 180W
+    "P5000":           (100, 180),   # Quadro P5000, min 90W
+    "QUADRO P5000":    (100, 180),   # Quadro P5000, min 90W
     "RTX 2070":        (125, 215),   # TDP 215W, min 125W
     "RTX 2070 SUPER":  (125, 215),   # TDP 215W, min 125W
     "RTX 2080":        (125, 215),   # TDP 215W
@@ -161,7 +163,11 @@ class GpuPowerManager:
             return False, str(e)
 
     def _run_powerd(self, payload: dict) -> tuple[bool, str]:
-        """root 側 GPU power daemon に制御要求を送る"""
+        """root 側 GPU power daemon に制御要求を送る
+
+        一時的なソケットエラー (daemon 再起動中など) では恒久無効化しない。
+        次回呼び出しで再試行可能にする。
+        """
         if not _socket_exists(self._power_socket):
             return False, f"GPU power daemon 未起動 ({self._power_socket})"
 
@@ -187,11 +193,14 @@ class GpuPowerManager:
             data = json.loads(raw)
             ok = bool(data.get("ok"))
             message = str(data.get("message", ""))
+            # daemon 側の明示的な権限エラーのみ恒久ブロック扱いにする
+            if not ok and ("Insufficient Permissions" in message or "権限" in message):
+                self._power_control_blocked = True
+                self._power_control_message = message
             return ok, message
         except Exception as e:
-            self._power_control_blocked = True
-            self._power_control_message = f"GPU power daemon 接続失敗: {e}"
-            return False, self._power_control_message
+            # 一時エラーとして扱う。恒久無効化せず次回再試行可能に
+            return False, f"GPU power daemon 接続失敗: {e}"
 
     def probe_power_control(self) -> tuple[bool, str]:
         """GPU 電力制御が利用可能かを確認"""

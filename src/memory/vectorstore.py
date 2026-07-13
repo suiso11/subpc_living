@@ -75,10 +75,8 @@ class VectorStore:
         print(f"  knowledge: {know_count} 件")
 
     def _create_embedding_function(self):
-        """ChromaDB 用の埋め込み関数を作成"""
         from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 
-        # "auto" を実デバイスに解決
         device = self.embedding_device
         if device == "auto":
             try:
@@ -89,10 +87,20 @@ class VectorStore:
 
         print(f"[VectorStore] 埋め込みモデル '{self.embedding_model_name}' をロード中 (device={device})...")
         start = time.time()
-        fn = SentenceTransformerEmbeddingFunction(
-            model_name=self.embedding_model_name,
-            device=device,
-        )
+        try:
+            fn = SentenceTransformerEmbeddingFunction(
+                model_name=self.embedding_model_name,
+                device=device,
+            )
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
+                print(f"[VectorStore] ⚠️  GPU ロード失敗 (OOM)、CPU にフォールバック: {e}")
+                fn = SentenceTransformerEmbeddingFunction(
+                    model_name=self.embedding_model_name,
+                    device="cpu",
+                )
+            else:
+                raise
         elapsed = time.time() - start
         print(f"[VectorStore] 埋め込みモデルロード完了 ({elapsed:.1f}秒)")
         return fn

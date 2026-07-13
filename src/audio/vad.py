@@ -239,14 +239,13 @@ class SileroVAD:
             発話が完了した場合は発話全体の音声データ
             まだ発話中または無音の場合は None
         """
-        import torch
-
         if frame.dtype != np.float32:
             frame = frame.astype(np.float32)
         if np.max(np.abs(frame)) > 1.0:
             frame = frame / 32768.0
 
         # Silero VADで推論
+        import torch
         tensor = torch.from_numpy(frame)
         speech_prob = self._model(tensor, self.sample_rate).item()
         is_speech = speech_prob > self.threshold
@@ -324,10 +323,11 @@ def create_vad(
     elif vad_type == "auto":
         try:
             import torch  # noqa: F401
-            print("[VAD] torch が利用可能 → Silero VAD を使用")
+            import torchaudio  # noqa: F401
+            print("[VAD] torch + torchaudio が利用可能 → Silero VAD を使用")
             return SileroVAD(sample_rate=sample_rate, **kwargs)
         except ImportError:
-            print("[VAD] torch が未インストール → Energy VAD にフォールバック")
+            print("[VAD] Silero VAD 依存ライブラリ不足 → Energy VAD にフォールバック (pip install torchaudio)")
             return EnergyVAD(sample_rate=sample_rate, **kwargs)
     else:
         raise ValueError(f"未知のVADタイプ: {vad_type}")

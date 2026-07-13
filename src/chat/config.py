@@ -2,7 +2,7 @@
 チャット設定モジュール
 Phase 2: テキスト対話用の設定を管理する
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import json
 
@@ -21,6 +21,7 @@ class ChatConfig:
     top_k: int = 40
     repeat_penalty: float = 1.1
     num_ctx: int = 8192  # コンテキスト長
+    num_predict: int | None = None  # 最大生成トークン数。NoneならOllamaデフォルト
 
     # --- システムプロンプト ---
     system_prompt: str = (
@@ -36,8 +37,25 @@ class ChatConfig:
     max_history_turns: int = 20  # 保持する会話ターン数の上限
     history_dir: str = "data/chat_history"  # 履歴保存ディレクトリ
 
+    # --- Web検索設定 ---
+    web_search_enabled: bool = False  # 最新情報が必要そうな時にWeb検索する
+    web_search_auto: bool = True  # True: 必要そうな発話だけ自動検索
+    web_search_max_results: int = 4
+    web_search_timeout_sec: float = 8.0
+    web_search_cache_path: str = ""  # 空なら永続キャッシュしない
+
     # --- 表示設定 ---
     stream: bool = True  # ストリーミング出力を使用するか
+
+    # --- 感情タグ ---
+    # True: 応答冒頭に [emo:happy] 形式のタグを出力させ、TTSスタイルを動的に切り替える
+    emotion_tag_enabled: bool = False
+
+    # --- Discord チャンネル別LLMプロファイル ---
+    # discord_channel_profile_map: {"channel_id": "profile_name"}
+    # discord_channel_profiles: {"profile_name": {"temperature": 0.4, ...}}
+    discord_channel_profile_map: dict[str, str] = field(default_factory=dict)
+    discord_channel_profiles: dict[str, dict] = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: str | Path = "config/chat_config.json") -> "ChatConfig":

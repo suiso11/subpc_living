@@ -5,12 +5,16 @@ faster-whisper>=1.0.0
 sounddevice>=0.4.6
 numpy>=1.24.0
 kokoro-onnx>=0.5.0
+# GPU TTS acceleration. The extras install CUDA/cuDNN runtime libraries for ORT.
+onnxruntime-gpu[cuda,cudnn]==1.24.2
 misaki[ja]>=0.1.0
 
 # Phase 3: Silero VAD (高精度VAD、オプション)
-# torch がインストールされていれば Silero VAD を自動使用
+# torch + torchaudio がインストールされていれば Silero VAD を自動使用
 # 未インストールの場合は Energy VAD にフォールバック
-# pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+# torch と torchaudio は CPU/CUDA の wheel index とバージョンを揃える
+# 例 (CUDA 12.8): pip install torchaudio==2.10.0 --index-url https://download.pytorch.org/whl/cu128
+# 例 (CPU): pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
 
 # Phase 4: 長期記憶 (RAG)
 chromadb>=0.5.0
@@ -18,6 +22,10 @@ sentence-transformers>=3.0.0
 
 # Phase 5: 映像入力
 opencv-python-headless>=4.8.0
+
+# 画面認識 (スクリーンショット → VLM描写)
+mss>=9.0.0
+Pillow>=10.0.0
 
 # Phase 6: PCログ収集
 psutil>=5.9.0
@@ -27,7 +35,14 @@ fastapi>=0.110.0
 uvicorn[standard]>=0.27.0
 python-multipart>=0.0.7
 
+<<<<<<< HEAD
 # テスト
 pytest>=8.0.0
+=======
+# Discord 操作コンソール
+discord.py>=2.4.0
+discord-ext-voice-recv>=0.5.2a179
+
+>>>>>>> 0a438129be6e75f27e4ce016bc914491bc628028
 # Phase 10: ウェイクワード検知
 openwakeword>=0.4.0

@@ -46,6 +46,12 @@ echo "✅ Python パッケージインストール完了"
 
 pip list --format=columns 2>/dev/null | grep -iE "faster-whisper|sounddevice|numpy|httpx|ctranslate2|kokoro|misaki"
 
+# misaki の日本語G2Pに必要な unidic 辞書 (約530MB、未ダウンロード時のみ)
+if ! python -c "import unidic, pathlib; assert (pathlib.Path(unidic.DICDIR) / 'mecabrc').exists()" 2>/dev/null; then
+    echo "unidic 辞書をダウンロード中 (約530MB)..."
+    python -m unidic download
+fi
+
 # --- 3. kokoro-onnx モデルのダウンロード ---
 echo ""
 echo "[3/4] kokoro-onnx TTS モデルの確認..."

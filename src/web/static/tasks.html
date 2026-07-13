@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#0b0d11">
+  <title>タスク - subpc_living</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+  <link rel="manifest" href="/static/manifest.json">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="tasks-page">
+  <div class="task-app">
+    <header class="task-header">
+      <div class="task-brand">
+        <span class="task-brand-mark"></span>
+        <span>subpc_living</span>
+      </div>
+      <nav class="top-nav" aria-label="画面切替">
+        <a class="top-nav-link" href="/">会話</a>
+        <a class="top-nav-link active" href="/tasks">タスク</a>
+        <a class="top-nav-link" href="/logs">ログ</a>
+      </nav>
+    </header>
+
+    <main class="task-workspace">
+      <section class="task-summary" aria-label="タスク概要">
+        <div class="metric is-zero">
+          <span class="metric-label">未完了</span>
+          <strong id="metric-open">0</strong>
+        </div>
+        <div class="metric danger is-zero">
+          <span class="metric-label">超過</span>
+          <strong id="metric-overdue">0</strong>
+        </div>
+        <div class="metric warn is-zero">
+          <span class="metric-label">今日</span>
+          <strong id="metric-today">0</strong>
+        </div>
+        <div class="metric high is-zero">
+          <span class="metric-label">高優先</span>
+          <strong id="metric-high">0</strong>
+        </div>
+      </section>
+
+      <section class="task-compose" aria-label="タスク追加">
+        <form id="task-add-form" class="task-compose-form" autocomplete="off">
+          <div class="compose-input-row">
+            <input id="task-text-input" name="text" type="text" placeholder="例: 明日18時までに牛乳を買う / 金曜 レポート提出" autocomplete="off" required>
+            <button class="secondary-btn compact" id="task-details-toggle" type="button" title="詳細を表示">詳細</button>
+            <button class="primary-btn" type="submit">追加</button>
+          </div>
+          <div id="task-preview-line" class="task-preview-line" hidden></div>
+          <div id="task-details-section" class="task-details-section" hidden>
+            <select id="task-priority-input" name="priority" aria-label="優先度">
+              <option value="normal">優先度: 普通</option>
+              <option value="high">優先度: 高</option>
+              <option value="low">優先度: 低</option>
+            </select>
+            <input id="task-note-input" name="note" type="text" placeholder="メモ (任意)" autocomplete="off">
+          </div>
+          <div class="due-quick" id="due-quick" aria-label="期限クイック入力"></div>
+        </form>
+      </section>
+
+      <section class="task-controlbar" aria-label="タスク操作">
+        <div class="controlbar-left">
+          <div class="segmented" id="task-view-seg" role="tablist" aria-label="表示切替">
+            <button class="segmented-btn active" data-view="list" type="button" role="tab">リスト</button>
+            <button class="segmented-btn" data-view="calendar" type="button" role="tab">カレンダー</button>
+          </div>
+        </div>
+        <div class="task-toolbar-actions">
+          <button class="secondary-btn" id="task-refresh-btn" type="button">更新</button>
+        </div>
+      </section>
+
+      <div class="task-error" id="task-error" role="alert" aria-live="polite"></div>
+
+      <section class="task-list-shell" id="task-list-shell" aria-label="タスク一覧">
+        <div class="task-list" id="task-list"></div>
+      </section>
+
+      <section class="task-calendar-shell" id="task-calendar-shell" aria-label="カレンダー" hidden>
+        <div class="cal-toolbar">
+          <div class="cal-nav">
+            <button class="secondary-btn compact" id="cal-prev" type="button" aria-label="前の月">‹</button>
+            <strong class="cal-title" id="cal-title"></strong>
+            <button class="secondary-btn compact" id="cal-next" type="button" aria-label="次の月">›</button>
+          </div>
+          <div class="task-toolbar-actions">
+            <span class="task-muted" id="cal-month-count"></span>
+            <button class="secondary-btn compact" id="cal-today-btn" type="button">今日</button>
+          </div>
+        </div>
+        <div class="cal-weekdays" id="cal-weekdays" aria-hidden="true"></div>
+        <div class="cal-grid" id="cal-grid"></div>
+        <div class="cal-day-panel" id="cal-day-panel" hidden></div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/static/tasks.js"></script>
+</body>
+</html>

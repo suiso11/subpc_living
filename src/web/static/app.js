@@ -548,8 +548,10 @@ function newSession() {
   sessionId = `web_${Date.now()}`;
   chatArea.innerHTML = `
     <div class="welcome">
-      <h2>💬 subpc_living</h2>
-      <p>パーソナルAIとチャットできます。<br>メッセージを入力してください。</p>
+      <div class="welcome-orb">✦</div>
+      <h2>subpc_living</h2>
+      <p>会話、音声入力、読み上げ</p>
+      <a class="welcome-link" href="/tasks">タスクを見る →</a>
     </div>
   `;
 }
@@ -613,6 +615,12 @@ async function init() {
   settingsPanel.addEventListener('click', (e) => {
     if (e.target === settingsPanel) closeSettings();
   });
+
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/static/service-worker.js').catch((e) => {
+      console.warn('[PWA] Service worker registration failed:', e);
+    });
+  }
 
   messageInput.focus();
 }

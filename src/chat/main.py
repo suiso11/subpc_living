@@ -13,6 +13,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from src.chat.config import ChatConfig
 from src.chat.client import OllamaClient
 from src.chat.session import ChatSession
+from src.chat.web_search import create_web_search_context
 
 
 # --- ANSI カラーコード ---
@@ -68,6 +69,9 @@ def main():
     print_banner()
     print(f"{Color.DIM}モデル: {config.model}{Color.RESET}")
     print(f"{Color.DIM}コンテキスト長: {config.num_ctx}{Color.RESET}")
+    web_search = create_web_search_context(config)
+    if web_search is not None:
+        print(f"{Color.DIM}Web検索: auto={config.web_search_auto}, max_results={config.web_search_max_results}{Color.RESET}")
 
     # Ollamaクライアントの初期化
     client = OllamaClient(base_url=config.ollama_base_url, model=config.model)
@@ -92,6 +96,7 @@ def main():
         system_prompt=config.system_prompt,
         max_history_turns=config.max_history_turns,
         history_dir=str(PROJECT_ROOT / config.history_dir),
+        web_search=web_search,
     )
 
     print_help()
@@ -167,6 +172,7 @@ def main():
                     top_k=config.top_k,
                     repeat_penalty=config.repeat_penalty,
                     num_ctx=config.num_ctx,
+                    num_predict=config.num_predict,
                 ):
                     print(token, end="", flush=True)
                     full_response += token
@@ -185,6 +191,7 @@ def main():
                     top_k=config.top_k,
                     repeat_penalty=config.repeat_penalty,
                     num_ctx=config.num_ctx,
+                    num_predict=config.num_predict,
                 )
                 print(response)
                 session.add_assistant_message(response)

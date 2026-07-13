@@ -1,0 +1,35 @@
+[Unit]
+Description=subpc_living Style-Bert-VITS2 TTS server
+Documentation=https://github.com/litagin02/Style-Bert-VITS2
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/ドキュメント/subpc_living
+Environment=PATH=%h/ドキュメント/subpc_living/.venv-sbv2/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+Environment=SBV2_HOST=127.0.0.1
+Environment=SBV2_PORT=50121
+Environment=SBV2_DEVICE=cuda:1
+Environment=SBV2_MODEL_NAME=tsukuyomi-chan
+Environment=SBV2_MODEL_FILE=tsukuyomi-chan_e200_s5200.safetensors
+Environment=SBV2_STYLE=Neutral
+Environment=SBV2_STYLE_WEIGHT=1.0
+Environment=SBV2_SPLIT_INTERVAL=0.3
+Environment=SBV2_MAX_CHARS=500
+Environment=SBV2_WARMUP_TEXT=こんにちは。
+
+ExecStart=%h/ドキュメント/subpc_living/.venv-sbv2/bin/python scripts/style_bert_vits2_server.py
+
+Restart=on-failure
+RestartSec=10
+
+MemoryMax=12G
+CPUQuota=800%
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=subpc-sbv2-tts
+
+[Install]
+WantedBy=default.target

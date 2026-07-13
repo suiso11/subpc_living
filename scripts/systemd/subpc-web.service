@@ -9,8 +9,16 @@ Type=notify
 WorkingDirectory=%h/ドキュメント/subpc_living
 Environment=PATH=%h/ドキュメント/subpc_living/.venv/bin:/usr/local/bin:/usr/bin:/bin
 Environment=PYTHONUNBUFFERED=1
+Environment=TTS_ONNX_PROVIDER=CUDAExecutionProvider
+Environment=TTS_ONNX_DEVICE_ID=1
+# 画面認識 (WEB_SCREEN_CONTEXT_ENABLED=true 時) のための X11 ディスプレイ。
+# systemd --user サービスから GUI セッションのスクリーンを掴むのに必要。
+Environment=DISPLAY=:0
+# WEB_SCREEN_CONTEXT_ENABLED / SCREEN_CONTEXT_MODE / SCREEN_INGEST_TOKEN などは
+# config/web.env で設定する (git 管理外、無ければ無視)。
+EnvironmentFile=-%h/ドキュメント/subpc_living/config/web.env
 
-# Ollama は GPU 0 (P40) を使用、Python推論は GPU 1 (2070S) を使用
+# Ollama は GPU 0 (P40) を使用、Python推論は GPU 1 (P5000) を使用
 # CUDA_VISIBLE_DEVICES は設定しない (gpu_config.py が device_index で制御)
 
 # 起動前にヘルスチェック (Ollama 接続確認)
@@ -28,7 +36,7 @@ WatchdogSec=120
 
 # リソース制限
 MemoryMax=4G
-CPUQuota=200%
+CPUQuota=800%
 
 # ロギング
 StandardOutput=journal

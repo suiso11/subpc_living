@@ -4,6 +4,7 @@
 """
 import threading
 import time
+import os
 import numpy as np
 from typing import Optional
 
@@ -49,8 +50,14 @@ class CameraCapture:
 
     def open(self) -> bool:
         """カメラデバイスを開く"""
+        device_path = f"/dev/video{self.device_id}"
+        if os.name != "nt" and not os.path.exists(device_path):
+            print(f"  カメラデバイス {device_path} が存在しません")
+            return False
+
         self._cap = cv2.VideoCapture(self.device_id)
         if not self._cap.isOpened():
+            print(f"  カメラ (device_id={self.device_id}) を開けません")
             return False
 
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
