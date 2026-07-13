@@ -3,40 +3,107 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <meta name="theme-color" content="#0b0d11">
-  <title>subpc_living</title>
+  <meta name="theme-color" content="#120B0A">
+  <title>SUBPC BUDDY</title>
   <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
   <link rel="manifest" href="/static/manifest.json">
   <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/pop-theme.css">
+  <link rel="stylesheet" href="/static/shell-theme.css">
 </head>
 <body>
   <div class="app">
     <!-- ヘッダー -->
-    <div class="header">
-      <div class="header-title">
+    <header class="header site-header">
+      <div class="header-title site-brand">
         <span id="status-dot" class="status-dot"></span>
-        <span>subpc_living</span>
+        <span>SUBPC BUDDY</span>
       </div>
-      <div class="header-actions">
-        <nav class="top-nav" aria-label="画面切替">
-          <a class="top-nav-link active" href="/">会話</a>
-          <a class="top-nav-link" href="/tasks">タスク</a>
-          <a class="top-nav-link" href="/logs">ログ</a>
-        </nav>
-        <button class="icon-btn" id="new-session-btn" title="新しい会話">🗑️</button>
-        <button class="icon-btn" id="settings-btn" title="設定">⚙️</button>
+      <nav class="top-nav" aria-label="画面切替">
+        <a class="top-nav-link active" href="/">話す</a>
+        <a class="top-nav-link" href="/tasks">やること</a>
+        <a class="top-nav-link" href="/logs">記録</a>
+        <a class="top-nav-link" href="/achievements">実績</a>
+      </nav>
+      <div class="header-actions site-actions">
+        <button class="icon-btn" id="new-session-btn" title="話題をリセット" aria-label="話題をリセット">＋</button>
+        <button class="icon-btn" id="settings-btn" title="設定" aria-label="設定">•••</button>
       </div>
-    </div>
+    </header>
+
+    <!-- 実際に蓄積した会話例・記憶・評価を可視化 -->
+    <section class="growth-panel" id="growth-panel" aria-label="育ちメーター" title="会話で増えた思い出や学びの量です。モデルの性能値ではありません。">
+      <div class="growth-head">
+        <div class="growth-title">
+          <span class="growth-mark">✦</span>
+          <span>育ちメーター</span>
+          <span class="growth-level" id="growth-level">Lv.1</span>
+        </div>
+        <div class="growth-score"><strong id="growth-points">—</strong> pt <span class="growth-delta" id="growth-delta" hidden></span></div>
+      </div>
+      <div class="growth-progress" role="progressbar" aria-label="次のレベルまで" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+        <span id="growth-progress-bar"></span>
+      </div>
+      <div class="growth-stats">
+        <span><strong id="growth-today">—</strong><small>きょう</small></span>
+        <span><strong id="growth-streak">—</strong><small>つづけた日</small></span>
+        <span><strong id="growth-memory">—</strong><small>思い出</small></span>
+        <span><strong id="growth-corrections">—</strong><small>学び直し</small></span>
+      </div>
+      <div class="growth-chart" id="growth-chart" aria-label="直近14日の成長"></div>
+    </section>
+
+    <section class="game-hub" id="game-hub" aria-label="会話ゲーム">
+      <button class="game-toggle" id="game-toggle" type="button" aria-expanded="false" aria-controls="game-details">
+        <span class="game-toggle-title"><span aria-hidden="true">◆</span> 今日のクエスト</span>
+        <span class="game-toggle-meta">
+          <strong id="game-rank">—</strong>
+          <span id="game-quest-summary">読み込み中</span>
+        </span>
+        <span class="game-toggle-icon" id="game-toggle-icon" aria-hidden="true">＋</span>
+      </button>
+      <div class="game-details" id="game-details" hidden>
+        <div class="game-toast" id="game-toast" role="status" aria-live="polite"></div>
+
+        <section class="game-section" aria-labelledby="game-missions-title">
+          <div class="game-section-head">
+            <h2 id="game-missions-title">今日のクエスト</h2>
+            <span id="game-next-rank"></span>
+          </div>
+          <div class="mission-list" id="game-mission-list"></div>
+        </section>
+
+        <section class="game-section" aria-labelledby="game-badges-title">
+          <div class="game-section-head">
+            <h2 id="game-badges-title">実績コレクション</h2>
+            <div class="game-section-meta">
+              <span id="game-badge-summary"></span>
+              <a class="game-section-link" href="/achievements">すべて見る →</a>
+            </div>
+          </div>
+          <div class="badge-list" id="game-badge-list"></div>
+        </section>
+
+        <section class="game-section" aria-labelledby="game-starters-title">
+          <div class="game-section-head">
+            <h2 id="game-starters-title">どう話す？</h2>
+            <span>選んだあと自由に書き換えられます</span>
+          </div>
+          <div class="starter-list" id="game-starter-list"></div>
+        </section>
+      </div>
+    </section>
 
     <!-- チャットエリア -->
     <div class="chat-area" id="chat-area">
       <div class="welcome">
         <div class="welcome-orb">✦</div>
-        <h2>subpc_living</h2>
-        <p>会話、音声入力、読み上げ</p>
-        <a class="welcome-link" href="/tasks">タスクを見る →</a>
+        <h2>おかえり！</h2>
+        <p>前の話の続きから、どうぞ。</p>
+        <a class="welcome-link" href="/tasks">やることを見る →</a>
       </div>
     </div>
 
@@ -44,7 +111,7 @@
     <div class="input-area">
       <div class="input-row">
         <div class="input-wrapper">
-          <textarea id="message-input" placeholder="メッセージを入力..." rows="1"></textarea>
+          <textarea id="message-input" placeholder="なんでも話して" rows="1"></textarea>
         </div>
         <button class="mic-btn" id="mic-btn" title="音声入力">
           <svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor">
@@ -58,7 +125,7 @@
         <label class="toggle-label">
           <input type="checkbox" class="toggle-input" id="tts-toggle" checked>
           <span class="toggle-switch"></span>
-          読み上げ
+          声で読む
         </label>
         <span class="stt-status" id="stt-status"></span>
       </div>
@@ -69,28 +136,29 @@
   <div class="settings-panel" id="settings-panel">
     <div class="settings-content">
       <div class="settings-header">
-        <h3>⚙️ 設定</h3>
+        <h3>話し方の設定</h3>
         <button class="icon-btn" id="settings-close">✕</button>
       </div>
 
       <div class="setting-group">
-        <label>TTS ボイス</label>
+        <label>声</label>
         <select id="voice-select">
           <option value="jf_alpha">jf_alpha — 日本語 女性 (Alpha)</option>
         </select>
       </div>
 
       <div class="setting-group">
-        <label>接続情報</label>
+        <label>つながり</label>
         <div class="conn-info">
-          <strong>サーバー:</strong> <span id="server-url"></span><br>
-          <strong>WebSocket:</strong> <span id="ws-status">接続中...</span>
+          <strong>接続先:</strong> <span id="server-url"></span><br>
+          <strong>会話:</strong> <span id="ws-status">つないでいます...</span>
         </div>
       </div>
     </div>
   </div>
 
   <script src="/static/app.js"></script>
+  <script src="/static/shell-ui.js"></script>
   <script>
     // 接続情報表示
     document.getElementById('server-url').textContent = location.origin;

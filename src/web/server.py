@@ -14,7 +14,8 @@ import subprocess
 import threading
 import time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -47,6 +48,8 @@ from src.service.healthcheck import HealthChecker
 from src.service.idle import IdleManager
 from src.discord_bot.task_ui import parse_due, parse_snooze, split_quick_input
 from src.tasks.store import TaskStore
+from src.tasks.chat_editor import TaskChatEditor
+from src.growth.tracker import GrowthTracker
 from src.service.log_setup import setup_logging, DEFAULT_LOG_DIR
 from src.chat import history_admin
 
@@ -69,7 +72,13 @@ web_search: Optional[WebSearchContext] = None
 sessions: dict[str, ChatSession] = {}
 idle_manager: Optional[IdleManager] = None
 task_store: Optional[TaskStore] = None
+task_chat_editor = TaskChatEditor()
+growth_tracker: Optional[GrowthTracker] = None
 tasks_timezone: str = "Asia/Tokyo"
+task_calendar_sync = None  # TaskCalendarSync | None (Webで作ったタスクをカレンダーへ push)
+calendar_client = None  # GoogleCalendarMCPClient | None (イベント CRUD 用)
+tasks_calendar_id: str = "primary"
+UPCOMING_PATH = PROJECT_ROOT / "data" / "calendar" / "upcoming.json"
 
 
 def get_local_ip() -> str:
@@ -84,10 +93,45 @@ def get_local_ip() -> str:
         return "127.0.0.1"
 
 
+@lru_cache(maxsize=1)
+def get_secure_web_url() -> str:
+    """マイクAPIを使えるHTTPS公開URLを返す。
+
+    明示設定を優先し、未設定ならTailscale Serveの現在設定から検出する。
+    """
+    configured = os.environ.get("WEB_PUBLIC_HTTPS_URL", "").strip().rstrip("/")
+    if configured.startswith("https://"):
+        return configured
+    try:
+        result = subprocess.run(
+            ["tailscale", "serve", "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        if result.returncode != 0:
+            return ""
+        payload = json.loads(result.stdout or "{}")
+        web = payload.get("Web") if isinstance(payload, dict) else None
+        if not isinstance(web, dict):
+            return ""
+        for authority, route in web.items():
+            handlers = route.get("Handlers") if isinstance(route, dict) else None
+            root = handlers.get("/") if isinstance(handlers, dict) else None
+            proxy = str(root.get("Proxy") or "") if isinstance(root, dict) else ""
+            if proxy.endswith(":8000"):
+                host = str(authority).removesuffix(":443")
+                return f"https://{host}"
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return ""
+    return ""
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """サーバー起動/終了時の処理"""
-    global config, llm, tts, stt, rag, vision, screen, monitor, profile, summarizer, preloader, web_search, idle_manager, task_store, tasks_timezone
+    global config, llm, tts, stt, rag, vision, screen, monitor, profile, summarizer, preloader, web_search, idle_manager, task_store, growth_tracker, tasks_timezone, task_calendar_sync, calendar_client, tasks_calendar_id
 
     logger.info("Web UI サーバー起動中...")
 
@@ -109,6 +153,15 @@ async def lifespan(app: FastAPI):
     config = ChatConfig.load(config_path)
     web_search = create_web_search_context(config)
     tasks_timezone = os.environ.get("DIARY_TIMEZONE", "Asia/Tokyo").strip() or "Asia/Tokyo"
+    try:
+        growth_tracker = GrowthTracker(
+            PROJECT_ROOT / "data" / "growth" / "growth.db",
+            timezone_name=tasks_timezone,
+        )
+        logger.info("✅ Growth tracker OK")
+    except Exception as e:
+        logger.warning("Growth tracker 初期化失敗 (計測なしで続行): %s", e)
+        growth_tracker = None
 
     try:
         task_store = TaskStore(
@@ -119,6 +172,39 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("Tasks 初期化失敗 (タスク管理なしで続行): %s", e)
         task_store = None
+
+    # Google Calendar 連携 (イベント CRUD + Webで作ったタスクの push 同期)
+    # 同期ワーカーは Discord 側にもあるが、on_change はプロセス内でしか発火しない
+    # ため、Web で作成・更新したタスクをカレンダーへ反映するには Web 側にも
+    # push ワーカーが必要 (pull は Discord 側のみが行う)。
+    calendar_sync_enabled = os.environ.get("TASKS_CALENDAR_SYNC_ENABLED", "").strip().lower() == "true"
+    tasks_calendar_id = (
+        os.environ.get("TASKS_CALENDAR_ID", "").strip()
+        or os.environ.get("DIARY_CALENDAR_ID", "").strip()
+        or "primary"
+    )
+    if calendar_sync_enabled:
+        try:
+            from src.integrations.google_calendar import GoogleCalendarMCPClient
+            from src.tasks.calendar_sync import TaskCalendarSync
+
+            calendar_client = GoogleCalendarMCPClient.from_env()
+            if task_store is not None:
+                sync = TaskCalendarSync(
+                    store=task_store,
+                    calendar_client=calendar_client,
+                    calendar_id=tasks_calendar_id,
+                    enabled=True,
+                    timezone=tasks_timezone,
+                )
+                sync.start()
+                task_store.on_change = sync.enqueue
+                task_calendar_sync = sync
+            logger.info("✅ Calendar OK (calendar=%s, task push同期有効)", tasks_calendar_id)
+        except Exception as e:
+            logger.warning("Calendar 初期化失敗 (カレンダー連携なしで続行): %s", e)
+            calendar_client = None
+            task_calendar_sync = None
 
     # LLM 初期化
     logger.info("[1/6] Ollama 接続確認...")
@@ -304,6 +390,8 @@ async def lifespan(app: FastAPI):
         vision.stop()
     if screen is not None:
         screen.stop()
+    if task_calendar_sync is not None:
+        task_calendar_sync.stop()
     if task_store is not None:
         task_store.close()
     llm.close()
@@ -343,6 +431,13 @@ async def tasks_page():
 async def logs_page():
     """ログ管理ページ"""
     html_path = STATIC_DIR / "logs.html"
+    return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
+
+
+@app.get("/achievements", response_class=HTMLResponse)
+async def achievements_page():
+    """相棒との実績ページ"""
+    html_path = STATIC_DIR / "achievements.html"
     return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
 
 
@@ -395,11 +490,253 @@ async def health():
         "vision": vision is not None and vision.is_running,
         "monitor": monitor is not None and monitor.is_running,
         "persona": profile is not None,
+        "growth": growth_tracker is not None,
         "idle_manager": idle_manager is not None and idle_manager.is_running,
     }
 
     status_code = 200 if result["status"] == "ok" else 503
     return JSONResponse(content=result, status_code=status_code)
+
+
+def _count_nonempty_lines(path: Path) -> int:
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            return sum(1 for line in f if line.strip())
+    except OSError:
+        return 0
+
+
+def _growth_asset_counts() -> dict[str, int]:
+    try:
+        rag_stats = rag.get_stats() if rag is not None else {}
+    except Exception:
+        rag_stats = {}
+    training_dir = Path(os.environ.get("DISCORD_TRAINING_DIR", "data/discord_training"))
+    if not training_dir.is_absolute():
+        training_dir = PROJECT_ROOT / training_dir
+    summaries_dir = PROJECT_ROOT / "data" / "profile" / "summaries"
+    return {
+        "retrievable_memories": int(rag_stats.get("conversations", 0)),
+        "knowledge_items": int(rag_stats.get("knowledge", 0)),
+        "training_turns": _count_nonempty_lines(training_dir / "conversations.jsonl"),
+        "feedback_items": _count_nonempty_lines(training_dir / "feedback.jsonl"),
+        "correction_candidates": _count_nonempty_lines(
+            training_dir / "training_candidates.jsonl"
+        ),
+        "profile_facts": len(profile.extracted_facts) if profile is not None else 0,
+        "conversation_summaries": len(list(summaries_dir.glob("summary_*.json"))),
+    }
+
+
+GAME_MISSIONS = (
+    {
+        "id": "first_turn",
+        "name": "まずはひとこと",
+        "detail": "今日1往復する",
+        "metric": "today_turns",
+        "target": 1,
+        "reward": 10,
+    },
+    {
+        "id": "three_turns",
+        "name": "話をつなげる",
+        "detail": "今日3往復する",
+        "metric": "today_turns",
+        "target": 3,
+        "reward": 20,
+    },
+    {
+        "id": "deep_talk",
+        "name": "じっくり話す",
+        "detail": "今日の会話を600文字まで育てる",
+        "metric": "today_chars",
+        "target": 600,
+        "reward": 25,
+    },
+)
+
+GAME_RANKS = (
+    (1, "はじめまして"),
+    (3, "話し相手"),
+    (5, "相棒"),
+    (8, "名コンビ"),
+    (12, "長年の相棒"),
+)
+
+GAME_STARTERS = (
+    {"id": "continue", "label": "続きを話す", "prompt": "前の話の続きをしよう"},
+    {"id": "reflect", "label": "今日を整理", "prompt": "今日あったことを一緒に整理したい"},
+    {"id": "decide", "label": "次を決める", "prompt": "いま一番優先すべきことを一緒に決めて"},
+    {"id": "tasks", "label": "タスクを編集", "prompt": "タスクを見せて"},
+    {"id": "refresh", "label": "気分転換", "prompt": "気分転換になる話題をひとつ出して"},
+)
+
+
+def _local_game_now(now: datetime | None = None) -> datetime:
+    tz = ZoneInfo(tasks_timezone or "Asia/Tokyo")
+    if now is None:
+        return datetime.now(tz)
+    if now.tzinfo is None:
+        return now.replace(tzinfo=tz)
+    return now.astimezone(tz)
+
+
+def _game_rank(level: int) -> dict:
+    current_name = GAME_RANKS[0][1]
+    next_rank = None
+    for minimum, name in GAME_RANKS:
+        if level >= minimum:
+            current_name = name
+        elif next_rank is None:
+            next_rank = {"level": minimum, "name": name}
+    return {"name": current_name, "level": level, "next": next_rank}
+
+
+def _game_state(
+    *,
+    now: datetime | None = None,
+    asset_counts: dict[str, int] | None = None,
+) -> dict:
+    """成長台帳から、決定論的で課金圧のないゲーム状態を組み立てる。"""
+    if growth_tracker is None:
+        return {"enabled": False}
+    local_now = _local_game_now(now)
+    counts = _growth_asset_counts() if asset_counts is None else asset_counts
+    summary = growth_tracker.summary(now=local_now, asset_counts=counts)
+    local_date = local_now.date().isoformat()
+    event_keys = [f"quest:{local_date}:{mission['id']}" for mission in GAME_MISSIONS]
+    claimed_keys = growth_tracker.existing_event_keys(event_keys)
+
+    missions = []
+    for mission in GAME_MISSIONS:
+        current = int(summary.get(mission["metric"], 0))
+        event_key = f"quest:{local_date}:{mission['id']}"
+        missions.append({
+            "id": mission["id"],
+            "name": mission["name"],
+            "detail": mission["detail"],
+            "reward": mission["reward"],
+            "current": min(current, mission["target"]),
+            "target": mission["target"],
+            "complete": current >= mission["target"],
+            "claimed": event_key in claimed_keys,
+        })
+
+    asset = summary["asset_counts"]
+    badge_specs = (
+        ("first", "●", "はじめの一歩", "最初の会話を記録", summary["total_turns"], 1, "往復"),
+        ("talk10", "◆", "話し好き", "10往復を記録", summary["total_turns"], 10, "往復"),
+        ("memory10", "■", "思い出係", "記憶を10回保存", summary["memory_turns"], 10, "回"),
+        ("streak3", "▲", "三日仲間", "3日続けて話す", summary["streak_days"], 3, "日"),
+        ("level10", "✦", "ベテランコンビ", "レベル10に到達", summary["level"], 10, "Lv"),
+        (
+            "correction",
+            "＋",
+            "学び上手",
+            "学び直しを1件保存",
+            int(asset.get("correction_candidates", 0)),
+            1,
+            "件",
+        ),
+    )
+    badges = [
+        {
+            "id": bid,
+            "mark": mark,
+            "name": name,
+            "detail": detail,
+            "current": int(current),
+            "target": int(target),
+            "unit": unit,
+            "unlocked": int(current) >= int(target),
+        }
+        for bid, mark, name, detail, current, target, unit in badge_specs
+    ]
+    return {
+        "enabled": True,
+        "date": local_date,
+        "rank": _game_rank(int(summary["level"])),
+        "points": int(summary["growth_points"]),
+        "missions": missions,
+        "completed_missions": sum(1 for mission in missions if mission["complete"]),
+        "claimed_missions": sum(1 for mission in missions if mission["claimed"]),
+        "claimable_missions": sum(
+            1 for mission in missions if mission["complete"] and not mission["claimed"]
+        ),
+        "badges": badges,
+        "unlocked_badges": sum(1 for badge in badges if badge["unlocked"]),
+        "starters": list(GAME_STARTERS),
+    }
+
+
+def _claim_game_mission(
+    mission_id: str,
+    *,
+    now: datetime | None = None,
+    asset_counts: dict[str, int] | None = None,
+) -> dict:
+    """達成済みクエストの固定報酬を、一意キーで一度だけ受け取る。"""
+    state = _game_state(now=now, asset_counts=asset_counts)
+    if not state.get("enabled"):
+        return {"ok": False, "status": 503, "error": "game is unavailable"}
+    mission = next((m for m in state["missions"] if m["id"] == mission_id), None)
+    if mission is None:
+        return {"ok": False, "status": 404, "error": "unknown mission"}
+    if not mission["complete"]:
+        return {"ok": False, "status": 409, "error": "mission is not complete"}
+    local_now = _local_game_now(now)
+    event_key = f"quest:{state['date']}:{mission_id}"
+    claimed_now = growth_tracker.record_signal(
+        kind="quest_reward",
+        source="web_game",
+        event_key=event_key,
+        points=int(mission["reward"]),
+        metadata={"mission_id": mission_id, "date": state["date"]},
+        now=local_now,
+    )
+    return {
+        "ok": True,
+        "status": 200,
+        "claimed_now": claimed_now,
+        "reward": int(mission["reward"]) if claimed_now else 0,
+        "state": _game_state(now=local_now, asset_counts=asset_counts),
+    }
+
+
+@app.get("/api/growth")
+async def growth_summary(days: int = 14):
+    """実際に増えた適応資産と、観測開始後の会話成長を返す。"""
+    if growth_tracker is None:
+        return JSONResponse({"enabled": False}, status_code=503)
+    summary = growth_tracker.summary(days=days, asset_counts=_growth_asset_counts())
+    return {
+        "enabled": True,
+        "metric_note": (
+            "GPは会話例・検索可能記憶・評価・修正候補・個人化事実の蓄積量です。"
+            "モデル重みや知能指数ではありません。"
+        ),
+        **summary,
+    }
+
+
+@app.get("/api/game")
+async def game_state():
+    if growth_tracker is None:
+        return JSONResponse({"enabled": False}, status_code=503)
+    return _game_state()
+
+
+@app.post("/api/game/claim")
+async def game_claim(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    result = _claim_game_mission(str(body.get("mission_id") or ""))
+    status_code = int(result.get("status", 200))
+    if status_code != 200:
+        return JSONResponse(result, status_code=status_code)
+    return result
 
 
 @app.get("/api/status")
@@ -414,6 +751,7 @@ async def status():
         "tts_voices": tts.list_ja_voices() if tts else {},
         "stt": stt is not None and stt.is_loaded(),
         "stt_model": stt.model_size if stt else None,
+        "secure_web_url": get_secure_web_url(),
         "rag": rag is not None,
         "rag_stats": rag.get_stats() if rag else None,
         "vision": vision is not None and vision.is_running,
@@ -422,6 +760,7 @@ async def status():
         "monitor_status": monitor.get_status() if monitor else None,
         "persona": profile is not None,
         "persona_status": preloader.get_status() if preloader else None,
+        "growth": growth_tracker is not None,
         "idle_manager": idle_manager.get_status() if idle_manager else None,
         "tasks": task_store is not None,
         "tasks_timezone": tasks_timezone,
@@ -441,6 +780,7 @@ def _task_to_json(task: dict) -> dict:
         "title": task.get("title") or "",
         "note": task.get("note") or "",
         "action_hint": task.get("action_hint") or "",
+        "steps": task.get("steps") or [],
         "due_at": due_at.isoformat() if due_at else None,
         "due_granularity": task.get("due_granularity"),
         "priority": task.get("priority") or "normal",
@@ -643,6 +983,19 @@ async def tasks_done(task_id: int):
     return {"ok": True}
 
 
+@app.post("/api/tasks/{task_id}/breakdown")
+async def tasks_breakdown(task_id: int):
+    """最初の一歩と小さな手順を、現在のタイトル・メモから作り直す。"""
+    unavailable = _require_task_store()
+    if unavailable is not None:
+        return unavailable
+    ok = await asyncio.to_thread(task_store.regenerate_breakdown, task_id)
+    if not ok:
+        return JSONResponse({"error": "task not found or not open"}, status_code=404)
+    task = await asyncio.to_thread(task_store.get, task_id)
+    return {"task": _task_to_json(task)}
+
+
 @app.post("/api/tasks/{task_id}/drop")
 async def tasks_drop(task_id: int):
     unavailable = _require_task_store()
@@ -671,6 +1024,241 @@ async def tasks_snooze(task_id: int, request: Request):
     if not ok:
         return JSONResponse({"error": "task not found or not open"}, status_code=404)
     return {"ok": True, "until": until.isoformat()}
+
+
+# --- Google Calendar イベント API ---
+# 読み取りは upcoming.json (Discord 側 pull ワーカーが定期更新するキャッシュ) から。
+# 書き込みは MCP で Google に直接反映し、成功したらキャッシュも楽観更新する
+# (次回 pull で正となる値に洗い替えされる)。
+
+
+def _read_upcoming_payload() -> dict:
+    try:
+        with open(UPCOMING_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _patch_upcoming_cache(mutate) -> None:
+    """upcoming.json を読み、mutate(events_list) で変更してアトミックに書き戻す。
+
+    キャッシュ更新は best-effort。失敗しても API 自体は成功扱い
+    (Google には反映済みで、次回 pull で追いつくため)。
+    """
+    try:
+        payload = _read_upcoming_payload()
+        events = payload.get("events")
+        if not isinstance(events, list):
+            events = []
+        payload["events"] = events
+        mutate(events)
+        events.sort(key=lambda e: str(e.get("start") or ""))
+        UPCOMING_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = UPCOMING_PATH.with_suffix(UPCOMING_PATH.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, UPCOMING_PATH)
+    except Exception as e:
+        logger.warning("upcoming.json 楽観更新失敗 (pull で追いつくため無視): %s", e)
+
+
+def _require_calendar_client() -> Optional[JSONResponse]:
+    if calendar_client is None:
+        return JSONResponse(
+            {"error": "Calendar not available", "hint": "TASKS_CALENDAR_SYNC_ENABLED=true と OAuth 設定が必要です"},
+            status_code=503,
+        )
+    return None
+
+
+def _parse_event_window(body: dict, base: Optional[dict] = None) -> tuple[str, str, Optional[str]]:
+    """body の date/time/duration_min から (start, end, error) を作る。
+
+    date: "YYYY-MM-DD" 必須 (PATCH 時は base の start から補完可)。
+    time: "HH:MM" (空なら終日イベント)。duration_min: 時刻付きの長さ (既定60分)。
+    """
+    date_str = str(body.get("date") or "").strip()
+    time_str = str(body.get("time") or "").strip()
+    if base is not None:
+        base_start = str(base.get("start") or "")
+        if not date_str:
+            date_str = base_start[:10]
+        # time キー自体が無いときは元の時刻を維持する (date だけの変更で
+        # 時刻付き予定が終日に化けないように)。time="" は明示的な終日化。
+        if "time" not in body and "T" in base_start:
+            time_str = base_start[11:16]
+    try:
+        d = date.fromisoformat(date_str)
+    except ValueError:
+        return "", "", "date は YYYY-MM-DD 形式で指定してください"
+    if not time_str:
+        return d.isoformat(), (d + timedelta(days=1)).isoformat(), None
+    try:
+        hh, mm = time_str.split(":", 1)
+        start_dt = datetime(d.year, d.month, d.day, int(hh), int(mm))
+    except (ValueError, TypeError):
+        return "", "", "time は HH:MM 形式で指定してください"
+    try:
+        duration = int(body.get("duration_min") or 60)
+    except (ValueError, TypeError):
+        duration = 60
+    duration = max(5, min(duration, 24 * 60))
+    end_dt = start_dt + timedelta(minutes=duration)
+    return (
+        start_dt.isoformat(timespec="seconds"),
+        end_dt.isoformat(timespec="seconds"),
+        None,
+    )
+
+
+@app.get("/api/calendar/events")
+async def calendar_events_list(start: str = "", end: str = ""):
+    """upcoming.json のイベントを日付範囲 (start/end, YYYY-MM-DD, 両端含む) で返す。"""
+    payload = _read_upcoming_payload()
+    events = [e for e in payload.get("events", []) if isinstance(e, dict)]
+    if start:
+        events = [e for e in events if str(e.get("start") or "")[:10] >= start]
+    if end:
+        events = [e for e in events if str(e.get("start") or "")[:10] <= end]
+    return {
+        "events": events,
+        "generated_at": payload.get("generated_at", ""),
+        "range": payload.get("range", {}),
+        "timezone": payload.get("timezone", tasks_timezone),
+        "writable": calendar_client is not None,
+    }
+
+
+@app.post("/api/calendar/events")
+async def calendar_event_create(request: Request):
+    """Google Calendar にイベントを作成する。
+
+    body: {"title": str, "date": "YYYY-MM-DD", "time": "HH:MM"?, "duration_min": int?,
+           "location": str?, "description": str?}
+    """
+    unavailable = _require_calendar_client()
+    if unavailable is not None:
+        return unavailable
+    body = await request.json()
+    title = str(body.get("title") or "").strip()
+    if not title:
+        return JSONResponse({"error": "title is required"}, status_code=400)
+    start_str, end_str, err = _parse_event_window(body)
+    if err:
+        return JSONResponse({"error": err}, status_code=400)
+    location = str(body.get("location") or "").strip()
+    description = str(body.get("description") or "").strip()
+
+    res = await asyncio.to_thread(
+        lambda: calendar_client.create_event(
+            calendar_id=tasks_calendar_id,
+            summary=title,
+            start=start_str,
+            end=end_str,
+            description=description,
+            location=location,
+            timezone=tasks_timezone,
+        )
+    )
+    if not res.ok:
+        return JSONResponse({"error": f"作成に失敗しました: {res.error}"}, status_code=502)
+
+    event = {
+        "title": title,
+        "start": start_str,
+        "end": end_str,
+        "location": location,
+        "description": description,
+        "event_id": res.event_id,
+    }
+    _patch_upcoming_cache(lambda events: events.append(dict(event)))
+    return JSONResponse({"event": event}, status_code=201)
+
+
+@app.patch("/api/calendar/events/{event_id}")
+async def calendar_event_update(event_id: str, request: Request):
+    """既存イベントを更新する。渡したフィールドのみ変更。"""
+    unavailable = _require_calendar_client()
+    if unavailable is not None:
+        return unavailable
+    body = await request.json()
+
+    cached = next(
+        (
+            e
+            for e in _read_upcoming_payload().get("events", [])
+            if isinstance(e, dict) and e.get("event_id") == event_id
+        ),
+        None,
+    )
+
+    kwargs: dict = {}
+    if "title" in body:
+        title = str(body.get("title") or "").strip()
+        if not title:
+            return JSONResponse({"error": "title is required"}, status_code=400)
+        kwargs["summary"] = title
+    if "date" in body or "time" in body or "duration_min" in body:
+        start_str, end_str, err = _parse_event_window(body, base=cached)
+        if err:
+            return JSONResponse({"error": err}, status_code=400)
+        kwargs["start"] = start_str
+        kwargs["end"] = end_str
+    if "location" in body:
+        kwargs["location"] = str(body.get("location") or "").strip()
+    if "description" in body:
+        kwargs["description"] = str(body.get("description") or "").strip()
+    if not kwargs:
+        return JSONResponse({"error": "no fields to update"}, status_code=400)
+
+    res = await asyncio.to_thread(
+        lambda: calendar_client.update_event(
+            event_id,
+            calendar_id=tasks_calendar_id,
+            timezone=tasks_timezone,
+            **kwargs,
+        )
+    )
+    if not res.ok:
+        return JSONResponse({"error": f"更新に失敗しました: {res.error}"}, status_code=502)
+
+    def _apply(events: list) -> None:
+        for e in events:
+            if isinstance(e, dict) and e.get("event_id") == event_id:
+                if "summary" in kwargs:
+                    e["title"] = kwargs["summary"]
+                if "start" in kwargs:
+                    e["start"] = kwargs["start"]
+                    e["end"] = kwargs["end"]
+                if "location" in kwargs:
+                    e["location"] = kwargs["location"]
+                if "description" in kwargs:
+                    e["description"] = kwargs["description"]
+
+    _patch_upcoming_cache(_apply)
+    return {"ok": True, "event_id": event_id}
+
+
+@app.delete("/api/calendar/events/{event_id}")
+async def calendar_event_delete(event_id: str):
+    unavailable = _require_calendar_client()
+    if unavailable is not None:
+        return unavailable
+    res = await asyncio.to_thread(
+        lambda: calendar_client.delete_event(event_id, calendar_id=tasks_calendar_id)
+    )
+    if not res.ok:
+        return JSONResponse({"error": f"削除に失敗しました: {res.error}"}, status_code=502)
+    def _apply(events: list) -> None:
+        events[:] = [
+            e for e in events
+            if not (isinstance(e, dict) and e.get("event_id") == event_id)
+        ]
+
+    _patch_upcoming_cache(_apply)
+    return {"ok": True}
 
 
 @app.post("/api/tts")
@@ -1209,23 +1797,180 @@ async def history_session_delete(filename: str):
 
 # --- WebSocket チャット ---
 
-def get_or_create_session(session_id: str) -> ChatSession:
-    """セッションを取得または新規作成"""
-    if session_id not in sessions:
-        sessions[session_id] = ChatSession(
-            system_prompt=config.system_prompt,
-            max_history_turns=config.max_history_turns,
-            history_dir=str(PROJECT_ROOT / config.history_dir),
-            rag=rag,
-            vision_context=vision,
-            screen_context=screen,
-            monitor_context=monitor,
-            task_store=task_store,
-            preloader=preloader,
-            web_search=web_search,
-            emotion_tags=config.emotion_tag_enabled,
+def _try_register_event_text(text: str) -> Optional[str]:
+    """予定登録の意図があれば Google Calendar に登録して結果文を返す (無ければ None)。
+
+    ブロッキング (MCP 呼び出しで数秒) なので to_thread 経由で呼ぶこと。
+    """
+    try:
+        from src.tasks.event_intent import try_register_event
+
+        return try_register_event(
+            text,
+            client=calendar_client,
+            calendar_id=tasks_calendar_id,
+            timezone_name=tasks_timezone,
+            upcoming_path=UPCOMING_PATH,
         )
-    return sessions[session_id]
+    except Exception as e:
+        logger.error("event register failed: %s", e)
+        return None
+
+
+def _try_edit_task_text(text: str, session_id: str) -> Optional[str]:
+    """明示的なタスク操作だけをルールベースで処理する。"""
+    try:
+        return task_chat_editor.handle(
+            text,
+            store=task_store,
+            session_id=session_id,
+        )
+    except Exception as e:
+        logger.error("task chat edit failed: %s", e)
+        return "タスクの編集中にエラーが起きました。まだ変更は反映していません。"
+
+
+async def _send_direct_chat_reply(
+    websocket: WebSocket,
+    *,
+    session_id: str,
+    user_text: str,
+    reply: str,
+    want_tts: bool,
+) -> None:
+    """LLMを介さないタスク/予定操作も、通常の会話と同じ形で保存・配信する。"""
+    session = get_or_create_session(session_id)
+    session.add_user_message(user_text)
+    session.add_assistant_message(reply)
+    try:
+        session.save()
+    except Exception:
+        pass
+    await websocket.send_json({"type": "token", "content": reply})
+    await websocket.send_json({"type": "done", "full_text": reply})
+    if want_tts and tts is not None:
+        try:
+            wav_data = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: tts.synthesize(reply)
+            )
+            await websocket.send_json({
+                "type": "audio",
+                "data": base64.b64encode(wav_data).decode("ascii"),
+            })
+        except Exception as e:
+            await websocket.send_json({
+                "type": "error",
+                "message": f"TTS error: {e}",
+            })
+
+
+def _new_chat_session() -> ChatSession:
+    """現在の依存コンポーネントを注入した ChatSession を新規作成する。"""
+    return ChatSession(
+        system_prompt=config.system_prompt,
+        max_history_turns=config.max_history_turns,
+        history_dir=str(PROJECT_ROOT / config.history_dir),
+        rag=rag,
+        vision_context=vision,
+        screen_context=screen,
+        monitor_context=monitor,
+        task_store=task_store,
+        preloader=preloader,
+        web_search=web_search,
+        growth_tracker=growth_tracker,
+        conversation_source="web",
+        emotion_tags=config.emotion_tag_enabled,
+    )
+
+
+def _history_dir_path() -> Path:
+    return _history_dir()
+
+
+def _messages_for_resume(session: ChatSession) -> list[dict]:
+    """resume API 用に user/assistant の文字列 content だけ抽出する。"""
+    out = []
+    for m in session.messages:
+        role = m.get("role")
+        content = m.get("content")
+        if role in ("user", "assistant") and isinstance(content, str):
+            out.append({"role": role, "content": content})
+    return out
+
+
+@app.get("/api/chat/resume")
+async def chat_resume(session_id: str | None = None):
+    """直近の会話を引き継ぐためのセッション情報を返す。
+
+    - session_id 指定かつ安全: そのIDで復元 (不在なら空セッション、新IDは発行しない)
+      不正ID: 400
+    - 指定なし: 最新の有効履歴を引き継ぐ。無ければ新しい web_<ms> ID を発行
+    """
+    history_dir = _history_dir_path()
+
+    if session_id is not None:
+        session_id = session_id.strip()
+        if not history_admin.is_safe_session_id(session_id):
+            return JSONResponse({"error": "invalid session_id"}, status_code=400)
+        session = get_or_create_session(session_id)
+        return {"session_id": session.session_id, "messages": _messages_for_resume(session)}
+
+    latest = history_admin.read_latest_valid_session(history_dir)
+    if latest is not None:
+        latest_id = latest.get("session_id")
+        if latest_id and history_admin.is_safe_session_id(str(latest_id)):
+            session = get_or_create_session(str(latest_id))
+            return {"session_id": session.session_id, "messages": _messages_for_resume(session)}
+
+    # 保存IDも履歴も無い初回 → 新ID発行
+    new_id = f"web_{int(time.time() * 1000)}"
+    return {"session_id": new_id, "messages": []}
+
+
+def get_or_create_session(session_id: str) -> ChatSession:
+    """セッションを取得または新規作成。
+
+    安全なIDに対応する session_<id>.json が存在すれば ChatSession.load で復元し、
+    無ければ新規作成後に session.session_id を要求IDに設定して以降同じファイルへ save する。
+    """
+    if not history_admin.is_safe_session_id(session_id):
+        raise ValueError("invalid session_id")
+    if session_id in sessions:
+        return sessions[session_id]
+
+    history_dir = _history_dir_path()
+    session_file = history_admin.session_file_for(history_dir, session_id)
+    if session_file is not None and history_admin.read_session_by_id(history_dir, session_id):
+        try:
+            session = ChatSession.load(
+                session_file,
+                max_history_turns=config.max_history_turns,
+                history_dir=str(history_dir),
+                rag=rag,
+                vision_context=vision,
+                screen_context=screen,
+                monitor_context=monitor,
+                task_store=task_store,
+                preloader=preloader,
+                web_search=web_search,
+                growth_tracker=growth_tracker,
+                conversation_source="web",
+                emotion_tags=config.emotion_tag_enabled,
+            )
+            # 復元時も現在設定の system_prompt を優先
+            session.system_prompt = config.system_prompt
+            session.emotion_tags = config.emotion_tag_enabled
+            session.max_history_turns = config.max_history_turns
+            session.session_id = session_id
+            sessions[session_id] = session
+            return session
+        except Exception as e:
+            logger.warning("session load failed for %s: %s", session_id, e)
+
+    session = _new_chat_session()
+    session.session_id = session_id
+    sessions[session_id] = session
+    return session
 
 
 @app.websocket("/ws/chat")
@@ -1259,6 +2004,13 @@ async def websocket_chat(websocket: WebSocket):
             user_text = data.get("text", "").strip()
             session_id = data.get("session_id", "default")
             want_tts = data.get("tts", False)
+
+            if not history_admin.is_safe_session_id(session_id):
+                await websocket.send_json({
+                    "type": "error",
+                    "message": "invalid session_id",
+                })
+                continue
 
             # --- 音声メッセージ処理 ---
             if msg_type == "audio_message":
@@ -1328,6 +2080,40 @@ async def websocket_chat(websocket: WebSocket):
                     continue
 
             if not user_text:
+                continue
+
+            # 「タスクを見せて」「タスク13を明日に変更」などは
+            # LLMを介さず、曖昧性検査と削除確認を持つ編集器で処理する。
+            task_reply = await asyncio.to_thread(
+                _try_edit_task_text, user_text, session_id
+            )
+            if task_reply is not None:
+                if idle_manager is not None and inference_started:
+                    idle_manager.notify_inference_end()
+                    inference_started = False
+                await _send_direct_chat_reply(
+                    websocket,
+                    session_id=session_id,
+                    user_text=user_text,
+                    reply=task_reply,
+                    want_tts=want_tts,
+                )
+                continue
+
+            # 「予定: ...」「〜の予定入れて」は LLM を介さず Google Calendar に
+            # 登録し、定型文で応答する (日時解釈はルールベース)。
+            event_reply = await asyncio.to_thread(_try_register_event_text, user_text)
+            if event_reply is not None:
+                if idle_manager is not None and inference_started:
+                    idle_manager.notify_inference_end()
+                    inference_started = False
+                await _send_direct_chat_reply(
+                    websocket,
+                    session_id=session_id,
+                    user_text=user_text,
+                    reply=event_reply,
+                    want_tts=want_tts,
+                )
                 continue
 
             # アイドル管理: ユーザー操作通知

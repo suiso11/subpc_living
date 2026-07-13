@@ -10,6 +10,12 @@ let calCursor = null;
 let selectedDayKey = null;
 let previewDebounceTimer = null;
 let detailsOpen = false;
+// Google Calendar の予定 (upcoming.json キャッシュ由来)
+let calEvents = [];
+let calEventsRange = null; // {start, end} 取得済み範囲
+let calWritable = false;
+let calEventsLoaded = false;
+let editingEventId = null;
 
 const addForm = $('#task-add-form');
 const textInput = $('#task-text-input');
@@ -169,9 +175,9 @@ function remainingText(task) {
 }
 
 function priorityLabel(priority) {
-  if (priority === 'high') return '高';
-  if (priority === 'low') return '低';
-  return '普通';
+  if (priority === 'high') return 'だいじ';
+  if (priority === 'low') return 'あとで';
+  return 'ふつう';
 }
 
 function setMetric(el, value) {
@@ -225,6 +231,10 @@ function renderTaskRow(task) {
   const today = isToday(task);
   const remaining = remainingText(task);
   const dueClass = overdue ? 'overdue' : today ? 'today' : '';
+  const steps = Array.isArray(task.steps) ? task.steps.filter(Boolean).slice(0, 3) : [];
+  const chatPrompt = encodeURIComponent(
+    `タスク#${task.id}「${task.title}」の最初の一歩を一緒に始めたい。まずは「${task.action_hint || '完了条件を1行で書く'}」`
+  );
   return `
     <article class="task-row ${overdue ? 'overdue' : ''}" data-id="${task.id}" data-touch-x="0">
       <button class="task-check-btn" data-action="done" data-id="${task.id}" type="button" aria-label="タスク完了"></button>
@@ -233,6 +243,19 @@ function renderTaskRow(task) {
           <strong>${escapeHtml(task.title)}</strong>
           ${task.note ? `<p class="task-note">${escapeHtml(task.note)}</p>` : ''}
         </div>
+        ${task.action_hint ? `
+          <div class="task-first-step">
+            <span class="task-first-step-label">まずこれ</span>
+            <span>${escapeHtml(task.action_hint)}</span>
+            <a href="/?prompt=${chatPrompt}" class="task-start-link">一緒に始める</a>
+          </div>
+        ` : ''}
+        ${steps.length ? `
+          <details class="task-breakdown">
+            <summary>${steps.length}ステップを見る</summary>
+            <ol>${steps.map((step) => `<li>${escapeHtml(step)}</li>`).join('')}</ol>
+          </details>
+        ` : ''}
         <div class="task-meta">
           ${task.due_at ? `<span class="due-text ${dueClass}">${escapeHtml(formatDue(task))}</span>` : '<span class="due-text">期限なし</span>'}
           ${remaining ? `<span class="remaining-text ${overdue ? 'overdue' : ''}">${escapeHtml(remaining)}</span>` : ''}
@@ -242,6 +265,7 @@ function renderTaskRow(task) {
       <button class="task-action-menu" data-action="menu" data-id="${task.id}" type="button" aria-label="操作メニュー">⋯</button>
       <div class="task-actions-expanded" hidden>
         <button class="action-item edit" data-action="edit" data-id="${task.id}" type="button">編集</button>
+        <button class="action-item" data-action="regenerate" data-id="${task.id}" type="button">手順を作り直す</button>
         <button class="action-item" data-action="snooze" data-when="30m" data-id="${task.id}" type="button">+30分</button>
         <button class="action-item" data-action="snooze-tomorrow" data-id="${task.id}" type="button">明日へ</button>
         <button class="action-item danger" data-action="drop" data-id="${task.id}" type="button">削除</button>
@@ -258,11 +282,12 @@ function renderEditRow(task) {
           <input name="title" type="text" value="${escapeHtml(task.title)}" placeholder="タイトル" required>
           <input name="due" type="text" value="${escapeHtml(formatDue(task))}" placeholder="期限 例: 明日 18時 / 金曜">
           <select name="priority" aria-label="優先度">
-            <option value="normal" ${task.priority === 'normal' ? 'selected' : ''}>普通</option>
-            <option value="high" ${task.priority === 'high' ? 'selected' : ''}>高</option>
-            <option value="low" ${task.priority === 'low' ? 'selected' : ''}>低</option>
+            <option value="normal" ${task.priority === 'normal' ? 'selected' : ''}>ふつう</option>
+            <option value="high" ${task.priority === 'high' ? 'selected' : ''}>だいじ</option>
+            <option value="low" ${task.priority === 'low' ? 'selected' : ''}>あとで</option>
           </select>
           <input name="note" type="text" value="${escapeHtml(task.note || '')}" placeholder="メモ (任意)">
+          <input name="action_hint" type="text" value="${escapeHtml(task.action_hint || '')}" placeholder="最初の一歩 (5分以内)">
           <div class="due-quick compact">${dueChipsHtml()}</div>
           <div class="edit-actions">
             <button class="primary-btn compact" type="submit">保存</button>
@@ -284,8 +309,8 @@ function render() {
   if (!tasks.length) {
     taskList.innerHTML = `
       <div class="task-empty-row">
-        <span class="empty-title">タスクはありません</span>
-        <span class="empty-hint">上のフォームからタスクを追加できます。</span>
+        <span class="empty-title">まだ何もありません</span>
+        <span class="empty-hint">思いついたら上から追加できます。</span>
       </div>
     `;
     return;
@@ -320,8 +345,8 @@ function render() {
 
   taskList.innerHTML = html.length ? html.join('') : `
     <div class="task-empty-row">
-      <span class="empty-title">該当するタスクはありません</span>
-      <span class="empty-hint">タスクを追加または他の条件で確認してください。</span>
+      <span class="empty-title">ここにはまだありません</span>
+      <span class="empty-hint">別の日を見るか、新しく追加してみましょう。</span>
     </div>
   `;
 }
@@ -409,6 +434,7 @@ async function addTask(event) {
     detailsOpen = false;
     detailsSection.hidden = true;
     detailsToggle.classList.remove('active');
+    detailsToggle.textContent = 'こまかく';
     previewLine.hidden = true;
     await loadTasks();
     textInput.focus();
@@ -458,7 +484,7 @@ async function handleActionClick(event) {
     return;
   }
 
-  if (action === 'drop' && !confirm(`このタスクを削除しますか？`)) {
+  if (action === 'drop' && !confirm('この「やること」を削除しますか？')) {
     return;
   }
 
@@ -482,6 +508,11 @@ async function handleActionClick(event) {
         method: 'POST',
         body: JSON.stringify({ when: '明日' }),
       });
+    } else if (action === 'regenerate') {
+      await requestJSON(`/api/tasks/${id}/breakdown`, {
+        method: 'POST',
+        body: '{}',
+      });
     }
     await loadTasks();
   } catch (err) {
@@ -504,6 +535,7 @@ async function saveEdit(event) {
     title: String(data.get('title') || '').trim(),
     priority: String(data.get('priority') || 'normal'),
     note: String(data.get('note') || '').trim(),
+    action_hint: String(data.get('action_hint') || '').trim(),
   };
   if (!payload.title) {
     setError('タイトルは必須です');
@@ -556,6 +588,11 @@ function setView(view) {
     const now = new Date();
     if (!calCursor) calCursor = { y: now.getFullYear(), m: now.getMonth() };
     if (!selectedDayKey) selectedDayKey = dayKeyOf(now);
+    if (!calEventsLoaded) {
+      loadCalendarEvents().then(() => {
+        if (viewMode === 'calendar') renderCalendar();
+      });
+    }
   }
   render();
 }
@@ -564,6 +601,51 @@ function dayKeyOf(date) {
   const mm = String(date.getMonth() + 1).padStart(2, '0');
   const dd = String(date.getDate()).padStart(2, '0');
   return `${date.getFullYear()}-${mm}-${dd}`;
+}
+
+// --- Google Calendar 予定 ---
+
+async function loadCalendarEvents() {
+  try {
+    const data = await requestJSON('/api/calendar/events');
+    calEvents = (data.events || []).filter((e) => e && e.start);
+    calEventsRange = data.range && data.range.start ? data.range : null;
+    calWritable = !!data.writable;
+    calEventsLoaded = true;
+  } catch (err) {
+    // 予定が取れなくてもタスク表示は続行する
+    calEvents = [];
+    calEventsLoaded = true;
+  }
+}
+
+function eventDayKey(ev) {
+  return String(ev.start || '').slice(0, 10);
+}
+
+function eventTimeLabel(ev) {
+  const start = String(ev.start || '');
+  if (!start.includes('T')) return '終日';
+  const d = new Date(start);
+  if (Number.isNaN(d.getTime())) return '';
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
+function eventsByDay() {
+  const map = new Map();
+  calEvents.forEach((ev) => {
+    const key = eventDayKey(ev);
+    if (!key) return;
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(ev);
+  });
+  map.forEach((list) => list.sort((a, b) => String(a.start).localeCompare(String(b.start))));
+  return map;
+}
+
+function calEventChip(ev) {
+  const label = `${eventTimeLabel(ev) === '終日' ? '' : eventTimeLabel(ev) + ' '}${ev.title}`;
+  return `<span class="cal-chip gcal" title="${escapeHtml(ev.title)}">${escapeHtml(label)}</span>`;
 }
 
 function tasksByDay() {
@@ -619,11 +701,22 @@ function renderCalendar() {
   }
 
   const byDay = tasksByDay();
+  const evByDay = eventsByDay();
+  const monthPrefix = `${y}-${String(m + 1).padStart(2, '0')}`;
   const monthCount = tasks.filter((task) => {
     const due = dueDate(task);
     return due && due.getFullYear() === y && due.getMonth() === m;
   }).length;
-  calMonthCount.textContent = monthCount ? `${monthCount} 件` : '';
+  const monthEvCount = calEvents.filter((ev) => eventDayKey(ev).startsWith(monthPrefix)).length;
+  const countParts = [];
+  if (monthCount) countParts.push(`やること ${monthCount}件`);
+  if (monthEvCount) countParts.push(`予定${monthEvCount}件`);
+  // 取得済み範囲外の月は「予定未取得」と明示する (キャッシュは過去2週〜先45日)
+  if (calEventsRange
+      && (`${monthPrefix}-31` < calEventsRange.start || `${monthPrefix}-01` > calEventsRange.end)) {
+    countParts.push('予定は未取得の範囲');
+  }
+  calMonthCount.textContent = countParts.join(' / ');
 
   const first = new Date(y, m, 1);
   const daysInMonth = new Date(y, m + 1, 0).getDate();
@@ -636,29 +729,71 @@ function renderCalendar() {
     const d = new Date(start.getFullYear(), start.getMonth(), start.getDate() + i);
     const key = dayKeyOf(d);
     const dayTasks = byDay.get(key) || [];
+    const dayEvents = evByDay.get(key) || [];
     const cls = ['cal-cell'];
     if (d.getMonth() !== m) cls.push('out');
     if (key === todayKey) cls.push('today');
     if (key === selectedDayKey) cls.push('selected');
     if (d.getDay() === 0) cls.push('sun');
     if (d.getDay() === 6) cls.push('sat');
-    const chips = dayTasks.slice(0, 3).map(calChip).join('');
-    const more = dayTasks.length > 3 ? `<span class="cal-more">+${dayTasks.length - 3}件</span>` : '';
-    const dots = dayTasks.length
-      ? `<span class="cal-dots">${dayTasks.slice(0, 4).map(calDot).join('')}</span>`
+    // 予定 (Google Calendar) を先に、タスクを後に。チップは合計3件まで。
+    const chipItems = [
+      ...dayEvents.map((ev) => calEventChip(ev)),
+      ...dayTasks.map((task) => calChip(task)),
+    ];
+    const chips = chipItems.slice(0, 3).join('');
+    const moreCount = chipItems.length - 3;
+    const more = moreCount > 0 ? `<span class="cal-more">+${moreCount}件</span>` : '';
+    const dotItems = [
+      ...dayEvents.map(() => '<i class="cal-dot gcal"></i>'),
+      ...dayTasks.map((task) => calDot(task)),
+    ];
+    const dots = dotItems.length
+      ? `<span class="cal-dots">${dotItems.slice(0, 4).join('')}</span>`
       : '';
     cells.push(`
-      <button class="${cls.join(' ')}" type="button" data-day="${key}" aria-label="${key} のタスク ${dayTasks.length}件">
+      <button class="${cls.join(' ')}" type="button" data-day="${key}" aria-label="${key} やること${dayTasks.length}件 予定${dayEvents.length}件">
         <span class="cal-date">${d.getDate()}</span>
         ${chips}${more}${dots}
       </button>
     `);
   }
   calGrid.innerHTML = cells.join('');
-  renderDayPanel(byDay);
+  renderDayPanel(byDay, evByDay);
 }
 
-function renderDayPanel(byDay) {
+function renderEventRow(ev) {
+  const time = eventTimeLabel(ev);
+  const location = ev.location ? `<span class="task-muted"> @${escapeHtml(ev.location)}</span>` : '';
+  const actions = calWritable ? `
+    <span class="cal-event-actions">
+      <button class="secondary-btn compact" type="button" data-event-action="edit" data-event-id="${escapeHtml(ev.event_id)}">編集</button>
+      <button class="secondary-btn compact" type="button" data-event-action="delete" data-event-id="${escapeHtml(ev.event_id)}">削除</button>
+    </span>` : '';
+  return `
+    <div class="cal-event-row">
+      <span class="cal-event-time">${escapeHtml(time)}</span>
+      <span class="cal-event-title">📅 ${escapeHtml(ev.title)}${location}</span>
+      ${actions}
+    </div>
+  `;
+}
+
+function renderEventEditRow(ev) {
+  const time = eventTimeLabel(ev);
+  return `
+    <form class="cal-event-row editing cal-event-edit-form" data-event-id="${escapeHtml(ev.event_id)}">
+      <input name="time" type="text" value="${time === '終日' ? '' : escapeHtml(time)}" placeholder="HH:MM (空=終日)" class="cal-event-time-input">
+      <input name="title" type="text" value="${escapeHtml(ev.title)}" placeholder="予定名" required>
+      <span class="cal-event-actions">
+        <button class="primary-btn compact" type="submit">保存</button>
+        <button class="secondary-btn compact" type="button" data-event-action="cancel-edit">キャンセル</button>
+      </span>
+    </form>
+  `;
+}
+
+function renderDayPanel(byDay, evByDay) {
   if (!selectedDayKey) {
     calDayPanel.hidden = true;
     calDayPanel.innerHTML = '';
@@ -668,24 +803,49 @@ function renderDayPanel(byDay) {
   const d = new Date(yy, mm - 1, dd);
   const heading = `${mm}/${dd} (${WEEKDAY_LABELS[d.getDay()]})`;
   const dayTasks = byDay.get(selectedDayKey) || [];
+  const dayEvents = (evByDay && evByDay.get(selectedDayKey)) || [];
+
+  const eventRows = dayEvents.map((ev) => (
+    editingEventId && ev.event_id === editingEventId ? renderEventEditRow(ev) : renderEventRow(ev)
+  )).join('');
+  const eventBlock = dayEvents.length
+    ? `<div class="cal-event-list">${eventRows}</div>`
+    : '';
+
   const body = dayTasks.length
     ? dayTasks.map((task) => (
       editingTaskId === task.id ? renderEditRow(task) : renderTaskRow(task)
     )).join('')
-    : '<div class="task-empty-row"><span class="empty-hint">この日のタスクはありません</span></div>';
+    : (dayEvents.length ? '' : '<div class="task-empty-row"><span class="empty-hint">この日はまだ何もありません</span></div>');
+  const addEventBtn = calWritable
+    ? `<button class="secondary-btn compact" type="button" data-add-event-day="${selectedDayKey}">＋予定</button>`
+    : '';
   calDayPanel.hidden = false;
   calDayPanel.innerHTML = `
     <div class="cal-day-head">
-      <span>${escapeHtml(heading)} のタスク <span class="task-muted">${dayTasks.length} 件</span></span>
-      <button class="secondary-btn compact" type="button" data-add-day="${selectedDayKey}">＋追加</button>
+      <span>${escapeHtml(heading)} <span class="task-muted">やること ${dayTasks.length}件・予定 ${dayEvents.length}件</span></span>
+      <span class="cal-day-head-actions">
+        ${addEventBtn}
+        <button class="secondary-btn compact" type="button" data-add-day="${selectedDayKey}">＋やること</button>
+      </span>
     </div>
+    ${eventBlock}
     ${body}
   `;
 }
 
 function handleCalendarClick(event) {
+  if (event.target.closest('button[data-event-action]')) {
+    handleEventActionClick(event);
+    return;
+  }
   if (event.target.closest('button[data-action]')) {
     handleActionClick(event);
+    return;
+  }
+  const addEventBtn = event.target.closest('button[data-add-event-day]');
+  if (addEventBtn) {
+    handleCalendarDayAddEvent(addEventBtn);
     return;
   }
   const addBtn = event.target.closest('button[data-add-day]');
@@ -696,8 +856,126 @@ function handleCalendarClick(event) {
   const cell = event.target.closest('.cal-cell[data-day]');
   if (cell) {
     selectedDayKey = cell.dataset.day;
+    editingEventId = null;
     renderCalendar();
   }
+}
+
+async function handleEventActionClick(event) {
+  const btn = event.target.closest('button[data-event-action]');
+  if (!btn) return;
+  const action = btn.dataset.eventAction;
+  const id = btn.dataset.eventId || '';
+
+  if (action === 'edit') {
+    editingEventId = id;
+    renderCalendar();
+    return;
+  }
+  if (action === 'cancel-edit') {
+    editingEventId = null;
+    renderCalendar();
+    return;
+  }
+  if (action === 'delete') {
+    const ev = calEvents.find((e) => e.event_id === id);
+    if (!confirm(`予定「${ev ? ev.title : ''}」を Google カレンダーから削除しますか？`)) return;
+    btn.disabled = true;
+    setError('');
+    try {
+      await requestJSON(`/api/calendar/events/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      await loadCalendarEvents();
+      renderCalendar();
+    } catch (err) {
+      setError(`予定の削除失敗: ${err.message}`);
+      btn.disabled = false;
+    }
+  }
+}
+
+async function saveEventEdit(event) {
+  const form = event.target.closest('.cal-event-edit-form');
+  if (!form) return;
+  event.preventDefault();
+  const id = form.dataset.eventId;
+  const data = new FormData(form);
+  const title = String(data.get('title') || '').trim();
+  const time = String(data.get('time') || '').trim();
+  if (!title) {
+    setError('予定名は必須です');
+    return;
+  }
+  const payload = { title, date: selectedDayKey, time };
+  // 時刻付き予定は元の長さを維持する (未指定だとサーバー既定の60分になる)
+  const current = calEvents.find((e) => e.event_id === id);
+  if (time && current && String(current.start).includes('T') && String(current.end).includes('T')) {
+    const dur = (new Date(current.end) - new Date(current.start)) / 60000;
+    if (Number.isFinite(dur) && dur > 0) payload.duration_min = Math.round(dur);
+  }
+  const submitBtn = form.querySelector('button[type="submit"]');
+  if (submitBtn) submitBtn.disabled = true;
+  setError('');
+  try {
+    await requestJSON(`/api/calendar/events/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(payload),
+    });
+    editingEventId = null;
+    await loadCalendarEvents();
+    renderCalendar();
+  } catch (err) {
+    setError(`予定の保存失敗: ${err.message}`);
+  } finally {
+    if (submitBtn) submitBtn.disabled = false;
+  }
+}
+
+function handleCalendarDayAddEvent(btn) {
+  const dayKey = btn.dataset.addEventDay;
+  const panel = btn.closest('.cal-day-head').parentElement;
+  const existing = panel.querySelector('.cal-day-add-input');
+  if (existing) {
+    existing.remove();
+    return;
+  }
+  const wrapper = document.createElement('div');
+  wrapper.innerHTML = `
+    <div class="cal-day-add-input">
+      <input type="text" placeholder="予定を追加 (例: 15:00 歯医者 / 飲み会)" class="cal-day-input">
+    </div>
+  `;
+  const input = wrapper.querySelector('.cal-day-input');
+  btn.closest('.cal-day-head').insertAdjacentElement('afterend', wrapper.firstElementChild);
+
+  input.focus();
+  input.addEventListener('keydown', async (e) => {
+    if (e.key === 'Enter') {
+      const text = input.value.trim();
+      if (!text) return;
+      const m = text.match(/^(\d{1,2}):(\d{2})\s+(.+)$/);
+      const payload = m
+        ? { title: m[3].trim(), date: dayKey, time: `${m[1].padStart(2, '0')}:${m[2]}` }
+        : { title: text, date: dayKey, time: '' };
+      setError('');
+      try {
+        await requestJSON('/api/calendar/events', {
+          method: 'POST',
+          body: JSON.stringify(payload),
+        });
+        await loadCalendarEvents();
+        renderCalendar();
+      } catch (err) {
+        setError(`予定の追加失敗: ${err.message}`);
+      }
+    } else if (e.key === 'Escape') {
+      input.parentElement.remove();
+    }
+  });
+  input.addEventListener('blur', () => {
+    if (input.parentElement) {
+      input.parentElement.remove();
+    }
+  });
 }
 
 function handleCalendarDayAdd(btn) {
@@ -707,7 +985,7 @@ function handleCalendarDayAdd(btn) {
 
   const inputHtml = `
     <div class="cal-day-add-input">
-      <input type="text" placeholder="この日のタスクを追加" class="cal-day-input" data-date-prefix="${datePrefix}">
+      <input type="text" placeholder="この日のやることを追加" class="cal-day-input" data-date-prefix="${datePrefix}">
     </div>
   `;
   const panel = btn.closest('.cal-day-head').parentElement;
@@ -829,16 +1107,26 @@ function init() {
     detailsOpen = !detailsOpen;
     detailsSection.hidden = !detailsOpen;
     detailsToggle.classList.toggle('active', detailsOpen);
+    detailsToggle.textContent = detailsOpen ? 'とじる' : 'こまかく';
   });
 
-  refreshBtn.addEventListener('click', loadTasks);
+  refreshBtn.addEventListener('click', async () => {
+    await Promise.all([loadTasks(), loadCalendarEvents()]);
+    render();
+  });
   taskList.addEventListener('click', handleActionClick);
   taskList.addEventListener('submit', saveEdit);
   taskList.addEventListener('keydown', handleEditKeydown);
   taskList.addEventListener('touchstart', handleTaskSwipe);
 
   calShell.addEventListener('click', handleCalendarClick);
-  calShell.addEventListener('submit', saveEdit);
+  calShell.addEventListener('submit', (e) => {
+    if (e.target.closest('.cal-event-edit-form')) {
+      saveEventEdit(e);
+    } else {
+      saveEdit(e);
+    }
+  });
   calShell.addEventListener('keydown', handleEditKeydown);
 
   $('#cal-prev').addEventListener('click', () => moveMonth(-1));
@@ -863,6 +1151,13 @@ function init() {
   }
 
   loadTasks();
+
+  const routeParams = new URLSearchParams(window.location.search);
+  if (routeParams.get('new') === '1') {
+    textInput.focus();
+    textInput.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    window.history.replaceState({}, '', window.location.pathname);
+  }
 }
 
 document.addEventListener('DOMContentLoaded', init);

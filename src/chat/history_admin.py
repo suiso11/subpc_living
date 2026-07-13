@@ -6,10 +6,66 @@ import re
 from pathlib import Path
 
 _SESSION_FILE_RE = re.compile(r"^session_[\w.-]+\.json$")
+_SAFE_SESSION_ID_RE = re.compile(r"^[\w.-]{1,128}$")
 
 
 def _is_session_file(name: str) -> bool:
     return bool(_SESSION_FILE_RE.match(name)) and "/" not in name and "\\" not in name
+
+
+def is_safe_session_id(session_id: str) -> bool:
+    """セッションIDとして安全か検証する (path traversal / 空文字 / 記号を拒否)。"""
+    if not isinstance(session_id, str) or not session_id:
+        return False
+    return bool(_SAFE_SESSION_ID_RE.match(session_id))
+
+
+def session_file_for(history_dir: str | Path, session_id: str) -> Path | None:
+    """安全なIDの保存先を返す。不正IDでは None。"""
+    if not is_safe_session_id(session_id):
+        return None
+    return Path(history_dir) / f"session_{session_id}.json"
+
+
+def read_session_by_id(history_dir: str | Path, session_id: str) -> dict | None:
+    """安全な session_id から session_<id>.json を読み取る。不正・不在・破損は None。"""
+    if not is_safe_session_id(session_id):
+        return None
+    path = session_file_for(history_dir, session_id)
+    if path is None or not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(data, dict) or data.get("session_id") != session_id:
+        return None
+    return data
+
+
+def read_latest_valid_session(history_dir: str | Path) -> dict | None:
+    """履歴ディレクトリから最新の有効（読取可能な）セッションを返す。無ければ None。"""
+    directory = Path(history_dir)
+    if not directory.is_dir():
+        return None
+    candidates: list[tuple[str, dict]] = []
+    for path in directory.glob("session_*.json"):
+        if not _is_session_file(path.name):
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        session_id = data.get("session_id") if isinstance(data, dict) else None
+        expected_path = session_file_for(directory, session_id)
+        if expected_path is None or expected_path != path:
+            continue
+        sort_key = data.get("saved_at") or data.get("created_at") or ""
+        candidates.append((sort_key, data))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda t: t[0], reverse=True)
+    return candidates[0][1]
 
 
 def list_sessions(history_dir: str | Path) -> list[dict]:

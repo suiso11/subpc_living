@@ -27,6 +27,7 @@ from zoneinfo import ZoneInfo
 import discord
 
 from src.discord_bot.task_ui import make_due_summary, parse_due
+from src.tasks.prioritizer import format_focus_decision
 from src.tasks.store import VALID_PRIORITY
 
 UTC = timezone.utc
@@ -37,6 +38,7 @@ SELECT_MAX_OPTIONS = 25
 
 ADD_BUTTON_CUSTOM_ID = "taskboard:add:v1"
 SELECT_CUSTOM_ID = "taskboard:select:v1"
+FOCUS_BUTTON_CUSTOM_ID = "taskboard:focus:v1"
 
 _PRIORITY_EMOJI = {"high": "🔴", "normal": "⚪", "low": "🔵"}
 
@@ -504,6 +506,27 @@ class TaskBoardView(discord.ui.View):
             return
         await interaction.response.send_modal(TaskModal(self.manager.state, source="board"))
 
+    @discord.ui.button(
+        label="🎯 今やる",
+        style=discord.ButtonStyle.primary,
+        custom_id=FOCUS_BUTTON_CUSTOM_ID,
+        row=1,
+    )
+    async def focus_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self._allowed(interaction):
+            await interaction.response.send_message("この操作は許可されていません。", ephemeral=True)
+            return
+        controller = getattr(self.manager.state, "priority_controller", None)
+        if controller is None:
+            await interaction.response.send_message(
+                "優先順位オーケストレーターが無効です。", ephemeral=True
+            )
+            return
+        decision = await asyncio.to_thread(controller.recommend)
+        await interaction.response.send_message(
+            format_focus_decision(decision, self.manager._tz()), ephemeral=True
+        )
+
     def _allowed(self, interaction: discord.Interaction) -> bool:
         return self.manager.state.is_allowed_feedback(
             interaction.user.id, interaction.channel_id or 0
@@ -724,6 +747,29 @@ class TaskBoardManager:
             return []
         return await asyncio.to_thread(store.list, "open", 1000)
 
+    async def _build_embed(self, tasks: list[dict], tz: ZoneInfo, now: datetime) -> discord.Embed:
+        embed = build_board_embed(tasks, tz, now)
+        controller = getattr(self.state, "priority_controller", None)
+        if controller is None:
+            return embed
+        try:
+            decision = await asyncio.to_thread(
+                controller.recommend, now=now, select=False
+            )
+        except Exception:
+            return embed
+        if decision is not None:
+            task = decision.task
+            mode = "固定中" if decision.current else "推奨"
+            reason = " / ".join(decision.ranked.reasons[:2])
+            embed.insert_field_at(
+                0,
+                name=f"🎯 今やる ({mode})",
+                value=f"`#{task['id']}` {task['title']}\n{reason}",
+                inline=False,
+            )
+        return embed
+
     async def setup(self) -> None:
         """既存ボードを探して無ければ作る。起動後 (on_ready) に1度呼ぶ。"""
         if not self.enabled:
@@ -761,7 +807,7 @@ class TaskBoardManager:
             tasks = await self._load_tasks()
             tz = self._tz()
             now = datetime.now(UTC)
-            embed = build_board_embed(tasks, tz, now)
+            embed = await self._build_embed(tasks, tz, now)
             view = TaskBoardView(self, build_select_options(tasks, tz, now))
             try:
                 self._message = await channel.send(embed=embed, view=view)
@@ -807,7 +853,7 @@ class TaskBoardManager:
             tasks = await self._load_tasks()
             tz = self._tz()
             now = datetime.now(UTC)
-            embed = build_board_embed(tasks, tz, now)
+            embed = await self._build_embed(tasks, tz, now)
             view = TaskBoardView(self, build_select_options(tasks, tz, now))
             try:
                 await self._message.edit(embed=embed, view=view)

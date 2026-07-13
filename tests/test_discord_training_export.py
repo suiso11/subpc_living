@@ -5,6 +5,7 @@ import tempfile
 from pathlib import Path
 
 from src.discord_bot.training import DiscordTrainingLog
+from src.growth.tracker import GrowthTracker
 from scripts.export_discord_training import (
     export_preference,
     export_sft,
@@ -14,6 +15,31 @@ from scripts.export_discord_training import (
 
 
 class DiscordTrainingExportTest(unittest.TestCase):
+    def test_training_feedback_and_correction_emit_growth_signals(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tracker = GrowthTracker(root / "growth.db")
+            log = DiscordTrainingLog(root / "training", growth_tracker=tracker)
+            log.record_turn(
+                guild_id=1, channel_id=10, user_id=20, user_message_id=30,
+                assistant_message_ids=[40], user_text="質問", assistant_text="返答",
+                model="test", num_ctx=1024,
+            )
+            self.assertTrue(log.record_feedback(
+                assistant_message_id=40, guild_id=1, channel_id=10,
+                user_id=20, emoji="👍",
+            ))
+            self.assertTrue(log.record_correction(
+                assistant_message_id=40, channel_id=10, guild_id=1,
+                user_id=20, correction_message_id=50, corrected_text="より良い返答",
+            ).ok)
+
+            summary = tracker.summary()
+            self.assertEqual(summary["tracked_points"], 55)
+            self.assertEqual(summary["signals"]["training_turn"], 1)
+            self.assertEqual(summary["signals"]["feedback"], 1)
+            self.assertEqual(summary["signals"]["correction"], 1)
+
     def test_training_log_preserves_profile_metadata_in_correction(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             log = DiscordTrainingLog(Path(tmp), enabled=True, system_prompt="")

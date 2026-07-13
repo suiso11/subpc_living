@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from src.chat.web_search import WebSearchContext
     from src.tasks.store import TaskStore
     from src.tasks.calendar_sync import CalendarContext
+    from src.growth.tracker import GrowthTracker
 
 
 class ChatSession:
@@ -37,6 +38,8 @@ class ChatSession:
         web_search: Optional["WebSearchContext"] = None,
         task_store: Optional["TaskStore"] = None,
         calendar_context: Optional["CalendarContext"] = None,
+        growth_tracker: Optional["GrowthTracker"] = None,
+        conversation_source: str = "chat",
         emotion_tags: bool = False,
     ):
         self.system_prompt = system_prompt
@@ -56,6 +59,8 @@ class ChatSession:
         self.web_search = web_search
         self.task_store = task_store
         self.calendar_context = calendar_context
+        self.growth_tracker = growth_tracker
+        self.conversation_source = conversation_source
 
     def add_user_message(self, content: str) -> None:
         """ユーザーのメッセージを追加"""
@@ -68,14 +73,32 @@ class ChatSession:
         self._trim_history()
 
         # RAG: 直前のuser+assistantをベクトルDBに保存
+        memory_id = None
+        user_msg = None
         if self.rag is not None and len(self._messages) >= 2:
             user_msg = self._messages[-2]
             if user_msg.get("role") == "user":
-                self.rag.store_turn(
+                memory_id = self.rag.store_turn(
                     user_message=user_msg["content"],
                     assistant_message=content,
                     session_id=self.session_id,
                 )
+
+        # 成長台帳: 本文は保存せず、成功した会話例とRAG保存成否だけを記録する。
+        if self.growth_tracker is not None and len(self._messages) >= 2:
+            user_msg = user_msg or self._messages[-2]
+            if user_msg.get("role") == "user":
+                try:
+                    self.growth_tracker.record_conversation(
+                        source=self.conversation_source,
+                        session_id=self.session_id,
+                        user_chars=len(str(user_msg.get("content") or "")),
+                        assistant_chars=len(str(content or "")),
+                        memory_saved=memory_id is not None,
+                    )
+                except Exception:
+                    # 計測失敗で会話自体を失敗させない。
+                    pass
 
     def build_messages(self) -> list[dict]:
         """

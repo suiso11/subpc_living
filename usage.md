@@ -1106,15 +1106,36 @@ AIを「PCに住み着いた相棒」に近づける3機能。いずれもデフ
 
 音声パイプライン専用だった `ProactiveEngine` (予定リマインド / 休憩提案 / 挨拶 / PC異常) を Discord に配線。トリガー発火時、定型文をLLMでペルソナ口調に言い換えてテキストチャンネルへ投稿し、通話接続中なら autoread でも読み上げる。
 
+プロフィール学習向けの会話開始も有効化できる。会話がない時間が続くと、好み・生活リズム・望む接し方などを一問だけ尋ねる。次の返答は質問文付きで `conversations.jsonl` に保存されるため、「ジャズかな」のような短い返答でも日記パーソナライズ時に文脈を失わない。質問への返答は通常のbot返答と同じく 👍/👎・修正候補の対象になる。
+
 ```bash
 # config/discord.env
 DISCORD_PROACTIVE_ENABLED=true
+# 空なら DISCORD_AUTO_REPLY_CHANNEL_IDS の先頭を使う
 DISCORD_PROACTIVE_CHANNEL_ID=<投稿先チャンネルID>
 DISCORD_PROACTIVE_LLM_REWRITE=true   # ペルソナ口調への言い換え (失敗時は定型文)
 DISCORD_PROACTIVE_CHECK_INTERVAL=60  # チェック間隔 (秒)
+
+DISCORD_PROACTIVE_CHAT_ENABLED=true
+DISCORD_PROACTIVE_CHAT_INTERVAL_HOURS=6
+DISCORD_PROACTIVE_CHAT_IDLE_MINUTES=60
+DISCORD_PROACTIVE_CHAT_REPLY_TIMEOUT_HOURS=12
+DISCORD_PROACTIVE_CHAT_DAILY_LIMIT=1
+DISCORD_PROACTIVE_CHAT_MAX_BACKOFF_HOURS=72
+DISCORD_PROACTIVE_CHAT_AUTOREAD=false
+DISCORD_PROACTIVE_QUIET_HOURS=1-9
 ```
 
-実装: `src/discord_bot/proactive_bridge.py`。許可ユーザーの発言で休憩タイマーがリセットされる。
+自発会話は1日1回を既定上限とし、返信がなければ次回間隔を最大72時間まで
+段階的に広げる。送信済み質問とスヌーズは
+`data/proactive/conversation_state.json` に保存され、サービス再起動後も維持される。
+保留中の質問へ「あとで」と返すと3時間スヌーズ、「今日は静かに」で
+翌日までスヌーズする。「自発会話を停止」と「自発会話を再開」は永続する。
+ユーザーの返答本文はこの制御状態には保存しない。
+
+`CHAT_INTERVAL_HOURS` は自発質問同士の最短間隔、`CHAT_IDLE_MINUTES` は最後の許可ユーザー発言から質問までの待機時間。`QUIET_HOURS` は日跨ぎに対応し、上例では 1:00 以上 9:00 未満に雑談を開始しない。予定・警告など他の通知はこの雑談用 quiet hours の対象外。
+
+実装: `src/discord_bot/proactive_bridge.py`。許可ユーザーの発言で休憩・自発質問の待機時間がリセットされる。
 
 ### 11.2 画面認識 (Screen Context)
 
@@ -1183,7 +1204,7 @@ AIにタスク管理を任せる機能。SQLite (`data/tasks/tasks.db`, WAL) に
 
 ### 登録方法 (5通り)
 1. **右クリック**: 任意のメッセージを右クリック (長押し) → アプリ → 「タスクに登録」→ 本文が入力済みのモーダルで期限だけ書いて送信
-2. **常設タスクボード**: ピン留めされたボードの【＋追加】ボタン → モーダル入力。ボードでは未完了一覧 (期限順・超過明示・最大15件) の確認と、Selectメニューからの完了/スヌーズ/削除もできる。ボタンは永続化済みで再起動後も有効。env: `TASKS_BOARD_ENABLED` (default true) / `DISCORD_TASK_BOARD_CHANNEL_ID` (未設定ならリマインド先と同じ)
+2. **常設タスクボード**: ピン留めされたボードの【＋追加】ボタン → モーダル入力。ボードでは未完了一覧 (期限順・超過明示・最大15件) と優先順位オーケストレーターの推奨1件を確認でき、【🎯 今やる】で固定、Selectメニューから完了/スヌーズ/削除もできる。ボタンは永続化済みで再起動後も有効。env: `TASKS_BOARD_ENABLED` (default true) / `DISCORD_TASK_BOARD_CHANNEL_ID` (未設定ならリマインド先と同じ)
 3. **slash command**: `/task add <title> [due] [priority] [note]` — due は「明日」「7/10」「7/10 15:00」に対応。ほか `/task list` `/task done <id>` `/task snooze <id> <30m|2h|明日>` `/task del <id>`
 4. **明示プレフィックス**: 「タスク: レポート提出」と発言すると確認なしで即登録 (テキスト・通話STT両方)
 5. **自然会話から**: 「明日までにレポート出さないと」と話すと、返信後に非同期でLLMが抽出し「登録する/無視」ボタンで確認 (黙って自動登録はしない)。相対日付はプロンプト内の計算済み換算表で絶対日時化
@@ -1200,6 +1221,32 @@ TASKS_QUIET_HOURS=1-8         # この時間帯 (ローカル) は超過以外�
 送信先は `DISCORD_PROACTIVE_CHANNEL_ID` (未設定なら auto-reply チャンネルの先頭)。
 
 実装: `src/tasks/` (store / reminder) + `src/discord_bot/task_ui.py`。音声パイプラインもタスク一覧を読み取り専用で参照する。
+
+### 優先順位の外注化 (`/focus`)
+
+登録済みタスクを、期限・明示優先度・滞留期間・次の一手の有無から決定的に採点し、
+「今やる1件」だけを理由付きで返す。いったん選んだ1件は、新しい緊急タスクが増えても
+勝手に切り替えず、完了または明示的な見送りまで固定する。Google Calendar の次の時刻付き
+予定も読み、予定の10分前を空けた最大25分の作業枠を提示する。
+
+- `/focus now`: 今やる1件と根拠を表示し、未選択なら固定
+- `/focus start`: 開始時刻を記録
+- `/focus done`: 完了し、今日の完了数/連続日数を更新して次を自動選定
+- `/focus next`: 現候補を既定2時間見送り、次を選定
+- `/focus pick <task_id>`: 人間の判断で上書き
+- `/focus status`: 委任した決定数、現在の固定、継続記録を表示
+
+優先順位コンテキストはDiscordだけでなく、`ChatSession` を使うWeb・音声にも既存の
+タスクコンテキスト経由で注入される。永続状態 `data/tasks/priority_state.json` には本文を
+複製せず、タスクID・時刻・見送り回数・日別完了数だけを保存する。
+
+```bash
+PRIORITY_ENABLED=true
+PRIORITY_SKIP_HOURS=2
+PRIORITY_CALENDAR_BUFFER_MIN=10
+```
+
+設計と採点規則: `docs/priority_orchestration.md`。
 
 ### Google Calendar 連携 (MCP)
 
@@ -1351,6 +1398,18 @@ subpc_living/
 │   └── piper/                 # Piper TTS バイナリ (レガシー)
 ├── requirements.txt
 └── readme.md                  # 要件定義書
+```
+
+---
+
+## 適応成長の確認
+
+Web会話画面上部の「適応成長」に、会話例・検索可能記憶・評価・修正候補・個人化事実の蓄積量が
+Growth Pointsとして表示される。これはモデル重みや知能指数ではない。点数とレベルの定義、保存内容は
+[`docs/adaptive_growth.md`](docs/adaptive_growth.md) を参照。
+
+```bash
+curl -s http://127.0.0.1:8000/api/growth | python -m json.tool
 ```
 
 ---

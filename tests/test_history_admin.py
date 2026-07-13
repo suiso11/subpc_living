@@ -84,6 +84,49 @@ class HistoryAdminTest(unittest.TestCase):
         self.assertEqual(history_admin.prune_sessions(self.dir, 0), 0)
         self.assertTrue((self.dir / "session_keep.json").exists())
 
+    def test_safe_session_id_rejects_traversal_and_long_values(self) -> None:
+        self.assertTrue(history_admin.is_safe_session_id("web_123.abc-test"))
+        for value in ("", "../secret", "a/b", "a\\b", "x y", "a;b", "a" * 129, None):
+            self.assertFalse(history_admin.is_safe_session_id(value))
+
+    def test_read_session_by_id(self) -> None:
+        _write_session(
+            self.dir, "session_web_123.json",
+            saved_at="2026-07-04T10:00:00", preview="続き",
+        )
+        data = history_admin.read_session_by_id(self.dir, "web_123")
+        self.assertEqual(data["session_id"], "web_123")
+        self.assertEqual(data["messages"][0]["content"], "続き")
+        self.assertIsNone(history_admin.read_session_by_id(self.dir, "../secret"))
+        self.assertIsNone(history_admin.read_session_by_id(self.dir, "nope_404"))
+
+    def test_read_session_by_id_rejects_mismatched_payload(self) -> None:
+        _write_session(
+            self.dir, "session_web_123.json",
+            saved_at="2026-07-04T10:00:00", preview="x",
+        )
+        data = json.loads((self.dir / "session_web_123.json").read_text(encoding="utf-8"))
+        data["session_id"] = "other"
+        (self.dir / "session_web_123.json").write_text(json.dumps(data), encoding="utf-8")
+        self.assertIsNone(history_admin.read_session_by_id(self.dir, "web_123"))
+
+    def test_latest_valid_session_uses_latest_and_skips_broken_file(self) -> None:
+        _write_session(
+            self.dir, "session_old.json",
+            saved_at="2026-07-01T10:00:00", preview="old",
+        )
+        _write_session(
+            self.dir, "session_new.json",
+            saved_at="2026-07-04T10:00:00", preview="new",
+        )
+        (self.dir / "session_broken.json").write_text("{broken", encoding="utf-8")
+        latest = history_admin.read_latest_valid_session(self.dir)
+        self.assertEqual(latest["session_id"], "new")
+
+    def test_read_latest_valid_session_empty_dir(self) -> None:
+        self.assertIsNone(history_admin.read_latest_valid_session(self.dir))
+        self.assertIsNone(history_admin.read_latest_valid_session(self.dir / "nope"))
+
 
 if __name__ == "__main__":
     unittest.main()

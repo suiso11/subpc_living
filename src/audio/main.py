@@ -106,6 +106,7 @@ def run_text_to_speech_mode(args):
     from src.chat.session import ChatSession
     from src.chat.config import ChatConfig
     from src.chat.web_search import create_web_search_context
+    from src.growth.tracker import GrowthTracker
 
     config = ChatConfig.load(PROJECT_ROOT / "config" / "chat_config.json")
     web_search = create_web_search_context(config)
@@ -125,11 +126,17 @@ def run_text_to_speech_mode(args):
         print(f"{Color.RED}Ollamaに接続できません{Color.RESET}")
         sys.exit(1)
 
+    try:
+        growth_tracker = GrowthTracker(PROJECT_ROOT / "data" / "growth" / "growth.db")
+    except Exception:
+        growth_tracker = None
     session = ChatSession(
         system_prompt=config.system_prompt,
         max_history_turns=config.max_history_turns,
         history_dir=str(PROJECT_ROOT / config.history_dir),
         web_search=web_search,
+        growth_tracker=growth_tracker,
+        conversation_source="audio_text",
     )
 
     print(f"{Color.DIM}テキスト入力 → LLM応答 → 音声再生モード{Color.RESET}")

@@ -12,6 +12,7 @@ src/monitor/storage.py の WAL パターンを踏襲する。
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -19,6 +20,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 from zoneinfo import ZoneInfo
+
+from src.tasks.decomposer import decompose_task
 
 UTC = timezone.utc
 DEFAULT_TZ = "Asia/Tokyo"
@@ -95,6 +98,7 @@ class TaskStore:
         self._conn.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._create_tables()
+        self._backfill_breakdowns()
         return self
 
     def close(self) -> None:
@@ -136,7 +140,8 @@ class TaskStore:
                     status TEXT NOT NULL DEFAULT 'open',
                     source TEXT NOT NULL DEFAULT 'command',
                     created_at TEXT NOT NULL,
-                    completed_at TEXT
+                    completed_at TEXT,
+                    breakdown_json TEXT NOT NULL DEFAULT '[]'
                 )
                 """
             )
@@ -182,6 +187,8 @@ class TaskStore:
             conn.execute("ALTER TABLE tasks ADD COLUMN calendar_event_id TEXT")
         if "calendar_synced_at" not in cols:
             conn.execute("ALTER TABLE tasks ADD COLUMN calendar_synced_at TEXT")
+        if "breakdown_json" not in cols:
+            conn.execute("ALTER TABLE tasks ADD COLUMN breakdown_json TEXT NOT NULL DEFAULT '[]'")
 
     # --- 内部ユーティリティ ---
 
@@ -204,12 +211,59 @@ class TaskStore:
         )
 
     @staticmethod
+    def _decode_steps(value: Any) -> list[str]:
+        try:
+            raw = json.loads(value or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+        if not isinstance(raw, list):
+            return []
+        return [str(step).strip()[:240] for step in raw if str(step).strip()][:3]
+
+    @staticmethod
+    def _generated_breakdown(
+        title: str,
+        note: Optional[str] = None,
+        action_hint: Optional[str] = None,
+    ) -> tuple[str, list[str]]:
+        generated = decompose_task(title, note=note, action_hint=action_hint)
+        first = str(action_hint or generated.first_step).strip()[:240]
+        tail = [step for step in generated.steps if step != first]
+        steps = ([first] if first else []) + tail
+        return first, steps[:3]
+
+    def _backfill_breakdowns(self) -> int:
+        """既存の未完了タスクだけを、冪等に細分化する。"""
+        changed = 0
+        now = utc_now()
+        with self._tx(immediate=True) as conn:
+            rows = conn.execute(
+                "SELECT id, title, note, action_hint, breakdown_json FROM tasks WHERE status = 'open'"
+            ).fetchall()
+            for row in rows:
+                existing_steps = self._decode_steps(row["breakdown_json"])
+                existing_hint = str(row["action_hint"] or "").strip()
+                if existing_hint and existing_steps:
+                    continue
+                hint, steps = self._generated_breakdown(
+                    str(row["title"]), row["note"], existing_hint or None
+                )
+                conn.execute(
+                    "UPDATE tasks SET action_hint = ?, breakdown_json = ? WHERE id = ?",
+                    (existing_hint or hint, json.dumps(steps, ensure_ascii=False), row["id"]),
+                )
+                self._log_event(conn, int(row["id"]), "decompose", "automatic backfill", now)
+                changed += 1
+        return changed
+
+    @staticmethod
     def _row_to_task(row: sqlite3.Row) -> dict:
         return {
             "id": row["id"],
             "title": row["title"],
             "note": row["note"],
             "action_hint": row["action_hint"],
+            "steps": TaskStore._decode_steps(row["breakdown_json"]),
             "due_at": from_iso(row["due_at"]),
             "due_granularity": row["due_granularity"],
             "priority": row["priority"],
@@ -245,18 +299,19 @@ class TaskStore:
         if due_at is not None and due_granularity not in VALID_GRANULARITY:
             due_granularity = "datetime"
         now = now or utc_now()
+        generated_hint, generated_steps = self._generated_breakdown(title, note, action_hint)
 
         with self._tx(immediate=True) as conn:
             cur = conn.execute(
                 """
                 INSERT INTO tasks
                     (title, note, action_hint, due_at, due_granularity,
-                     priority, status, source, created_at, completed_at)
-                VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, NULL)
+                     priority, status, source, created_at, completed_at, breakdown_json)
+                VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, NULL, ?)
                 """,
                 (
-                    title, note, action_hint, to_iso(due_at), due_granularity,
-                    priority, source, to_iso(now),
+                    title, note, generated_hint, to_iso(due_at), due_granularity,
+                    priority, source, to_iso(now), json.dumps(generated_steps, ensure_ascii=False),
                 ),
             )
             task_id = int(cur.lastrowid)
@@ -323,7 +378,16 @@ class TaskStore:
             params.append(note)
         if action_hint is not None:
             fields.append("action_hint = ?")
-            params.append(action_hint)
+            clean_hint = action_hint.strip()[:240]
+            params.append(clean_hint)
+            fields.append("breakdown_json = ?")
+            if clean_hint:
+                current = self.get(task_id)
+                current_steps = list(current.get("steps") or []) if current else []
+                tail = current_steps[1:]
+                params.append(json.dumps(([clean_hint] + tail)[:3], ensure_ascii=False))
+            else:
+                params.append("[]")
         due_changed = False
         if clear_due:
             fields.append("due_at = NULL")
@@ -363,6 +427,24 @@ class TaskStore:
         if changed:
             self._fire_change(task_id, "update")
         return changed
+
+    def regenerate_breakdown(self, task_id: int, *, now: Optional[datetime] = None) -> bool:
+        """現在のタイトル・メモから細分化を作り直す。子タスクは作らない。"""
+        now = now or utc_now()
+        with self._tx(immediate=True) as conn:
+            row = conn.execute(
+                "SELECT title, note FROM tasks WHERE id = ? AND status = 'open'",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            hint, steps = self._generated_breakdown(str(row["title"]), row["note"])
+            conn.execute(
+                "UPDATE tasks SET action_hint = ?, breakdown_json = ? WHERE id = ?",
+                (hint, json.dumps(steps, ensure_ascii=False), task_id),
+            )
+            self._log_event(conn, task_id, "decompose", "manual regenerate", now)
+        return True
 
     def done(self, task_id: int, *, now: Optional[datetime] = None) -> bool:
         now = now or utc_now()
@@ -620,14 +702,20 @@ def format_local_due(due_at: Optional[datetime], granularity: Optional[str], tz:
 
 
 def build_task_context(store: "TaskStore", limit: int = 8, *, now: Optional[datetime] = None) -> str:
-    """未完了タスクを「--- 未完了タスク ---」ブロックとして返す。0件なら空文字。"""
+    """優先順位の推奨と未完了タスクをチャット用コンテキストにする。"""
     now = now or utc_now()
     try:
         tasks = store.get_context_tasks(limit=limit, now=now)
     except Exception:
         return ""
+    try:
+        from src.tasks.prioritizer import build_priority_context
+
+        priority_text = build_priority_context(store, now=now)
+    except Exception:
+        priority_text = ""
     if not tasks:
-        return ""
+        return priority_text
     tz = store.tz
     lines = ["\n--- 未完了タスク ---"]
     for t in tasks:
@@ -643,4 +731,4 @@ def build_task_context(store: "TaskStore", limit: int = 8, *, now: Optional[date
         if t["action_hint"]:
             line += f" 次の一手: {t['action_hint']}"
         lines.append(line)
-    return "\n".join(lines)
+    return priority_text + "\n".join(lines)

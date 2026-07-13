@@ -14,6 +14,7 @@ from src.chat.config import ChatConfig
 from src.chat.client import OllamaClient
 from src.chat.session import ChatSession
 from src.chat.web_search import create_web_search_context
+from src.growth.tracker import GrowthTracker
 
 
 # --- ANSI カラーコード ---
@@ -92,11 +93,17 @@ def main():
     print(f"{Color.GREEN}✅ モデル確認OK{Color.RESET}")
 
     # セッションの初期化
+    try:
+        growth_tracker = GrowthTracker(PROJECT_ROOT / "data" / "growth" / "growth.db")
+    except Exception:
+        growth_tracker = None
     session = ChatSession(
         system_prompt=config.system_prompt,
         max_history_turns=config.max_history_turns,
         history_dir=str(PROJECT_ROOT / config.history_dir),
         web_search=web_search,
+        growth_tracker=growth_tracker,
+        conversation_source="cli",
     )
 
     print_help()

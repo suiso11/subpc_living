@@ -4,6 +4,7 @@ Phase 3: VAD → STT → LLM (Ollama) → TTS → 再生
 改善: ストリーミングTTS (文単位で合成・再生)、Silero VAD対応
 Phase 10: ウェイクワード検知モード追加
 """
+import os
 import sys
 import re
 import time
@@ -41,6 +42,7 @@ from src.persona.summarizer import ConversationSummarizer
 from src.persona.preloader import SessionPreloader
 from src.persona.proactive import ProactiveEngine
 from src.service.idle import IdleManager
+from src.growth.tracker import GrowthTracker
 
 
 class VoicePipeline:
@@ -209,6 +211,34 @@ class VoicePipeline:
             print(f"⚠️  Calendar context 初期化スキップ: {e}")
             self.calendar_context = None
 
+        # Calendar 書き込み: 「予定入れて」発話の登録用。定期ワーカーは持たず、
+        # 発話時に on-demand で MCP を呼ぶだけ (pull は従来通り Discord 側のみ)。
+        self.calendar_client = None
+        self.tasks_calendar_id = (
+            os.environ.get("TASKS_CALENDAR_ID", "").strip()
+            or os.environ.get("DIARY_CALENDAR_ID", "").strip()
+            or "primary"
+        )
+        self.tasks_timezone = os.environ.get("DIARY_TIMEZONE", "Asia/Tokyo").strip() or "Asia/Tokyo"
+        if os.environ.get("TASKS_CALENDAR_SYNC_ENABLED", "").strip().lower() == "true":
+            try:
+                from src.integrations.google_calendar import GoogleCalendarMCPClient
+                self.calendar_client = GoogleCalendarMCPClient.from_env()
+            except Exception as e:
+                print(f"⚠️  Calendar 書き込みクライアント初期化スキップ: {e}")
+                self.calendar_client = None
+
+        # 成長台帳（Web/Discord/CLIと同じSQLiteを共有）
+        try:
+            self.growth_tracker = GrowthTracker(
+                PROJECT_ROOT / "data" / "growth" / "growth.db",
+                timezone_name=os.environ.get("DIARY_TIMEZONE", "Asia/Tokyo").strip()
+                or "Asia/Tokyo",
+            )
+        except Exception as e:
+            print(f"⚠️  Growth tracker 初期化スキップ: {e}")
+            self.growth_tracker = None
+
         # セッション
         self.session = ChatSession(
             system_prompt=self.config.system_prompt,
@@ -222,6 +252,8 @@ class VoicePipeline:
             web_search=self.web_search,
             task_store=self.task_store,
             calendar_context=self.calendar_context,
+            growth_tracker=self.growth_tracker,
+            conversation_source="voice",
             emotion_tags=self.config.emotion_tag_enabled,
         )
 
@@ -445,6 +477,22 @@ class VoicePipeline:
         print("=" * 50)
         return True
 
+    def _try_register_event(self, text: str) -> Optional[str]:
+        """予定登録の意図があれば Google Calendar に登録して結果文を返す (無ければ None)。"""
+        try:
+            from src.tasks.event_intent import try_register_event
+
+            return try_register_event(
+                text,
+                client=self.calendar_client,
+                calendar_id=self.tasks_calendar_id,
+                timezone_name=self.tasks_timezone,
+                upcoming_path=str(PROJECT_ROOT / "data" / "calendar" / "upcoming.json"),
+            )
+        except Exception as e:
+            print(f"⚠️  予定登録エラー: {e}")
+            return None
+
     def _on_proactive_trigger(self, trigger_type: str, message: str) -> None:
         """Proactiveエンジンからのコールバック: AI発話をTTSで再生"""
         if not self._running:
@@ -512,6 +560,20 @@ class VoicePipeline:
             return None
 
         print(f"\n👤 あなた: {user_text}")
+
+        # --- 予定登録 (「予定入れて」等) は LLM を介さず Google Calendar へ ---
+        event_reply = self._try_register_event(user_text)
+        if event_reply is not None:
+            self.session.add_user_message(user_text)
+            self.session.add_assistant_message(event_reply)
+            print(f"\n📅 {event_reply}")
+            try:
+                wav_data = self.tts.synthesize(event_reply)
+                self.player.play_wav(wav_data, blocking=True)
+            except Exception as e:
+                print(f"⚠️  応答再生失敗: {e}")
+            self.idle_manager.notify_inference_end()
+            return event_reply
 
         # --- LLM → TTS (ストリーミング) ---
         print("\n🤖 考え中...")

@@ -158,7 +158,23 @@ class MCPStdioClient:
             result = item.get("result", {})
             if not isinstance(result, dict):
                 raise MCPStdioError(f"Unexpected MCP response: {result!r}")
+            if result.get("isError"):
+                raise MCPStdioError(self._tool_error_message(result))
             return result
+
+    @staticmethod
+    def _tool_error_message(result: dict[str, Any]) -> str:
+        """MCP tool が content で返したエラー文を取り出す。"""
+        messages: list[str] = []
+        content = result.get("content", [])
+        if isinstance(content, list):
+            for item in content:
+                if not isinstance(item, dict) or item.get("type") != "text":
+                    continue
+                value = item.get("text")
+                if isinstance(value, str) and value.strip():
+                    messages.append(value.strip())
+        return "\n".join(messages) or "MCP tool returned an error"
 
     @staticmethod
     def _read_stdout(stream, messages: "queue.Queue[dict[str, Any] | Exception | None]") -> None:
@@ -201,4 +217,3 @@ class MCPStdioClient:
         if stderr:
             return f"{message}\nstderr:\n{stderr[-4000:]}"
         return message
-
