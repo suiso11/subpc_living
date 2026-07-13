@@ -14,7 +14,8 @@ def startup_command() -> str:
     if getattr(sys, "frozen", False):
         args = [str(Path(sys.executable).resolve()), "--hidden"]
     else:
-        args = [str(Path(sys.executable).resolve()), "-m", "src.desktop", "--hidden"]
+        launcher = Path(__file__).resolve().parents[2] / "scripts" / "run_desktop.py"
+        args = [str(Path(sys.executable).resolve()), str(launcher), "--hidden"]
     return subprocess.list2cmdline(args)
 
 

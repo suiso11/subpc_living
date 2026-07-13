@@ -106,9 +106,10 @@ class DesktopSettingsTest(unittest.TestCase):
                     os.environ["SUBPC_DESKTOP_SERVER_URL"] = old
             self.assertEqual(overridden.server_url, "http://tailscale:8000")
 
-    def test_startup_command_uses_module_entrypoint(self) -> None:
+    def test_startup_command_uses_absolute_launcher(self) -> None:
         command = startup_command()
-        self.assertIn("src.desktop", command)
+        launcher = Path(__file__).resolve().parents[1] / "scripts" / "run_desktop.py"
+        self.assertIn(str(launcher), command)
         self.assertIn("--hidden", command)
 
     @unittest.skipUnless(os.name == "nt", "Windows registry integration")
