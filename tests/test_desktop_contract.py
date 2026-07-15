@@ -15,6 +15,7 @@ class DesktopContractTest(unittest.TestCase):
             "Main.qml",
             "ChatPage.qml",
             "TasksPage.qml",
+            "CalendarPage.qml",
             "LogsPage.qml",
             "AchievementsPage.qml",
             "CommandPalette.qml",
@@ -45,6 +46,36 @@ class DesktopContractTest(unittest.TestCase):
         self.assertIn('"/api/chat/resume"', api)
         self.assertIn("/ws/chat", api)
         self.assertNotIn("from src.web import server", bridge)
+
+    def test_native_client_keeps_web_feature_parity_routes_and_actions(self) -> None:
+        api = (DESKTOP / "api.py").read_text(encoding="utf-8")
+        bridge = (DESKTOP / "bridge.py").read_text(encoding="utf-8")
+        qml = "\n".join(path.read_text(encoding="utf-8") for path in QML.glob("*.qml"))
+        for route in (
+            "/api/growth",
+            "/api/tasks/preview",
+            "/snooze",
+            "/api/calendar/events",
+            "/api/tts",
+            "/api/tts/voice",
+            "/api/logs/files",
+        ):
+            self.assertIn(route, api)
+        for action in (
+            "newSession",
+            "replayText",
+            "previewTask",
+            "snoozeTask",
+            "loadCalendar",
+            "createCalendarEvent",
+            "loadLogFiles",
+            "deleteHistory",
+            "setTtsVoice",
+        ):
+            self.assertIn(action, bridge)
+            self.assertIn(action, qml)
+        for label in ("新しい会話", "予定表", "30分後", "アプリ", "解除済み"):
+            self.assertIn(label, qml)
 
     def test_windows_distribution_files_are_present(self) -> None:
         requirements = (ROOT / "requirements-desktop.txt").read_text(encoding="utf-8")

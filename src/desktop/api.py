@@ -92,6 +92,22 @@ class DesktopApi:
             raise DesktopApiError("バックエンドから不正な応答を受け取りました")
         return data
 
+    def _request_bytes(self, method: str, path: str, **kwargs: Any) -> bytes:
+        if self._client is None:
+            raise DesktopApiError("バックエンド接続は終了しています")
+        try:
+            response = self._client.request(method, path, **kwargs)
+            response.raise_for_status()
+            return response.content
+        except httpx.HTTPStatusError as exc:
+            try:
+                detail = exc.response.json().get("error")
+            except Exception:
+                detail = None
+            raise DesktopApiError(detail or f"HTTP {exc.response.status_code}") from exc
+        except httpx.HTTPError as exc:
+            raise DesktopApiError(f"バックエンドに接続できません: {exc}") from exc
+
     def status(self) -> dict[str, Any]:
         return self._request("GET", "/api/status")
 
@@ -141,3 +157,73 @@ class DesktopApi:
 
     def delete_history(self, filename: str) -> dict[str, Any]:
         return self._request("DELETE", f"/api/history/sessions/{quote(filename, safe='')}")
+
+    def growth(self, days: int = 14) -> dict[str, Any]:
+        return self._request("GET", "/api/growth", params={"days": int(days)})
+
+    def preview_task(self, text: str) -> dict[str, Any]:
+        return self._request("POST", "/api/tasks/preview", json={"text": text})
+
+    def snooze_task(self, task_id: int, when: str) -> dict[str, Any]:
+        return self._request(
+            "POST", f"/api/tasks/{int(task_id)}/snooze", json={"when": when}
+        )
+
+    def calendar_events(self, start: str = "", end: str = "") -> dict[str, Any]:
+        params: dict[str, Any] = {}
+        if start:
+            params["start"] = start
+        if end:
+            params["end"] = end
+        return self._request("GET", "/api/calendar/events", params=params or None)
+
+    def create_calendar_event(
+        self,
+        title: str,
+        date: str,
+        *,
+        time: str = "",
+        duration_min: int | None = None,
+        location: str = "",
+        description: str = "",
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"title": title, "date": date}
+        if time:
+            payload["time"] = time
+        if duration_min is not None:
+            payload["duration_min"] = int(duration_min)
+        if location:
+            payload["location"] = location
+        if description:
+            payload["description"] = description
+        return self._request("POST", "/api/calendar/events", json=payload)
+
+    def update_calendar_event(
+        self, event_id: str, fields: dict[str, Any]
+    ) -> dict[str, Any]:
+        return self._request(
+            "PATCH",
+            f"/api/calendar/events/{quote(event_id, safe='')}",
+            json=fields,
+        )
+
+    def delete_calendar_event(self, event_id: str) -> dict[str, Any]:
+        return self._request(
+            "DELETE", f"/api/calendar/events/{quote(event_id, safe='')}"
+        )
+
+    def synthesize(self, text: str) -> bytes:
+        return self._request_bytes("POST", "/api/tts", json={"text": text})
+
+    def set_tts_voice(self, voice: str) -> dict[str, Any]:
+        return self._request("POST", "/api/tts/voice", json={"voice": voice})
+
+    def log_files(self) -> dict[str, Any]:
+        return self._request("GET", "/api/logs/files")
+
+    def log_file(self, name: str, lines: int = 300) -> dict[str, Any]:
+        return self._request(
+            "GET",
+            f"/api/logs/files/{quote(name, safe='')}",
+            params={"lines": max(10, min(int(lines), 2000))},
+        )

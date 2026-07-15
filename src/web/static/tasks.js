@@ -232,6 +232,7 @@ function renderTaskRow(task) {
   const remaining = remainingText(task);
   const dueClass = overdue ? 'overdue' : today ? 'today' : '';
   const steps = Array.isArray(task.steps) ? task.steps.filter(Boolean).slice(0, 3) : [];
+  const stepDone = Array.isArray(task.step_done) ? task.step_done : [];
   const chatPrompt = encodeURIComponent(
     `タスク#${task.id}「${task.title}」の最初の一歩を一緒に始めたい。まずは「${task.action_hint || '完了条件を1行で書く'}」`
   );
@@ -253,7 +254,14 @@ function renderTaskRow(task) {
         ${steps.length ? `
           <details class="task-breakdown">
             <summary>${steps.length}ステップを見る</summary>
-            <ol>${steps.map((step) => `<li>${escapeHtml(step)}</li>`).join('')}</ol>
+            <ol>${steps.map((step, index) => `
+              <li>
+                <label class="task-step-check">
+                  <input type="checkbox" data-action="step-done" data-id="${task.id}" data-step-index="${index}" ${stepDone[index] ? 'checked' : ''}>
+                  <span>${escapeHtml(step)}</span>
+                </label>
+              </li>
+            `).join('')}</ol>
           </details>
         ` : ''}
         <div class="task-meta">
@@ -455,10 +463,11 @@ function handleMenuClick(event) {
 }
 
 async function handleActionClick(event) {
-  const btn = event.target.closest('button[data-action]');
+  const btn = event.target.closest('[data-action]');
   if (!btn) return;
   const action = btn.dataset.action;
   const id = Number(btn.dataset.id);
+  const previousChecked = action === 'step-done' ? !btn.checked : null;
 
   if (action === 'menu') {
     handleMenuClick(event);
@@ -513,9 +522,22 @@ async function handleActionClick(event) {
         method: 'POST',
         body: '{}',
       });
+    } else if (action === 'step-done') {
+      const stepIndex = Number(btn.dataset.stepIndex);
+      await requestJSON(`/api/tasks/${id}/steps/${stepIndex}`, {
+        method: 'POST',
+        body: JSON.stringify({ done: btn.checked }),
+      });
+      const task = tasks.find((item) => item.id === id);
+      if (task) {
+        if (!Array.isArray(task.step_done)) task.step_done = [];
+        task.step_done[stepIndex] = btn.checked;
+      }
+      return;
     }
     await loadTasks();
   } catch (err) {
+    if (action === 'step-done') btn.checked = previousChecked;
     setError(`操作失敗: ${err.message}`);
   } finally {
     btn.disabled = false;

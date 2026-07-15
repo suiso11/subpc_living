@@ -8,6 +8,7 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from PySide6.QtCore import QObject, Property, QRunnable, QThreadPool, QTimer, QUrl, Signal, Slot
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
@@ -46,15 +47,20 @@ class DesktopBridge(QObject):
     tasksChanged = Signal()
     messagesChanged = Signal()
     gameChanged = Signal()
+    growthChanged = Signal()
+    taskPreviewChanged = Signal()
+    calendarChanged = Signal()
     historiesChanged = Signal()
     historyMessagesChanged = Signal()
     logsChanged = Signal()
+    logFilesChanged = Signal()
     statusChanged = Signal()
     serverUrlChanged = Signal()
     loadingChanged = Signal()
     recordingChanged = Signal()
     autostartChanged = Signal()
     ttsEnabledChanged = Signal()
+    ttsVoicesChanged = Signal()
     toast = Signal(str, str)
     nativeNotification = Signal(str, str)
 
@@ -77,9 +83,20 @@ class DesktopBridge(QObject):
         self._tasks: list[dict[str, Any]] = []
         self._messages: list[dict[str, Any]] = []
         self._game: dict[str, Any] = {}
+        self._growth: dict[str, Any] = {}
+        self._task_preview: dict[str, Any] = {}
+        self._calendar_events: list[dict[str, Any]] = []
+        self._calendar_writable = False
+        self._calendar_start = ""
+        self._calendar_end = ""
+        self._calendar_generation = 0
+        self._preview_generation = 0
         self._histories: list[dict[str, Any]] = []
         self._history_messages: list[dict[str, Any]] = []
         self._logs = ""
+        self._log_files: list[dict[str, Any]] = []
+        self._tts_voice = ""
+        self._tts_voices: list[dict[str, str]] = []
         self._status_text = "接続を確認中"
         self._connected = False
         self._recording = False
@@ -88,6 +105,7 @@ class DesktopBridge(QObject):
         self._pending_chat: list[dict[str, Any]] = []
         self._session_id = settings.session_id
         self._chat_ready = False
+        self._resume_generation = 0
         self._shutting_down = False
         self._notified_due: set[str] = set()
         self.recorder = NativeAudioRecorder()
@@ -124,6 +142,22 @@ class DesktopBridge(QObject):
     def game(self) -> dict[str, Any]:
         return self._game
 
+    @Property("QVariantMap", notify=growthChanged)
+    def growth(self) -> dict[str, Any]:
+        return self._growth
+
+    @Property("QVariantMap", notify=taskPreviewChanged)
+    def taskPreview(self) -> dict[str, Any]:
+        return self._task_preview
+
+    @Property("QVariantList", notify=calendarChanged)
+    def calendarEvents(self) -> list[dict[str, Any]]:
+        return self._calendar_events
+
+    @Property(bool, notify=calendarChanged)
+    def calendarWritable(self) -> bool:
+        return self._calendar_writable
+
     @Property("QVariantList", notify=historiesChanged)
     def histories(self) -> list[dict[str, Any]]:
         return self._histories
@@ -135,6 +169,10 @@ class DesktopBridge(QObject):
     @Property(str, notify=logsChanged)
     def logs(self) -> str:
         return self._logs
+
+    @Property("QVariantList", notify=logFilesChanged)
+    def logFiles(self) -> list[dict[str, Any]]:
+        return self._log_files
 
     @Property(str, notify=statusChanged)
     def statusText(self) -> str:
@@ -164,6 +202,14 @@ class DesktopBridge(QObject):
     def ttsEnabled(self) -> bool:
         return self.settings.tts_enabled
 
+    @Property(str, notify=ttsVoicesChanged)
+    def ttsVoice(self) -> str:
+        return self._tts_voice
+
+    @Property("QVariantList", notify=ttsVoicesChanged)
+    def ttsVoices(self) -> list[dict[str, str]]:
+        return self._tts_voices
+
     @Slot()
     def initialize(self) -> None:
         if self.offline:
@@ -182,6 +228,7 @@ class DesktopBridge(QObject):
         self.resumeChat()
         self.loadTasks()
         self.loadGame()
+        self.loadGrowth()
         self.reminder_timer.start()
 
     def _run(self, call: Callable[[], Any], success: Callable[[Any], None]) -> None:
@@ -246,7 +293,14 @@ class DesktopBridge(QObject):
         self._connected = True
         model = data.get("model") or "モデル未設定"
         self._status_text = f"接続済み · {model}"
+        voices = data.get("tts_voices") or {}
+        self._tts_voices = [
+            {"id": str(voice_id), "label": str(description)}
+            for voice_id, description in voices.items()
+        ] if isinstance(voices, dict) else []
+        self._tts_voice = str(data.get("tts_voice") or "")
         self.statusChanged.emit()
+        self.ttsVoicesChanged.emit()
 
     @Slot()
     def loadTasks(self) -> None:
@@ -291,6 +345,31 @@ class DesktopBridge(QObject):
             return
         self._run(lambda: self.api.add_task(text, priority, note), self._task_changed)
 
+    @Slot(str)
+    def previewTask(self, text: str) -> None:
+        text = text.strip()
+        if not text:
+            self.clearTaskPreview()
+            return
+        self._preview_generation += 1
+        generation = self._preview_generation
+        self._run(
+            lambda: self.api.preview_task(text),
+            lambda data: self._task_preview_loaded(data, generation),
+        )
+
+    def _task_preview_loaded(self, data: dict[str, Any], generation: int) -> None:
+        if generation != self._preview_generation:
+            return
+        self._task_preview = data
+        self.taskPreviewChanged.emit()
+
+    @Slot()
+    def clearTaskPreview(self) -> None:
+        self._preview_generation += 1
+        self._task_preview = {}
+        self.taskPreviewChanged.emit()
+
     @Slot(int)
     def completeTask(self, task_id: int) -> None:
         self._run(lambda: self.api.complete_task(task_id), self._task_completed)
@@ -302,6 +381,14 @@ class DesktopBridge(QObject):
     @Slot(int)
     def regenerateTask(self, task_id: int) -> None:
         self._run(lambda: self.api.regenerate_task(task_id), self._task_changed)
+
+    @Slot(int, str)
+    def snoozeTask(self, task_id: int, when: str) -> None:
+        self._run(lambda: self.api.snooze_task(task_id, when), self._task_snoozed)
+
+    def _task_snoozed(self, data: dict[str, Any]) -> None:
+        self.toast.emit("あとで見るに移しました", str(data.get("until") or ""))
+        self.loadTasks()
 
     @Slot(int, str, str, str, str, str)
     def updateTask(
@@ -328,7 +415,61 @@ class DesktopBridge(QObject):
         self.loadGame()
 
     def _task_changed(self, _: dict[str, Any]) -> None:
+        self.clearTaskPreview()
         self.loadTasks()
+
+    @Slot(str, str)
+    def loadCalendar(self, start: str = "", end: str = "") -> None:
+        if self.offline:
+            return
+        self._calendar_start = start
+        self._calendar_end = end
+        self._calendar_generation += 1
+        generation = self._calendar_generation
+        self._run(
+            lambda: self.api.calendar_events(start, end),
+            lambda data: self._calendar_loaded(data, generation),
+        )
+
+    def _calendar_loaded(self, data: dict[str, Any], generation: int) -> None:
+        if generation != self._calendar_generation:
+            return
+        self._calendar_events = list(data.get("events") or [])
+        self._calendar_writable = bool(data.get("writable"))
+        self.calendarChanged.emit()
+
+    @Slot(str, str, str, int, str, str)
+    def createCalendarEvent(
+        self,
+        title: str,
+        date: str,
+        time: str = "",
+        duration_min: int = 60,
+        location: str = "",
+        description: str = "",
+    ) -> None:
+        self._run(
+            lambda: self.api.create_calendar_event(
+                title.strip(), date, time=time.strip(), duration_min=duration_min,
+                location=location.strip(), description=description.strip(),
+            ),
+            self._calendar_changed,
+        )
+
+    @Slot(str, "QVariantMap")
+    def updateCalendarEvent(self, event_id: str, fields: dict[str, Any]) -> None:
+        self._run(
+            lambda: self.api.update_calendar_event(event_id, dict(fields)),
+            self._calendar_changed,
+        )
+
+    @Slot(str)
+    def deleteCalendarEvent(self, event_id: str) -> None:
+        self._run(lambda: self.api.delete_calendar_event(event_id), self._calendar_changed)
+
+    def _calendar_changed(self, _: dict[str, Any]) -> None:
+        self.toast.emit("カレンダーを更新しました", "Google Calendarと同期しました")
+        self.loadCalendar(self._calendar_start, self._calendar_end)
 
     @Slot()
     def loadGame(self) -> None:
@@ -339,6 +480,16 @@ class DesktopBridge(QObject):
     def _game_loaded(self, data: dict[str, Any]) -> None:
         self._game = data
         self.gameChanged.emit()
+
+    @Slot()
+    def loadGrowth(self) -> None:
+        if self.offline:
+            return
+        self._run(lambda: self.api.growth(14), self._growth_loaded)
+
+    def _growth_loaded(self, data: dict[str, Any]) -> None:
+        self._growth = data
+        self.growthChanged.emit()
 
     @Slot(str)
     def claimMission(self, mission_id: str) -> None:
@@ -356,6 +507,20 @@ class DesktopBridge(QObject):
     def _logs_loaded(self, data: dict[str, Any]) -> None:
         self._logs = "\n".join(data.get("lines") or []) or "(ログなし)"
         self.logsChanged.emit()
+
+    @Slot()
+    def loadLogFiles(self) -> None:
+        if self.offline:
+            return
+        self._run(self.api.log_files, self._log_files_loaded)
+
+    def _log_files_loaded(self, data: dict[str, Any]) -> None:
+        self._log_files = list(data.get("files") or [])
+        self.logFilesChanged.emit()
+
+    @Slot(str, int)
+    def loadLogFile(self, name: str, lines: int = 300) -> None:
+        self._run(lambda: self.api.log_file(name, lines), self._logs_loaded)
 
     @Slot()
     def loadHistories(self) -> None:
@@ -380,12 +545,56 @@ class DesktopBridge(QObject):
 
     @Slot(str)
     def deleteHistory(self, filename: str) -> None:
-        self._run(lambda: self.api.delete_history(filename), lambda _: self.loadHistories())
+        self._run(lambda: self.api.delete_history(filename), self._history_deleted)
+
+    def _history_deleted(self, _: dict[str, Any]) -> None:
+        self._history_messages = []
+        self.historyMessagesChanged.emit()
+        self.loadHistories()
+        self.toast.emit("会話記録を削除しました", "")
 
     @Slot()
     def resumeChat(self) -> None:
         session = self._session_id or None
-        self._run(lambda: self.api.resume_chat(session), self._chat_resumed)
+        self._resume_generation += 1
+        generation = self._resume_generation
+        self._run(
+            lambda: self.api.resume_chat(session),
+            lambda data: self._chat_resumed_if_current(data, generation),
+        )
+
+    def _chat_resumed_if_current(self, data: dict[str, Any], generation: int) -> None:
+        if generation == self._resume_generation:
+            self._chat_resumed(data)
+
+    @Slot()
+    def newSession(self) -> None:
+        self.socket.abort()
+        self._session_id = f"desktop_{uuid4().hex}"
+        self.settings.session_id = self._session_id
+        self._chat_ready = False
+        self._pending_chat = []
+        self._messages = []
+        self.messagesChanged.emit()
+        self._save_settings()
+        self.resumeChat()
+        self.toast.emit("新しい会話を始めました", "これまでの記録は残っています")
+
+    @Slot(str)
+    def replayText(self, text: str) -> None:
+        text = text.strip()
+        if text:
+            self._run(lambda: self.api.synthesize(text), self._play_audio_bytes)
+
+    @Slot(str)
+    def setTtsVoice(self, voice: str) -> None:
+        if voice and voice != self._tts_voice:
+            self._run(lambda: self.api.set_tts_voice(voice), self._tts_voice_changed)
+
+    def _tts_voice_changed(self, data: dict[str, Any]) -> None:
+        self._tts_voice = str(data.get("voice") or "")
+        self.ttsVoicesChanged.emit()
+        self.toast.emit("読み上げ音声を変更しました", str(data.get("description") or ""))
 
     def _chat_resumed(self, data: dict[str, Any]) -> None:
         self._session_id = str(data.get("session_id") or "")
@@ -531,11 +740,14 @@ class DesktopBridge(QObject):
     def _play_audio(self, encoded: str) -> None:
         try:
             audio = base64.b64decode(encoded, validate=True)
-            handle = tempfile.NamedTemporaryFile(prefix="subpc-tts-", suffix=".wav", delete=False)
-            handle.write(audio)
-            handle.close()
         except Exception:
             return
+        self._play_audio_bytes(audio)
+
+    def _play_audio_bytes(self, audio: bytes) -> None:
+        handle = tempfile.NamedTemporaryFile(prefix="subpc-tts-", suffix=".wav", delete=False)
+        handle.write(audio)
+        handle.close()
         self._remove_audio_temp()
         self._audio_temp = Path(handle.name)
         self.player.setSource(QUrl.fromLocalFile(handle.name))

@@ -23,7 +23,9 @@ Popup {
         { id: "tasks", label: "やること", detail: "優先順位と最初の一歩を見る", key: "Alt+2" },
         { id: "logs", label: "記録", detail: "会話とシステムの動きを振り返る", key: "Alt+3" },
         { id: "game", label: "実績", detail: "相棒との積み重ねを見る", key: "Alt+4" },
+        { id: "new-chat", label: "新しい会話", detail: "記録を残したまま別の会話を始める", key: "Ctrl+N" },
         { id: "add", label: "タスクを追加", detail: "やることを1行で登録", key: "N" },
+        { id: "calendar", label: "予定表を開く", detail: "Google Calendarの予定を確認・編集", key: "C" },
         { id: "refresh", label: "いまの画面を読み直す", detail: "バックエンドから最新状態を取得", key: "R" },
         { id: "settings", label: "接続と常駐の設定", detail: "サーバー・自動起動・音声", key: "," }
     ]
@@ -47,10 +49,12 @@ Popup {
         else if (commandId === "tasks") hostWindow.currentPage = 1
         else if (commandId === "logs") hostWindow.currentPage = 2
         else if (commandId === "game") hostWindow.currentPage = 3
+        else if (commandId === "new-chat") { hostWindow.currentPage = 0; backend.newSession() }
         else if (commandId === "add") {
             hostWindow.currentPage = 1
             taskPage.focusAdd()
-        } else if (commandId === "settings") hostWindow.openSettings()
+        } else if (commandId === "calendar") { hostWindow.currentPage = 1; taskPage.openCalendar() }
+        else if (commandId === "settings") hostWindow.openSettings()
         else if (commandId === "refresh") hostWindow.refreshCurrentPage()
     }
 

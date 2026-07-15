@@ -781,6 +781,7 @@ def _task_to_json(task: dict) -> dict:
         "note": task.get("note") or "",
         "action_hint": task.get("action_hint") or "",
         "steps": task.get("steps") or [],
+        "step_done": task.get("step_done") or [],
         "due_at": due_at.isoformat() if due_at else None,
         "due_granularity": task.get("due_granularity"),
         "priority": task.get("priority") or "normal",
@@ -981,6 +982,33 @@ async def tasks_done(task_id: int):
     if not ok:
         return JSONResponse({"error": "task not found or not open"}, status_code=404)
     return {"ok": True}
+
+
+@app.post("/api/tasks/{task_id}/steps/{step_index}")
+async def tasks_step_done(task_id: int, step_index: int, request: Request):
+    """分割された手順のチェック状態を更新する。body: {"done": bool}"""
+    unavailable = _require_task_store()
+    if unavailable is not None:
+        return unavailable
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "JSON body is required"}, status_code=400)
+    if not isinstance(body.get("done"), bool):
+        return JSONResponse({"error": "done must be boolean"}, status_code=400)
+    ok = await asyncio.to_thread(
+        task_store.set_step_done,
+        task_id,
+        step_index,
+        body["done"],
+    )
+    if not ok:
+        return JSONResponse(
+            {"error": "task or step not found, or task is not open"},
+            status_code=404,
+        )
+    task = await asyncio.to_thread(task_store.get, task_id)
+    return {"task": _task_to_json(task)}
 
 
 @app.post("/api/tasks/{task_id}/breakdown")

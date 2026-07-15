@@ -7,7 +7,9 @@ import "."
 Item {
     id: page
     property var backend
+    property int mode: 0
     function focusAdd() { Qt.callLater(taskInput.forceActiveFocus) }
+    function openCalendar() { mode = 1; calendar.activate() }
     function dueLabel(value) {
         if (!value) return "期限なし"
         const date = new Date(value)
@@ -68,12 +70,20 @@ Item {
             }
         }
 
+        RowLayout {
+            Layout.fillWidth: true
+            Label { Layout.fillWidth: true; text: page.mode === 0 ? "優先順位順のタスク" : "Google Calendarの予定"; color: Theme.textMuted; font.family: Theme.uiFont; font.pixelSize: 11 }
+            BuddyButton { text: "リスト"; accent: page.mode === 0; onClicked: page.mode = 0 }
+            BuddyButton { text: "予定表"; accent: page.mode === 1; onClicked: page.openCalendar() }
+        }
+
         Rectangle {
             Layout.fillWidth: true
             implicitHeight: addColumn.implicitHeight + 24
             radius: Theme.radius
             color: Theme.panel
             border.color: taskInput.activeFocus ? Theme.accent : Theme.lineSoft
+            visible: page.mode === 0
             ColumnLayout {
                 id: addColumn
                 anchors.fill: parent
@@ -91,7 +101,9 @@ Item {
                         selectByMouse: true
                         background: Item {}
                         onAccepted: addButton.clicked()
+                        onTextChanged: previewTimer.restart()
                     }
+                    BuddyButton { text: "解析"; onClicked: backend.previewTask(taskInput.text) }
                     BuddyComboBox {
                         id: priority
                         model: ["ふつう", "だいじ", "あとで"]
@@ -112,7 +124,13 @@ Item {
                         contentItem: Label { text: addButton.text; color: Theme.background; font.family: Theme.uiFont; font.bold: true; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                     }
                 }
-                Label { text: "日時・優先度を自然な日本語で書けます。登録時に最初の一歩まで自動で作ります。"; color: Theme.textMuted; font.family: Theme.uiFont; font.pixelSize: 11 }
+                Label {
+                    text: backend.taskPreview.title
+                        ? "登録内容：" + backend.taskPreview.title + (backend.taskPreview.due_display ? "  ·  " + backend.taskPreview.due_display : "  ·  期限なし")
+                        : "日時・優先度を自然な日本語で書けます。登録時に最初の一歩まで自動で作ります。"
+                    color: backend.taskPreview.title ? Theme.accent : Theme.textMuted
+                    font.family: Theme.uiFont; font.pixelSize: 11
+                }
             }
         }
 
@@ -122,6 +140,7 @@ Item {
             radius: Theme.radius
             color: Theme.backgroundRaised
             border.color: Theme.lineSoft
+            visible: page.mode === 0
             ListView {
                 id: taskList
                 anchors.fill: parent
@@ -150,6 +169,18 @@ Item {
                             onClicked: backend.completeTask(row.modelData.id)
                             background: Rectangle { radius: 17; color: doneButton.hovered ? Theme.green : "transparent"; border.color: Theme.green; border.width: 1 }
                             contentItem: Label { text: doneButton.text; color: doneButton.hovered ? Theme.background : Theme.green; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter; font.bold: true }
+                        }
+                        Button {
+                            id: snoozeButton
+                            text: "あとで"
+                            onClicked: snoozeMenu.open()
+                            background: Rectangle { radius: Theme.radiusSmall; color: snoozeButton.hovered ? Theme.panelHover : "transparent"; border.color: Theme.line }
+                            contentItem: Label { text: snoozeButton.text; color: Theme.textMuted; font.family: Theme.uiFont; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                            Menu {
+                                id: snoozeMenu
+                                MenuItem { text: "30分後"; onTriggered: backend.snoozeTask(row.modelData.id, "30m") }
+                                MenuItem { text: "明日"; onTriggered: backend.snoozeTask(row.modelData.id, "明日") }
+                            }
                         }
                         ColumnLayout {
                             Layout.fillWidth: true
@@ -186,6 +217,21 @@ Item {
                 ScrollBar.vertical: ScrollBar {}
             }
         }
+
+        CalendarPage {
+            id: calendar
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            visible: page.mode === 1
+            backend: page.backend
+        }
+    }
+
+    Timer {
+        id: previewTimer
+        interval: 450
+        repeat: false
+        onTriggered: backend.previewTask(taskInput.text)
     }
 
     Dialog {
