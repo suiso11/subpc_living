@@ -2090,6 +2090,24 @@ button {
 
 .task-breakdown li + li { margin-top: 4px; }
 
+.task-step-check {
+  display: inline-flex;
+  gap: 7px;
+  align-items: flex-start;
+  cursor: pointer;
+}
+
+.task-step-check input {
+  flex: 0 0 auto;
+  margin: 2px 0 0;
+  accent-color: var(--accent);
+}
+
+.task-step-check input:checked + span {
+  color: var(--text-faint);
+  text-decoration: line-through;
+}
+
 .task-meta {
   display: flex;
   flex-wrap: wrap;

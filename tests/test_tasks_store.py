@@ -30,6 +30,7 @@ class TaskStoreTest(unittest.TestCase):
         self.assertEqual(t["status"], "open")
         self.assertEqual(t["action_hint"], "序論")
         self.assertEqual(t["steps"][0], "序論")
+        self.assertEqual(t["step_done"], [False] * len(t["steps"]))
 
     def test_add_automatically_creates_first_step_and_three_or_fewer_steps(self) -> None:
         tid = self.store.add("実験レポートを書く", now=self.now)
@@ -45,6 +46,39 @@ class TaskStoreTest(unittest.TestCase):
         self.assertTrue(self.store.regenerate_breakdown(tid, now=self.now))
         task = self.store.get(tid)
         self.assertIn("要点", task["action_hint"])
+
+    def test_step_done_can_be_checked_and_unchecked(self) -> None:
+        tid = self.store.add("実験レポートを書く", now=self.now)
+        self.assertTrue(self.store.set_step_done(tid, 0, True, now=self.now))
+        self.assertTrue(self.store.get(tid)["step_done"][0])
+
+        self.assertTrue(self.store.set_step_done(tid, 0, False, now=self.now))
+        self.assertFalse(self.store.get(tid)["step_done"][0])
+
+    def test_step_done_rejects_invalid_or_closed_task(self) -> None:
+        tid = self.store.add("実験レポートを書く", now=self.now)
+        self.assertFalse(self.store.set_step_done(tid, -1, True, now=self.now))
+        self.assertFalse(self.store.set_step_done(tid, 99, True, now=self.now))
+        self.store.done(tid, now=self.now)
+        self.assertFalse(self.store.set_step_done(tid, 0, True, now=self.now))
+
+    def test_legacy_string_steps_are_read_as_unchecked(self) -> None:
+        tid = self.store.add("旧形式", now=self.now)
+        with self.store._tx(immediate=True) as conn:
+            conn.execute(
+                "UPDATE tasks SET breakdown_json = ? WHERE id = ?",
+                ('["手順A", "手順B"]', tid),
+            )
+        task = self.store.get(tid)
+        self.assertEqual(task["steps"], ["手順A", "手順B"])
+        self.assertEqual(task["step_done"], [False, False])
+
+    def test_regenerate_breakdown_resets_step_checks(self) -> None:
+        tid = self.store.add("実験レポートを書く", now=self.now)
+        self.store.set_step_done(tid, 0, True, now=self.now)
+        self.assertTrue(self.store.regenerate_breakdown(tid, now=self.now))
+        task = self.store.get(tid)
+        self.assertEqual(task["step_done"], [False] * len(task["steps"]))
 
     def test_initialize_backfills_existing_open_task_idempotently(self) -> None:
         legacy_path = str(Path(self._tmp.name) / "legacy.db")

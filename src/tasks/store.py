@@ -211,14 +211,48 @@ class TaskStore:
         )
 
     @staticmethod
-    def _decode_steps(value: Any) -> list[str]:
+    def _decode_breakdown(value: Any) -> list[dict[str, Any]]:
+        """旧形式の文字列配列も、完了状態つきの手順として読み込む。"""
         try:
             raw = json.loads(value or "[]")
         except (TypeError, ValueError, json.JSONDecodeError):
             return []
         if not isinstance(raw, list):
             return []
-        return [str(step).strip()[:240] for step in raw if str(step).strip()][:3]
+
+        result: list[dict[str, Any]] = []
+        for step in raw:
+            if isinstance(step, dict):
+                text = str(step.get("text") or "").strip()[:240]
+                done = step.get("done") is True
+            else:
+                text = str(step).strip()[:240]
+                done = False
+            if text:
+                result.append({"text": text, "done": done})
+            if len(result) >= 3:
+                break
+        return result
+
+    @staticmethod
+    def _decode_steps(value: Any) -> list[str]:
+        return [step["text"] for step in TaskStore._decode_breakdown(value)]
+
+    @staticmethod
+    def _encode_breakdown(steps: Iterable[str], done: Optional[Iterable[bool]] = None) -> str:
+        done_values = list(done or [])
+        payload = []
+        for index, step in enumerate(steps):
+            text = str(step).strip()[:240]
+            if not text:
+                continue
+            payload.append({
+                "text": text,
+                "done": bool(done_values[index]) if index < len(done_values) else False,
+            })
+            if len(payload) >= 3:
+                break
+        return json.dumps(payload, ensure_ascii=False)
 
     @staticmethod
     def _generated_breakdown(
@@ -250,7 +284,7 @@ class TaskStore:
                 )
                 conn.execute(
                     "UPDATE tasks SET action_hint = ?, breakdown_json = ? WHERE id = ?",
-                    (existing_hint or hint, json.dumps(steps, ensure_ascii=False), row["id"]),
+                    (existing_hint or hint, self._encode_breakdown(steps), row["id"]),
                 )
                 self._log_event(conn, int(row["id"]), "decompose", "automatic backfill", now)
                 changed += 1
@@ -258,12 +292,14 @@ class TaskStore:
 
     @staticmethod
     def _row_to_task(row: sqlite3.Row) -> dict:
+        breakdown = TaskStore._decode_breakdown(row["breakdown_json"])
         return {
             "id": row["id"],
             "title": row["title"],
             "note": row["note"],
             "action_hint": row["action_hint"],
-            "steps": TaskStore._decode_steps(row["breakdown_json"]),
+            "steps": [step["text"] for step in breakdown],
+            "step_done": [step["done"] for step in breakdown],
             "due_at": from_iso(row["due_at"]),
             "due_granularity": row["due_granularity"],
             "priority": row["priority"],
@@ -311,7 +347,7 @@ class TaskStore:
                 """,
                 (
                     title, note, generated_hint, to_iso(due_at), due_granularity,
-                    priority, source, to_iso(now), json.dumps(generated_steps, ensure_ascii=False),
+                    priority, source, to_iso(now), self._encode_breakdown(generated_steps),
                 ),
             )
             task_id = int(cur.lastrowid)
@@ -384,8 +420,11 @@ class TaskStore:
             if clean_hint:
                 current = self.get(task_id)
                 current_steps = list(current.get("steps") or []) if current else []
+                current_done = list(current.get("step_done") or []) if current else []
                 tail = current_steps[1:]
-                params.append(json.dumps(([clean_hint] + tail)[:3], ensure_ascii=False))
+                first_done = bool(current_done[0]) if current_steps and current_steps[0] == clean_hint else False
+                done_values = [first_done] + current_done[1:]
+                params.append(self._encode_breakdown(([clean_hint] + tail)[:3], done_values))
             else:
                 params.append("[]")
         due_changed = False
@@ -441,9 +480,54 @@ class TaskStore:
             hint, steps = self._generated_breakdown(str(row["title"]), row["note"])
             conn.execute(
                 "UPDATE tasks SET action_hint = ?, breakdown_json = ? WHERE id = ?",
-                (hint, json.dumps(steps, ensure_ascii=False), task_id),
+                (hint, self._encode_breakdown(steps), task_id),
             )
             self._log_event(conn, task_id, "decompose", "manual regenerate", now)
+        return True
+
+    def set_step_done(
+        self,
+        task_id: int,
+        step_index: int,
+        done: bool,
+        *,
+        now: Optional[datetime] = None,
+    ) -> bool:
+        """分割された手順の完了状態を更新する。タスク本体は自動完了しない。"""
+        now = now or utc_now()
+        changed = False
+        with self._tx(immediate=True) as conn:
+            row = conn.execute(
+                "SELECT breakdown_json FROM tasks WHERE id = ? AND status = 'open'",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            breakdown = self._decode_breakdown(row["breakdown_json"])
+            if step_index < 0 or step_index >= len(breakdown):
+                return False
+            if breakdown[step_index]["done"] != done:
+                breakdown[step_index]["done"] = done
+                conn.execute(
+                    "UPDATE tasks SET breakdown_json = ? WHERE id = ?",
+                    (
+                        self._encode_breakdown(
+                            (step["text"] for step in breakdown),
+                            (step["done"] for step in breakdown),
+                        ),
+                        task_id,
+                    ),
+                )
+                self._log_event(
+                    conn,
+                    task_id,
+                    "step_done",
+                    f"index={step_index} done={done}",
+                    now,
+                )
+                changed = True
+        if changed:
+            self._fire_change(task_id, "step_done")
         return True
 
     def done(self, task_id: int, *, now: Optional[datetime] = None) -> bool:

@@ -22,6 +22,70 @@ Claude/Anthropic 系に依存しない既定構成。
 
 ## Commands
 
+### Pi + Codex orchestrator
+
+Pi をエージェントランタイム、Codex をオーケストレーター、OpenCode を作業ワーカーとして使う。
+プロジェクトローカル拡張 `.pi/extensions/opencode-orchestrator/` が、同期タスク、
+バックグラウンドサブエージェント、フェーズ付きworkflowを登録し、目的・対象パス・制約・
+期待出力を構造化して `opencode run --format json` へ渡す。
+
+初回だけ通常の `pi` を起動して `/login` を実行し、`ChatGPT Plus/Pro (Codex)` を選ぶ。
+以後はリポジトリルートで次を実行する。
+
+```bash
+scripts/pi_codex_orchestrator.sh
+```
+
+最初の依頼例:
+
+```text
+AGENTS.md に従ってこの不具合を修正して。独立した探索・実装・テストは
+opencode_spawn で並列委譲し、opencode_wait で回収して。複数フェーズが必要な場合だけ
+opencode_workflow を使い、あなたは計画、判断、差分確認、最終検証を担当して。
+```
+
+既定値は Pi 側が `openai-codex/gpt-5.5`、OpenCode 側が `opencode-go/glm-5.2`。
+必要なら環境変数で上書きできる。
+
+```bash
+PI_CODEX_MODEL=openai-codex/gpt-5.5 \
+PI_OPENCODE_MODEL=opencode-go/glm-5.2 \
+scripts/pi_codex_orchestrator.sh
+```
+
+その他の設定:
+
+- `PI_OPENCODE_BIN`: OpenCode CLI のパス。既定は `opencode`
+- `PI_OPENCODE_TIMEOUT_MS`: 1ワーカーのタイムアウト。既定は600000ミリ秒、上限30分
+- `/opencode-status`: Pi セッション内でワーカーモデルとタイムアウトを表示
+
+### Background workers
+
+- `opencode_spawn`: ワーカーをバックグラウンド起動
+- `opencode_wait`: 複数ワーカーの完了待ちと結果回収
+- `opencode_check` / `opencode_list`: 状態・直近アクティビティ確認
+- `opencode_cancel`: 実行中プロセスを停止
+- `opencode_task`: 小さな単発タスクを同期実行する互換用ショートカット
+
+同時実行上限は全体で4。`read_only` は対象パスが重複しても並列実行できる。
+`write` も並列実行できるが、`relevant_paths` に指定した具体的なファイルまたはディレクトリが
+同一・親子関係になるタスクは競合として拒否する。glob、作業ディレクトリ外のパスも拒否する。
+これは宣言スコープによる競合防止でありOSサンドボックスではないため、Codexは完了後に差分を確認する。
+
+### Phased workflows
+
+`opencode_workflow` は2フェーズ以上を必須とし、フェーズを順番に、各フェーズ内のタスクを
+最大4並列で実行する。単純な1タスクでは使わず、調査→実装、実装→独立検証など依存関係がある
+複雑な作業だけに使う。直前フェーズの結果は上限付きで次フェーズの各ワーカーへ渡す。
+同一フェーズ内のwriteスコープ重複は開始前に拒否する。
+
+- `opencode_workflow_wait`: workflow完了待ち
+- `opencode_workflow_check` / `opencode_workflow_list`: 状態確認
+- `opencode_workflow_cancel`: workflowと配下の実行中ワーカーを停止
+
+バックグラウンド結果は、親Codexが明示的にwaitしなかった場合、Piのfollow-upメッセージとして返る。
+実装結果を信用してそのまま完了せず、Codexが関連差分と検証結果を確認する。
+
 読み取り専用の独立意見:
 
 ```bash
