@@ -32,4 +32,5 @@ Claude/Anthropic 系の使用量に依存しない構成を既定にする。Cla
 - 独立性を守る: あるエージェントの結論を別のエージェントへの入力に混ぜない
 - 些細な一発作業 (1ファイルの小修正、単純な質問) は委譲せず直接やる
 - 各エージェントの最終メッセージはユーザーには見えない。重要な内容は最終返答に含める
-- Claude がレートリミット中の詳しい退避構成は `docs/orchestration_no_claude.md` を参照する
+- Pi/Codex/OpenCode のオーケストレーション環境は
+  `https://github.com/suiso11/pi-codex-opencode-orchestrator` で管理する
