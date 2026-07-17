@@ -35,14 +35,11 @@ fastapi>=0.110.0
 uvicorn[standard]>=0.27.0
 python-multipart>=0.0.7
 
-<<<<<<< HEAD
 # テスト
 pytest>=8.0.0
-=======
+
 # Discord 操作コンソール
 discord.py>=2.4.0
 discord-ext-voice-recv>=0.5.2a179
-
->>>>>>> 0a438129be6e75f27e4ce016bc914491bc628028
 # Phase 10: ウェイクワード検知
 openwakeword>=0.4.0
