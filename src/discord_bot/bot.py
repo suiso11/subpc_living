@@ -220,7 +220,13 @@ class DiscordLLMProfile:
         overrides: dict[str, Any] | None = None,
     ) -> "DiscordLLMProfile":
         raw = overrides or {}
-        system_prompt = str(raw.get("system_prompt", config.system_prompt))
+        # 基本プロンプト: profile が明示 system_prompt を持てばそれを、無ければ
+        # profile の model に対する model_prompt_overrides (無ければ base) を使う。
+        if "system_prompt" in raw:
+            system_prompt = str(raw.get("system_prompt", ""))
+        else:
+            profile_model = str(raw.get("model", config.model))
+            system_prompt = config.effective_system_prompt(profile_model)
         suffix = str(raw.get("system_prompt_suffix", "") or "")
         if suffix:
             system_prompt = f"{system_prompt.rstrip()}\n{suffix}"

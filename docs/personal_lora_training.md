@@ -216,27 +216,155 @@ MoE ExpertへLoRAを追加すると、アダプターサイズと推論オーバ
 
 LoRAはベースモデルへ直接上書きしない。ベース、SFT、DPOを別名で保持し、`config/chat_config.json` のモデル名だけで即時に戻せるようにする。
 
-## 7. Phase 13で追加する実装
+## 7. 実装済みパイプライン
 
-今後リポジトリへ追加する候補:
+### 解消した5つの障害
 
+1. **データ品質と個人情報漏えい**
+   - エクスポーターは既定で `metadata` を出力しない。ローカル監査時だけ `--include-metadata` を明示する。
+   - `training/validate_dataset.py` がスキーマ、空欄、重複、文字数、秘密情報、メール、電話番号などを検査する。
+   - `--clean-output` は問題行と重複行を除外し、metadataも削除した転送用JSONLを作る。検出値そのものはログへ表示しない。
+   - SFTは20件、DPOは50件を設定上の最低件数とし、少数データでの誤学習をdry-run段階で止める。
+2. **Qwen3.6と学習ライブラリの不整合**
+   - ベースrevisionを `995ad96eacd98c81ed38be0c5b274b04031597b0` に固定した。
+   - `requirements-training.txt` は `qwen3_5_moe` を実装したTransformers 5.13.1を含む、検証可能な組み合わせへ固定した。
+   - 公式chat templateにはassistantマスクがないため、`training/templates/qwen3_6_assistant.jinja` に `{% generation %}` 範囲を定義した。これにより `assistant_only_loss` が全トークン無効になる事故を防ぐ。
+3. **MoE向け安全なSFT/DPO実行系がない**
+   - `training/train_sft.py`、`training/train_dpo.py`、`training/runtime.py` を追加した。
+   - conservative設定はAttentionとGatedDeltaNet射影だけ、strong設定も共有Expertだけを追加し、256 routed Experts、router、vision、embedding、lm_headを除外する。
+   - BF16 LoRA以外、未固定revision、全層学習、量子化学習を設定検証で拒否し、実行前manifestを保存する。
+4. **学習後の比較・マージ・配備手順がない**
+   - `training/evaluate.py` と25件の固定会話、`training/merge_adapter.py`、`scripts/convert_personal_model_to_gguf.sh`、Ollama Modelfile例を追加した。
+   - LoRAをBF16ベースのコピーへマージしてから、フルモデルGGUFへ変換・量子化する。ベースとadapterは上書きしない。
+5. **モデル切替時に人格promptが評価へ混ざり、ロールバックも危険**
+   - `ChatConfig.model_prompt_overrides` でpersonal modelだけ短い人格契約を使い、base modelでは従来の長いpromptを維持する。
+   - `scripts/switch_chat_model.py` は `model` 以外のJSON値を維持し、バックアップと本体をアトミックに書き、`rollback` で完全復元する。
+
+### 実装ファイル
+
+- `training/dataset.py`
 - `training/validate_dataset.py`
-  - スキーマ、重複、秘密情報、文字数を検査
+- `training/tokenize_check.py`
+- `training/runtime.py`
 - `training/train_sft.py`
-  - H200用BF16 LoRA
 - `training/train_dpo.py`
-  - SFTアダプターからのDPO
 - `training/merge_adapter.py`
-  - アダプターをBF16ベースへマージ
+- `training/evaluate.py`
+- `training/eval_prompts.jsonl`
+- `training/templates/qwen3_6_assistant.jinja`
 - `training/configs/persona_conservative.yaml`
 - `training/configs/persona_strong.yaml`
+- `training/configs/persona_dpo.yaml`
+- `requirements-training.txt`
 - `scripts/convert_personal_model_to_gguf.sh`
+- `scripts/switch_chat_model.py`
 - `models/ollama/Modelfile.personal.example`
-- `tests/test_training_dataset.py`
+- `tests/test_training_*.py`
+- `tests/test_chat_model_switch.py`
 
-既存の会話、記憶、Discord、Web、音声処理は変更せず、学習とモデル変換を独立したオフライン工程として追加する。
+## 8. 実行手順
 
-## 8. 参考資料
+### 8.1 ローカル: 出力、清掃、tokenize確認
+
+```bash
+source .venv/bin/activate
+
+python scripts/export_discord_training.py \
+  --format sft --include-positive-feedback --min-score 1 \
+  --output data/finetune/sft.jsonl
+python scripts/export_discord_training.py \
+  --format preference \
+  --output data/finetune/dpo.jsonl
+
+python -m training.validate_dataset \
+  --input data/finetune/sft.jsonl --format sft \
+  --clean-output data/finetune/sft.clean.jsonl --json \
+  > data/finetune/sft.validation.json
+python -m training.validate_dataset \
+  --input data/finetune/dpo.jsonl --format dpo \
+  --clean-output data/finetune/dpo.clean.jsonl --json \
+  > data/finetune/dpo.validation.json
+
+python -m training.tokenize_check \
+  --input data/finetune/sft.clean.jsonl --format sft \
+  --tokenizer Qwen/Qwen3.6-35B-A3B \
+  --revision 995ad96eacd98c81ed38be0c5b274b04031597b0 \
+  --chat-template training/templates/qwen3_6_assistant.jinja \
+  --max-tokens 2048
+```
+
+2026-07-15時点のローカル実行ではSFT 73件、DPO 12件が検査を通過した。SFT最大244 tokens、DPO最大173 tokensで、2048 tokens以内だった。SFT実験の最低件数は満たすが、DPOは最低50件に未達なので現時点では実行しない。JSONL本体はgit管理外とする。
+
+### 8.2 H200: 環境確認と学習
+
+```bash
+python -m venv .venv-training
+source .venv-training/bin/activate
+pip install -r requirements-training.txt
+
+python -m training.train_sft \
+  training/configs/persona_conservative.yaml --dry-run
+python -m training.train_sft \
+  training/configs/persona_conservative.yaml
+
+# SFT adapterを選び、明示修正ペアが50件以上になった後
+python -m training.train_dpo \
+  --config training/configs/persona_dpo.yaml --dry-run
+python -m training.train_dpo \
+  --config training/configs/persona_dpo.yaml
+```
+
+H200へ送るのは `*.clean.jsonl`、設定、スクリプトだけとする。実学習前にmanifestのrevision、対象module、dataset pathを確認する。**このリポジトリで完了したのは実行系とローカルpreflightであり、H200上の実学習自体はH200を確保した後に実行する外部工程である。**
+
+### 8.3 ローカル: マージ、GGUF、Ollama
+
+```bash
+python -m training.merge_adapter \
+  --config training/configs/persona_conservative.yaml \
+  --adapter training/outputs/persona-conservative \
+  --output training/outputs/persona-conservative-merged \
+  --dry-run
+
+python -m training.merge_adapter \
+  --config training/configs/persona_conservative.yaml \
+  --adapter training/outputs/persona-conservative \
+  --output training/outputs/persona-conservative-merged
+
+bash scripts/convert_personal_model_to_gguf.sh \
+  --merged-model training/outputs/persona-conservative-merged \
+  --output-dir data/models/personal \
+  --basename qwen3.6-shunkin-sft \
+  --quant Q4_K_M \
+  --llama-dir /path/to/llama.cpp \
+  --dry-run
+```
+
+`--dry-run` の表示を確認してから外し、`models/ollama/Modelfile.personal.example` をコピーして `__MODEL_GGUF__` を生成済みGGUFの絶対パスへ置換する。
+
+### 8.4 比較、切替、ロールバック
+
+```bash
+python -m training.evaluate \
+  --kind baseline --model qwen3.6:35b-a3b-base-q4_K_M \
+  --output data/finetune/eval-base.json
+python -m training.evaluate \
+  --kind sft --model qwen3.6:35b-a3b-shunkin-sft-q4_K_M \
+  --output data/finetune/eval-sft.json
+
+python scripts/switch_chat_model.py show
+python scripts/switch_chat_model.py switch \
+  qwen3.6:35b-a3b-shunkin-sft-q4_K_M
+# 問題があれば
+python scripts/switch_chat_model.py rollback
+```
+
+サービスへ反映する場合だけ、切替後に次を実行する。
+
+```bash
+systemctl --user restart subpc-discord.service subpc-web.service
+```
+
+## 9. 参考資料
 
 - Qwen3.6: https://github.com/QwenLM/Qwen3.6
 - Qwen3.6-35B-A3B: https://huggingface.co/Qwen/Qwen3.6-35B-A3B

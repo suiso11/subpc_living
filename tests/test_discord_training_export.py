@@ -119,6 +119,7 @@ class DiscordTrainingExportTest(unittest.TestCase):
             profile="voice_short",
             source="discord_voice_transcript",
             channel_id=None,
+            include_metadata=True,
         )
 
         self.assertEqual(len(rows), 1)
@@ -180,6 +181,75 @@ class DiscordTrainingExportTest(unittest.TestCase):
         self.assertEqual(len(default_rows), 1)
         self.assertEqual(default_rows[0]["messages"][1]["content"], "まず一個だけ置いてみましょ。")
         self.assertEqual(len(expanded_rows), 2)
+
+    def test_default_records_omit_metadata_for_training_bound_export(self) -> None:
+        turns = [
+            {
+                "turn_id": "voice-1",
+                "source": "discord_voice_transcript",
+                "profile": "voice_short",
+                "channel_id": 10,
+                "user": "眠い",
+                "assistant": "寝なさい。",
+            }
+        ]
+        candidates = [
+            {
+                "turn_id": "voice-1",
+                "input": "眠い",
+                "preferred_output": "それなら10分だけ休みましょ。",
+                "rejected_output": "寝なさい。",
+            }
+        ]
+
+        pref_default = export_preference(
+            candidates=candidates,
+            turns_by_id=turn_index(turns),
+            profile="voice_short",
+            source="discord_voice_transcript",
+            channel_id=None,
+        )
+        pref_meta = export_preference(
+            candidates=candidates,
+            turns_by_id=turn_index(turns),
+            profile="voice_short",
+            source="discord_voice_transcript",
+            channel_id=None,
+            include_metadata=True,
+        )
+        sft_default = export_sft(
+            candidates=candidates,
+            turns=turns,
+            turns_by_id=turn_index(turns),
+            scores={},
+            profile="voice_short",
+            source="discord_voice_transcript",
+            channel_id=None,
+            include_positive_feedback=False,
+            min_score=1,
+        )
+        sft_meta = export_sft(
+            candidates=candidates,
+            turns=turns,
+            turns_by_id=turn_index(turns),
+            scores={},
+            profile="voice_short",
+            source="discord_voice_transcript",
+            channel_id=None,
+            include_positive_feedback=False,
+            min_score=1,
+            include_metadata=True,
+        )
+
+        self.assertNotIn("metadata", pref_default[0])
+        self.assertEqual(set(pref_default[0].keys()), {"prompt", "chosen", "rejected"})
+
+        self.assertIn("metadata", pref_meta[0])
+
+        self.assertNotIn("metadata", sft_default[0])
+        self.assertEqual(set(sft_default[0].keys()), {"messages"})
+
+        self.assertIn("metadata", sft_meta[0])
 
 
 if __name__ == "__main__":

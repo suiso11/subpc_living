@@ -15,8 +15,18 @@ config/discord.env
 config/web.env
 
 # モデル・バイナリ（サイズが大きいためgit管理外）
-models/
-tools/
+# models/* (not models/) so the tracked Modelfile template below can be
+# re-included; git cannot re-include files under a fully excluded directory.
+models/*
+tools/*
+
+# 例外: Ollama Modelfile のテンプレートは追跡する
+!models/ollama/
+!models/ollama/Modelfile.personal.example
+
+# training の成果物（チェックポイント・評価結果）は管理外
+training/checkpoints/
+training/outputs/
 
 # OS
 .DS_Store

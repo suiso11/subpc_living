@@ -1,0 +1,17 @@
+# Phase 13: isolated H200 BF16 LoRA environment.
+# Install separately from requirements.txt. These versions are pinned because
+# Qwen3.6 uses the qwen3_5_moe architecture introduced after Transformers 5.1.
+# Use the PyTorch wheel matching the H200 host CUDA runtime.
+torch==2.10.0
+transformers==5.13.1
+peft==0.19.1
+trl==1.8.0
+accelerate==1.14.0
+datasets==5.0.0
+huggingface-hub==1.23.0
+safetensors==0.8.0
+sentencepiece==0.2.1
+PyYAML==6.0.3
+einops==0.8.2
+Pillow==12.1.0
+torchvision==0.25.0

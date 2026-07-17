@@ -98,7 +98,7 @@ def main():
     except Exception:
         growth_tracker = None
     session = ChatSession(
-        system_prompt=config.system_prompt,
+        system_prompt=config.effective_system_prompt(),
         max_history_turns=config.max_history_turns,
         history_dir=str(PROJECT_ROOT / config.history_dir),
         web_search=web_search,
@@ -146,7 +146,7 @@ def main():
                 continue
             elif cmd == "/system":
                 print(f"\n{Color.DIM}[System Prompt]{Color.RESET}")
-                print(f"{Color.DIM}{config.system_prompt}{Color.RESET}")
+                print(f"{Color.DIM}{config.effective_system_prompt()}{Color.RESET}")
                 continue
             elif cmd == "/save":
                 saved_path = session.save()

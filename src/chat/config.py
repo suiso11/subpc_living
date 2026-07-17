@@ -2,6 +2,8 @@
 チャット設定モジュール
 Phase 2: テキスト対話用の設定を管理する
 """
+import os
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 import json
@@ -57,6 +59,60 @@ class ChatConfig:
     discord_channel_profile_map: dict[str, str] = field(default_factory=dict)
     discord_channel_profiles: dict[str, dict] = field(default_factory=dict)
 
+    # --- モデル別 system_prompt 上書き ---
+    # model_prompt_overrides: {"model_name": "短いプロンプト"}
+    # SFT/DPO 等の人格定着済みモデルでは長い system_prompt を付けず、
+    # ここで指定した短い人格契約だけを差し込む。base の system_prompt は
+    # 上書きされず保持され、モデル名を base に戻せば元の長いプロンプトに戻る。
+    model_prompt_overrides: dict[str, str] = field(default_factory=dict)
+
+    def effective_system_prompt(self, model: str | None = None) -> str:
+        """指定モデル (省略時 self.model) で実際に使用する system_prompt を返す。
+
+        model_prompt_overrides に該当モデル名があればその短いプロンプトを、
+        無ければ base の self.system_prompt を返す。本フィールドは読み取り専用で、
+        self.system_prompt を書き換えない。
+        """
+        target = model if model is not None else self.model
+        if target and target in self.model_prompt_overrides:
+            return self.model_prompt_overrides[target]
+        return self.system_prompt
+
+    @staticmethod
+    def _atomic_write(path: Path, payload: bytes) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_name, path)
+        except Exception:
+            try:
+                os.unlink(tmp_name)
+            except FileNotFoundError:
+                pass
+            raise
+
+    def create_backup(self, path: str | Path = "config/chat_config.json") -> Path | None:
+        """既存設定を同一ディレクトリの <path>.bak へアトミックに保存する。"""
+        path = Path(path)
+        if not path.exists():
+            return None
+        backup = path.with_name(path.name + ".bak")
+        self._atomic_write(backup, path.read_bytes())
+        return backup
+
+    def rollback_from_backup(self, path: str | Path = "config/chat_config.json") -> bool:
+        """バックアップをアトミックに復元する。"""
+        path = Path(path)
+        backup = path.with_name(path.name + ".bak")
+        if not backup.exists():
+            return False
+        self._atomic_write(path, backup.read_bytes())
+        return True
+
     @classmethod
     def load(cls, path: str | Path = "config/chat_config.json") -> "ChatConfig":
         """JSONファイルから設定をロード"""
@@ -68,9 +124,8 @@ class ChatConfig:
         return cls()
 
     def save(self, path: str | Path = "config/chat_config.json") -> None:
-        """設定をJSONファイルに保存"""
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        """設定を同一ディレクトリの一時ファイル経由でアトミックに保存。"""
         from dataclasses import asdict
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(asdict(self), f, ensure_ascii=False, indent=2)
+        path = Path(path)
+        payload = (json.dumps(asdict(self), ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        self._atomic_write(path, payload)
