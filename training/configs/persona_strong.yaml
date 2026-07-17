@@ -1,0 +1,28 @@
+# Strong SFT: conservative targets plus the shared expert MLP only.
+name: persona-strong
+stage: sft
+model_name: Qwen/Qwen3.6-35B-A3B
+model_revision: "995ad96eacd98c81ed38be0c5b274b04031597b0"
+precision: bf16
+max_sequence_length: 2048
+micro_batch_size: 1
+gradient_accumulation_steps: 8
+learning_rate: 5.0e-5
+epochs: 1
+gradient_checkpointing: true
+assistant_only_loss: true
+chat_template_path: training/templates/qwen3_6_assistant.jinja
+dataset_path: data/finetune/sft.clean.jsonl
+min_dataset_rows: 20
+save_steps: 100
+seed: 42
+warmup_ratio: 0.03
+lr_scheduler_type: cosine
+output_dir: training/outputs/persona-strong
+lora:
+  rank: 32
+  alpha: 64
+  dropout: 0.05
+  target_mode: strong
+  target_modules: []
+  modules_to_save: []

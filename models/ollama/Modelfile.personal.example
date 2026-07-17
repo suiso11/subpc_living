@@ -1,0 +1,8 @@
+# Copy this file per model and replace __MODEL_GGUF__ with an absolute path.
+# Keep separate Ollama tags; never overwrite the base:
+#   ollama create qwen3.6:35b-a3b-base-q4_K_M -f Modelfile.base
+#   ollama create qwen3.6:35b-a3b-shunkin-sft-q4_K_M -f Modelfile.sft
+#   ollama create qwen3.6:35b-a3b-shunkin-dpo-q4_K_M -f Modelfile.dpo
+FROM __MODEL_GGUF__
+PARAMETER num_ctx 4096
+PARAMETER temperature 0.7

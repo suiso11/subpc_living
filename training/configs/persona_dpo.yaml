@@ -1,0 +1,30 @@
+# DPO continuation from the selected SFT adapter.
+name: persona-dpo
+stage: dpo
+model_name: Qwen/Qwen3.6-35B-A3B
+model_revision: "995ad96eacd98c81ed38be0c5b274b04031597b0"
+precision: bf16
+max_sequence_length: 2048
+micro_batch_size: 1
+gradient_accumulation_steps: 8
+learning_rate: 1.0e-6
+epochs: 1
+gradient_checkpointing: true
+assistant_only_loss: true
+chat_template_path: training/templates/qwen3_6_assistant.jinja
+dataset_path: data/finetune/dpo.clean.jsonl
+# 12件の現状データでは実行しない。明示修正が50件以上になってから有効化。
+min_dataset_rows: 50
+base_adapter_path: training/outputs/persona-conservative
+output_dir: training/outputs/persona-dpo
+save_steps: 100
+seed: 42
+warmup_ratio: 0.03
+lr_scheduler_type: cosine
+lora:
+  rank: 16
+  alpha: 32
+  dropout: 0.05
+  target_mode: conservative
+  target_modules: []
+  modules_to_save: []

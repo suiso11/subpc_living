@@ -131,7 +131,7 @@ def run_text_to_speech_mode(args):
     except Exception:
         growth_tracker = None
     session = ChatSession(
-        system_prompt=config.system_prompt,
+        system_prompt=config.effective_system_prompt(),
         max_history_turns=config.max_history_turns,
         history_dir=str(PROJECT_ROOT / config.history_dir),
         web_search=web_search,

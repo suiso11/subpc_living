@@ -1,0 +1,12 @@
+{%- for message in messages %}
+    {%- set content = message.content | trim %}
+    {%- if message.role == 'assistant' %}
+        {{- '<|im_start|>assistant\n' }}
+        {%- generation %}{{- content + '<|im_end|>\n' }}{%- endgeneration %}
+    {%- elif message.role == 'system' or message.role == 'user' %}
+        {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>\n' }}
+    {%- else %}
+        {{- raise_exception('Only system/user/assistant messages are supported for text SFT.') }}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}{{- '<|im_start|>assistant\n' }}{%- endif %}

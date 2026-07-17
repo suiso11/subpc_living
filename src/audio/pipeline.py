@@ -241,7 +241,7 @@ class VoicePipeline:
 
         # セッション
         self.session = ChatSession(
-            system_prompt=self.config.system_prompt,
+            system_prompt=self.config.effective_system_prompt(),
             max_history_turns=self.config.max_history_turns,
             history_dir=str(PROJECT_ROOT / self.config.history_dir),
             rag=self.rag,

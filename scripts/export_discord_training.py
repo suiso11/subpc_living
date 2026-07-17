@@ -97,14 +97,22 @@ def metadata_matches(
     return True
 
 
-def sft_record(prompt: str, response: str, metadata: dict[str, Any]) -> dict[str, Any]:
-    return {
+def sft_record(
+    prompt: str,
+    response: str,
+    metadata: dict[str, Any],
+    *,
+    include_metadata: bool = False,
+) -> dict[str, Any]:
+    record: dict[str, Any] = {
         "messages": [
             {"role": "user", "content": prompt},
             {"role": "assistant", "content": response},
         ],
-        "metadata": metadata,
     }
+    if include_metadata:
+        record["metadata"] = metadata
+    return record
 
 
 def preference_record(
@@ -112,13 +120,17 @@ def preference_record(
     chosen: str,
     rejected: str,
     metadata: dict[str, Any],
+    *,
+    include_metadata: bool = False,
 ) -> dict[str, Any]:
-    return {
+    record: dict[str, Any] = {
         "prompt": prompt,
         "chosen": chosen,
         "rejected": rejected,
-        "metadata": metadata,
     }
+    if include_metadata:
+        record["metadata"] = metadata
+    return record
 
 
 def export_preference(
@@ -128,6 +140,7 @@ def export_preference(
     profile: str | None,
     source: str | None,
     channel_id: int | None,
+    include_metadata: bool = False,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for candidate in candidates:
@@ -140,7 +153,11 @@ def export_preference(
         rejected = str(candidate.get("rejected_output") or (turn or {}).get("assistant") or "").strip()
         if not prompt or not chosen or not rejected:
             continue
-        rows.append(preference_record(prompt, chosen, rejected, metadata))
+        rows.append(
+            preference_record(
+                prompt, chosen, rejected, metadata, include_metadata=include_metadata
+            )
+        )
     return rows
 
 
@@ -155,6 +172,7 @@ def export_sft(
     channel_id: int | None,
     include_positive_feedback: bool,
     min_score: int,
+    include_metadata: bool = False,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
@@ -168,7 +186,9 @@ def export_sft(
         response = str(candidate.get("preferred_output") or "").strip()
         key = (prompt, response)
         if prompt and response and key not in seen:
-            rows.append(sft_record(prompt, response, metadata))
+            rows.append(
+                sft_record(prompt, response, metadata, include_metadata=include_metadata)
+            )
             seen.add(key)
 
     if not include_positive_feedback:
@@ -185,7 +205,9 @@ def export_sft(
         response = str(turn.get("assistant") or "").strip()
         key = (prompt, response)
         if prompt and response and key not in seen:
-            rows.append(sft_record(prompt, response, metadata))
+            rows.append(
+                sft_record(prompt, response, metadata, include_metadata=include_metadata)
+            )
             seen.add(key)
 
     return rows
@@ -206,6 +228,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--min-score", type=int, default=1)
     parser.add_argument("--max-rows", type=int, default=0, help="0 means no limit.")
+    parser.add_argument(
+        "--include-metadata",
+        action="store_true",
+        help=(
+            "Retain per-record metadata in the exported file for local audit/"
+            "filtering. By default metadata is omitted from training-bound records."
+        ),
+    )
     return parser
 
 
@@ -224,6 +254,7 @@ def main() -> None:
             profile=args.profile,
             source=args.source,
             channel_id=args.channel_id,
+            include_metadata=args.include_metadata,
         )
     else:
         rows = export_sft(
@@ -236,6 +267,7 @@ def main() -> None:
             channel_id=args.channel_id,
             include_positive_feedback=args.include_positive_feedback,
             min_score=args.min_score,
+            include_metadata=args.include_metadata,
         )
 
     if args.max_rows > 0:

@@ -1892,10 +1892,22 @@ async def _send_direct_chat_reply(
             })
 
 
+def _effective_system_prompt(cfg) -> str:
+    """実行時に使用する system_prompt を返す。
+
+    ChatConfig なら model_prompt_overrides を考慮した effective_system_prompt を使う。
+    テスト用の duck-typed モック (SimpleNamespace 等) には system_prompt だけ使う。
+    """
+    fn = getattr(cfg, "effective_system_prompt", None)
+    if callable(fn):
+        return fn()
+    return cfg.system_prompt
+
+
 def _new_chat_session() -> ChatSession:
     """現在の依存コンポーネントを注入した ChatSession を新規作成する。"""
     return ChatSession(
-        system_prompt=config.system_prompt,
+        system_prompt=_effective_system_prompt(config),
         max_history_turns=config.max_history_turns,
         history_dir=str(PROJECT_ROOT / config.history_dir),
         rag=rag,
@@ -1986,7 +1998,7 @@ def get_or_create_session(session_id: str) -> ChatSession:
                 emotion_tags=config.emotion_tag_enabled,
             )
             # 復元時も現在設定の system_prompt を優先
-            session.system_prompt = config.system_prompt
+            session.system_prompt = _effective_system_prompt(config)
             session.emotion_tags = config.emotion_tag_enabled
             session.max_history_turns = config.max_history_turns
             session.session_id = session_id
