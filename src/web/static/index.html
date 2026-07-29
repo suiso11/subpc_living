@@ -75,6 +75,7 @@
           <div class="growth-progress" role="progressbar" aria-label="次のレベルまで" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="growth-progress-bar"></span></div>
           <div class="growth-stats"><span><strong id="growth-today">—</strong><small>きょう</small></span><span><strong id="growth-streak">—</strong><small>つづけた日</small></span><span><strong id="growth-memory">—</strong><small>思い出</small></span><span><strong id="growth-corrections">—</strong><small>学び直し</small></span></div>
           <div class="growth-chart" id="growth-chart" aria-label="直近14日の成長"></div>
+          <button class="growth-open" id="growth-open" type="button" aria-haspopup="dialog" aria-controls="growth-dialog" aria-label="育ちメーターの詳細を開く" disabled><span>詳細</span><span aria-hidden="true">↗</span></button>
         </section>
         <section class="game-hub" id="game-hub" aria-label="会話ゲーム">
           <button class="game-toggle" id="game-toggle" type="button" aria-expanded="false" aria-controls="game-details"><span class="game-toggle-title"><span aria-hidden="true">◆</span> 今日のクエスト</span><span class="game-toggle-meta"><strong id="game-rank">—</strong><span id="game-quest-summary">読み込み中</span></span><span class="game-toggle-icon" id="game-toggle-icon" aria-hidden="true">＋</span></button>
@@ -89,6 +90,33 @@
     </main>
     <footer class="site-footer"><strong>LOCAL · OLLAMA</strong><span class="footer-sep">/</span><span>この会話はこの端末で動作します</span><span class="footer-sep">/</span><span>接続状態は上の印で確認</span></footer>
   </div>
+
+  <dialog class="growth-dialog" id="growth-dialog" tabindex="-1" aria-labelledby="growth-dialog-title" aria-describedby="growth-dialog-note">
+    <div class="growth-dialog-surface">
+      <header class="growth-dialog-head">
+        <div><span class="growth-dialog-kicker">growth / last 14 days</span><h2 id="growth-dialog-title">育ちの記録</h2></div>
+        <button class="icon-btn growth-dialog-close" id="growth-dialog-close" type="button" aria-label="育ちの記録を閉じる">✕</button>
+      </header>
+      <div class="growth-dialog-body">
+        <section class="growth-dialog-stat" aria-label="現在の育ちポイント">
+          <div class="growth-dialog-figure"><strong id="growth-detail-points">—</strong><span>pt</span></div>
+          <p><strong id="growth-detail-level">Lv.1</strong><span>会話と思い出から積み上がった現在値</span></p>
+        </section>
+        <div class="growth-detail-progress" role="progressbar" aria-label="次のレベルまで" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="growth-detail-progress-bar"></span></div>
+        <div class="growth-detail-stats" aria-label="育ちポイントの内訳">
+          <span><strong id="growth-detail-today">—</strong><small>きょう</small></span>
+          <span><strong id="growth-detail-streak">—</strong><small>つづけた日</small></span>
+          <span><strong id="growth-detail-memory">—</strong><small>思い出</small></span>
+          <span><strong id="growth-detail-corrections">—</strong><small>学び直し</small></span>
+        </div>
+        <section class="growth-history" aria-labelledby="growth-history-title">
+          <div class="growth-history-head"><h3 id="growth-history-title">直近14日</h3><span>日ごとの獲得ポイント</span></div>
+          <div class="growth-detail-chart" id="growth-detail-chart"></div>
+        </section>
+        <p class="growth-dialog-note" id="growth-dialog-note">この値は会話で増えた思い出や学びの量です。モデルの性能値ではありません。</p>
+      </div>
+    </div>
+  </dialog>
 
   <div class="settings-panel" id="settings-panel" role="dialog" aria-modal="true" aria-labelledby="settings-title" aria-hidden="true"><div class="settings-content"><div class="settings-header"><h3 id="settings-title">話し方の設定</h3><button class="icon-btn" id="settings-close" aria-label="設定を閉じる">✕</button></div><div class="setting-group"><label for="voice-select">声</label><select id="voice-select"><option value="jf_alpha">jf_alpha — 日本語 女性 (Alpha)</option></select></div><div class="setting-group"><p class="conn-label">つながり</p><div class="conn-info"><strong>接続先:</strong> <span id="server-url"></span><br><strong>会話:</strong> <span id="ws-status">つないでいます…</span></div></div></div></div>
   <script src="/static/app.js"></script><script src="/static/shell-ui.js"></script><script>document.getElementById('server-url').textContent = location.origin;</script>

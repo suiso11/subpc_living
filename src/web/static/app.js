@@ -36,6 +36,11 @@ const micBtn = $('#mic-btn');
 const sttStatus = $('#stt-status');
 const growthPanel = $('#growth-panel');
 const growthProgress = growthPanel?.querySelector('.growth-progress');
+const growthOpen = $('#growth-open');
+const growthDialog = $('#growth-dialog');
+const growthDialogClose = $('#growth-dialog-close');
+let growthRestoreFocus = null;
+let lastGrowthData = null;
 let lastGrowthPoints = null;
 const gameHub = $('#game-hub');
 const gameToggle = $('#game-toggle');
@@ -47,6 +52,73 @@ const runtimeStatus = { ollama: null, stt: null, tts: null, rag: null, websocket
 
 function formatCount(value) {
   return Number(value || 0).toLocaleString('ja-JP');
+}
+
+function renderGrowthDetail(data, { animate = false } = {}) {
+  if (!growthDialog || !data) return;
+  const points = Number(data.growth_points || 0);
+  const pointsNode = $('#growth-detail-points');
+  pointsNode.textContent = formatCount(points);
+  if (animate) {
+    pointsNode.classList.remove('number-settle');
+    void pointsNode.offsetWidth;
+    pointsNode.classList.add('number-settle');
+  }
+  $('#growth-detail-level').textContent = `Lv.${data.level || 1}`;
+  $('#growth-detail-today').textContent = `+${formatCount(data.today_points)}`;
+  $('#growth-detail-streak').textContent = formatCount(data.streak_days);
+  $('#growth-detail-memory').textContent = formatCount(data.asset_counts?.retrievable_memories);
+  $('#growth-detail-corrections').textContent = formatCount(data.asset_counts?.correction_candidates);
+  $('#growth-dialog-note').textContent = data.metric_note || growthPanel.title;
+
+  const progress = Math.max(0, Math.min(100, Number(data.level_progress || 0)));
+  $('#growth-detail-progress-bar').style.transform = `scaleX(${progress / 100})`;
+  $('.growth-detail-progress').setAttribute('aria-valuenow', String(progress));
+
+  const daily = Array.isArray(data.daily) ? data.daily : [];
+  const maxPoints = Math.max(1, ...daily.map((day) => Number(day.points || 0)));
+  const chart = $('#growth-detail-chart');
+  chart.replaceChildren(...daily.map((day) => {
+    const item = document.createElement('div');
+    item.className = 'growth-day';
+    const value = Number(day.points || 0);
+    const valueLabel = document.createElement('strong');
+    valueLabel.textContent = formatCount(value);
+    const track = document.createElement('span');
+    track.className = 'growth-day-track';
+    const bar = document.createElement('span');
+    bar.className = value > 0 ? 'growth-day-bar active' : 'growth-day-bar';
+    bar.style.transform = `scaleY(${Math.max(value > 0 ? 0.08 : 0.02, value / maxPoints)})`;
+    track.appendChild(bar);
+    const date = document.createElement('time');
+    date.dateTime = day.date;
+    const parts = String(day.date || '').split('-');
+    date.textContent = parts.length === 3 ? `${Number(parts[1])}/${Number(parts[2])}` : day.date;
+    item.title = `${day.date}：${value} pt・${day.turns || 0}往復`;
+    item.append(valueLabel, track, date);
+    return item;
+  }));
+}
+
+function openGrowthDialog() {
+  if (!growthDialog || !lastGrowthData || growthOpen?.disabled) return;
+  growthRestoreFocus = document.activeElement;
+  renderGrowthDetail(lastGrowthData, { animate: true });
+  growthDialog.showModal();
+  document.documentElement.classList.add('growth-dialog-open');
+  growthDialog.focus({ preventScroll: true });
+}
+
+function closeGrowthDialog() {
+  if (growthDialog?.open) growthDialog.close();
+}
+
+function handleGrowthDialogClose() {
+  document.documentElement.classList.remove('growth-dialog-open');
+  const restoreCandidate = growthRestoreFocus?.isConnected && !growthRestoreFocus.disabled
+    ? growthRestoreFocus : growthOpen?.disabled ? $('#settings-btn') : growthOpen;
+  growthRestoreFocus = null;
+  setTimeout(() => restoreCandidate?.focus({ preventScroll: true }), 0);
 }
 
 function statusWord(value) {
@@ -127,6 +199,9 @@ async function loadGrowth({ animate = false } = {}) {
     const data = await resp.json();
     if (!data.enabled) throw new Error('growth disabled');
     growthPanel.classList.remove('growth-unavailable');
+    growthOpen.disabled = false;
+    growthOpen.removeAttribute('aria-disabled');
+    lastGrowthData = data;
 
     const points = Number(data.growth_points || 0);
     const previous = lastGrowthPoints;
@@ -155,6 +230,8 @@ async function loadGrowth({ animate = false } = {}) {
       return bar;
     }));
 
+    if (growthDialog?.open) renderGrowthDetail(data, { animate });
+
     if (animate && previous !== null && points > previous) {
       const delta = points - previous;
       const badge = $('#growth-delta');
@@ -167,6 +244,9 @@ async function loadGrowth({ animate = false } = {}) {
     }
   } catch (e) {
     growthPanel.classList.add('growth-unavailable');
+    growthOpen.disabled = true;
+    growthOpen.setAttribute('aria-disabled', 'true');
+    if (growthDialog?.open) closeGrowthDialog();
     console.warn('[Growth] Fetch failed:', e);
   }
 }
@@ -1046,6 +1126,15 @@ async function init() {
   // イベント
   sendBtn.addEventListener('click', sendMessage);
   micBtn.addEventListener('click', toggleRecording);
+  growthOpen?.addEventListener('click', openGrowthDialog);
+  growthDialogClose?.addEventListener('click', closeGrowthDialog);
+  growthDialog?.addEventListener('close', handleGrowthDialogClose);
+  growthDialog?.addEventListener('click', (event) => {
+    if (event.target === growthDialog) {
+      event.preventDefault();
+      closeGrowthDialog();
+    }
+  });
 
   // 手動スクロール位置の受動追跡（末尾付近かどうかで自動追従を切り替える）
   chatArea.addEventListener('scroll', trackChatScroll, { passive: true });

@@ -23,6 +23,7 @@
   // 設定ダイアログなど、シェル外のモーダルが開いているかを判定する。
   // シェルのコマンドパレット自体は除外し、パレット操作中は邪魔しない。
   function settingsModalOpen() {
+    if (document.querySelector('dialog[open]')) return true;
     const panel = document.querySelector('#settings-panel');
     if (!panel) return false;
     if (panel.getAttribute('aria-hidden') === 'false') return true;

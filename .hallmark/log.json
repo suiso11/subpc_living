@@ -1,5 +1,14 @@
 [
   {
+    "date": "2026-07-30",
+    "build": "Hallmark v1.1.0",
+    "macrostructure": "Stat-Led",
+    "theme": "Midnight",
+    "drop": "night",
+    "enrichment": "Tier-A expanded growth instrument",
+    "summary": "Made the real growth meter an accessible expandable instrument with a large current figure, honest 14-day detail, restrained motion, and mobile-safe dialog behavior."
+  },
+  {
     "date": "2026-07-29",
     "build": "Hallmark v1.1.0",
     "macrostructure": "Workbench",

@@ -1,4 +1,4 @@
-/* Hallmark Lumen / Night Foundry portable token export. Keep in sync with runtime copy. */
+/* Hallmark Midnight / Stat-Led portable token export. Keep in sync with runtime copy. */
 :root {
   color-scheme: dark;
 
@@ -50,7 +50,7 @@
 
   /* Type. Japanese fallbacks remain first-class. */
   --font-body: "Geist", "Noto Sans JP", "Hiragino Sans", "Yu Gothic", sans-serif;
-  --font-display: "Instrument Serif", "Noto Serif JP", "Yu Mincho", serif;
+  --font-display: "Geist", "Noto Sans JP", "Hiragino Sans", "Yu Gothic", sans-serif;
   --font-mono: "JetBrains Mono", "Noto Sans Mono CJK JP", ui-monospace, monospace;
   --font-size-micro: 0.61rem;
   --font-size-label: 0.68rem;

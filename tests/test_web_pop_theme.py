@@ -37,12 +37,12 @@ class HallmarkWebThemeTest(unittest.TestCase):
 
     def test_hallmark_stamp_tokens_and_instrument(self) -> None:
         css = (STATIC / "hallmark-theme.css").read_text(encoding="utf-8")
-        self.assertTrue(css.startswith('/* Hallmark · genre: atmospheric · macrostructure: Workbench · theme: Lumen / Night Foundry · enrichment: Tier-A signal instrument · nav: N13 · footer: Ft2 */'))
+        self.assertTrue(css.startswith('/* Hallmark · genre: atmospheric · macrostructure: Stat-Led · theme: Midnight · enrichment: Tier-A expanded growth instrument · nav: N13 · footer: Ft2 */'))
         for token in (
             'genre: atmospheric',
-            'macrostructure: Workbench',
-            'theme: Lumen / Night Foundry',
-            'enrichment: Tier-A signal instrument',
+            'macrostructure: Stat-Led',
+            'theme: Midnight',
+            'enrichment: Tier-A expanded growth instrument',
             'nav: N13',
             'footer: Ft2',
             '.shell-command-dialog',
@@ -57,6 +57,10 @@ class HallmarkWebThemeTest(unittest.TestCase):
         self.assertIn('265)', tokens)
         self.assertIn('50)', tokens)
         self.assertIn('18)', tokens)
+        self.assertIn('--font-display: "Geist"', tokens)
+        self.assertIn('macrostructure: Stat-Led', css)
+        self.assertEqual(log := json.loads((ROOT / ".hallmark" / "log.json").read_text(encoding="utf-8")), sorted(log, key=lambda entry: entry["date"], reverse=True))
+        self.assertEqual(log[0]["theme"], "Midnight")
 
     def test_mobile_command_trigger_collapses_without_losing_label(self) -> None:
         css = (STATIC / "hallmark-theme.css").read_text(encoding="utf-8")
@@ -84,7 +88,7 @@ class HallmarkWebThemeTest(unittest.TestCase):
 
     def test_service_worker_caches_hallmark_revision(self) -> None:
         worker = (STATIC / "service-worker.js").read_text(encoding="utf-8")
-        self.assertIn("subpc-living-v27", worker)
+        self.assertIn("subpc-living-v28", worker)
         self.assertIn("/static/tokens.css", worker)
         self.assertIn("/static/hallmark-theme.css", worker)
         for asset in ("geist-latin.woff2", "instrument-serif-latin.woff2", "jetbrains-mono-latin.woff2", "LICENSES.txt"):
@@ -105,6 +109,9 @@ class HallmarkWebThemeTest(unittest.TestCase):
             self.assertIn(f'id="{hook}"', html)
         self.assertNotIn('READY / PRIVATE', html)
         self.assertNotIn('welcome-orb', html)
+        shell = (STATIC / "shell-ui.js").read_text(encoding="utf-8")
+        self.assertIn("document.querySelector('dialog[open]')", shell)
+        self.assertIn("settingsModalOpen() && state.backdrop.hidden", shell)
         self.assertIn('class="workbench"', html)
         self.assertIn('class="signal-apparatus" role="group"', html)
         self.assertNotIn('class="signal-apparatus" role="img"', html)

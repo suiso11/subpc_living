@@ -1,4 +1,4 @@
-const CACHE_NAME = 'subpc-living-v27';
+const CACHE_NAME = 'subpc-living-v28';
 const STATIC_ASSETS = [
   '/',
   '/tasks',

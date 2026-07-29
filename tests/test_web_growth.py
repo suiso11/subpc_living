@@ -52,6 +52,40 @@ class WebGrowthTest(unittest.TestCase):
         self.assertIn("/api/growth?days=14", js)
         self.assertIn("loadGrowth({ animate: true })", js)
 
+    def test_growth_meter_opens_accessible_real_data_dialog(self) -> None:
+        root = Path(server.PROJECT_ROOT)
+        html = (root / "src/web/static/index.html").read_text(encoding="utf-8")
+        js = (root / "src/web/static/app.js").read_text(encoding="utf-8")
+        css = (root / "src/web/static/style.css").read_text(encoding="utf-8")
+
+        for token in (
+            'id="growth-open"', 'aria-haspopup="dialog"',
+            'aria-controls="growth-dialog"', '<dialog class="growth-dialog"',
+            'aria-labelledby="growth-dialog-title"',
+            'aria-describedby="growth-dialog-note"', 'id="growth-dialog-close"',
+            'id="growth-detail-chart"', 'id="growth-detail-points"',
+        ):
+            self.assertIn(token, html)
+        for token in (
+            "lastGrowthData = data", "renderGrowthDetail", "growthDialog.showModal()",
+            "event.target === growthDialog", "event.preventDefault()",
+            "growthDialog?.addEventListener('close'",
+            "setTimeout(() => restoreCandidate?.focus({ preventScroll: true }), 0)",
+            "data.asset_counts?.retrievable_memories", "data.metric_note",
+            "Array.isArray(data.daily)",
+        ):
+            self.assertIn(token, js)
+        for token in (
+            ".growth-dialog::backdrop", "@keyframes growth-dialog-enter",
+            "@keyframes growth-update-pulse", "@keyframes growth-number-settle",
+            ".growth-open:focus-visible", "outline-offset: -3px",
+            "@media (hover: hover) and (pointer: fine)",
+            "@media (prefers-reduced-motion: reduce)",
+            "grid-template-columns: repeat(7, minmax(0, 1fr))",
+        ):
+            self.assertIn(token, css)
+        self.assertNotIn("transition-all", css)
+
 
 if __name__ == "__main__":
     unittest.main()
