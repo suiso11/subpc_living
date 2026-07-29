@@ -41,16 +41,22 @@ _TAG_RE = re.compile(
     re.IGNORECASE,
 )
 
+# 旧モデルや一部GGUFが出しがちな [neutral] / [happy] 形式も表示前に除去する。
+_LEGACY_TAG_RE = re.compile(
+    r"^[\s　]*[\[［]\s*(happy|sad|angry|surprise|fear|disgust|neutral)\s*[\]］]",
+    re.IGNORECASE,
+)
+
 # 途中まで入力された「タグになりうる接頭辞」を判定する部分マッチ用。
-# 空文字・空白・"["・"[e"・"[em"・"[emo"・"[emo:"・"[emo:ha" などにマッチする。
+# 空文字・空白・"["・"[e"・"[emo:ha" に加え、旧形式 "[neutral" も保留する。
 _PARTIAL_TAG_RE = re.compile(
     r"^[\s　]*"
     r"(?:[\[［]"
     r"(?:\s*"
-    r"(?:e(?:m(?:o"
-    r"(?:\s*[:：]"
-    r"(?:\s*[A-Za-z]*)?"
-    r")?)?)?)?"
+    r"(?:"
+    r"e(?:m(?:o(?:\s*[:：](?:\s*[A-Za-z]*)?)?)?)?"
+    r"|[A-Za-z]*"
+    r")"
     r")?)?$",
     re.IGNORECASE,
 )
@@ -76,6 +82,8 @@ def parse_emotion_tag(text: str) -> tuple[str, str]:
     if not text:
         return "neutral", text
     match = _TAG_RE.match(text)
+    if match is None:
+        match = _LEGACY_TAG_RE.match(text)
     if match is None:
         return "neutral", text
     emotion = match.group(1).strip().lower()
@@ -116,6 +124,8 @@ class EmotionTagStreamFilter:
         self._buffer += chunk
 
         match = _TAG_RE.match(self._buffer)
+        if match is None:
+            match = _LEGACY_TAG_RE.match(self._buffer)
         if match is not None:
             emotion = match.group(1).strip().lower()
             self.emotion = emotion if emotion in VALID_EMOTIONS else "neutral"

@@ -686,19 +686,26 @@ class VoicePipeline:
     @staticmethod
     def _is_repeated_tts_sentence(sentence: str, previous_sentences: list[str]) -> bool:
         normalized = re.sub(r"\s+", "", sentence)
-        if not normalized or len(previous_sentences) < 5:
+        if not normalized:
             return False
 
+        punct_chars = {"。", "…", ".", "、"}
+        is_punct_only = len(normalized) <= 8 and set(normalized) <= punct_chars
         recent = [re.sub(r"\s+", "", sent) for sent in previous_sentences[-5:]]
+
+        # 「……。」「...」だけの沈黙文が続く時は、2回読んだ時点で止める。
+        if is_punct_only:
+            recent_punct = [sent for sent in recent if sent and set(sent) <= punct_chars]
+            if len(recent_punct) >= 2:
+                return True
+
+        if len(previous_sentences) < 5:
+            return False
+
         if all(sent == normalized for sent in recent):
             return True
 
-        punct_chars = {"。", "…", ".", "、"}
-        return (
-            len(normalized) <= 6
-            and set(normalized) <= punct_chars
-            and all(set(sent) <= punct_chars for sent in recent)
-        )
+        return is_punct_only and all(set(sent) <= punct_chars for sent in recent)
 
     def _tts_worker(self) -> None:
         """TTS合成・再生のワーカースレッド"""

@@ -3,6 +3,7 @@ RAGリトリーバー モジュール
 Phase 4: ベクトルDB から関連文脈を検索してLLMプロンプトに注入する
 """
 from typing import Optional
+from src.chat.quality import is_low_value_memory_text, should_store_rag_turn
 from src.memory.vectorstore import VectorStore
 
 
@@ -51,11 +52,20 @@ class RAGRetriever:
             n_results=self.max_context_items,
         )
 
-        # 関連度で足切り
-        filtered = [
-            r for r in results
-            if r.get("distance", 2.0) < self.relevance_threshold
-        ]
+        # 関連度で足切り + 低情報応答の除外。
+        # 過去に「……。」「さっさと、寝なさい」系の定形文が大量に保存され、
+        # RAG 注入で同じ応答を誘発したため、検索時にも防御する。
+        filtered = []
+        for r in results:
+            if r.get("distance", 2.0) >= self.relevance_threshold:
+                continue
+            metadata = r.get("metadata") or {}
+            # 低情報応答フィルタは会話ログの assistant 側だけに適用する。
+            # knowledge はユーザーが明示保存したメモなので、短文や命令形でも落とさない。
+            assistant_text = metadata.get("assistant_message")
+            if assistant_text is not None and is_low_value_memory_text(str(assistant_text)):
+                continue
+            filtered.append(r)
 
         return filtered
 
@@ -131,6 +141,8 @@ class RAGRetriever:
             保存したドキュメントのID
         """
         if not self.vector_store.is_initialized():
+            return None
+        if not should_store_rag_turn(user_message, assistant_message):
             return None
 
         try:
