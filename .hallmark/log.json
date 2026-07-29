@@ -1,0 +1,11 @@
+[
+  {
+    "date": "2026-07-29",
+    "build": "Hallmark v1.1.0",
+    "macrostructure": "Workbench",
+    "theme": "lumen",
+    "drop": "night",
+    "enrichment": "Tier-A signal instrument",
+    "summary": "Redesigned the self-only conversation workbench around a local-first chat canvas, with supporting growth and quest context, N13 command search, and Ft2 local runtime status across all routes."
+  }
+]

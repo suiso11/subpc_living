@@ -1,0 +1,161 @@
+/* Hallmark Lumen / Night Foundry portable token export. Keep in sync with runtime copy. */
+:root {
+  color-scheme: dark;
+
+  /* Color: cool-violet paper, molten brass, restrained coral. */
+  --color-paper-0: oklch(13% 0.035 265);
+  --color-paper-1: oklch(17% 0.04 265);
+  --color-paper-2: oklch(21% 0.045 265);
+  --color-paper-3: oklch(26% 0.05 265);
+  --color-ink: oklch(96% 0.015 95);
+  --color-ink-muted: oklch(76% 0.025 265);
+  --color-ink-faint: oklch(60% 0.03 265);
+  --color-brass: oklch(78% 0.13 50);
+  --color-brass-bright: oklch(85% 0.14 50);
+  --color-brass-ink: oklch(18% 0.04 50);
+  --color-coral: oklch(70% 0.12 18);
+  --color-coral-soft: oklch(70% 0.12 18 / 0.16);
+  --color-violet-soft: oklch(55% 0.08 265 / 0.2);
+  --color-success: oklch(75% 0.11 150);
+  --color-warning: oklch(80% 0.12 85);
+  --color-danger: oklch(72% 0.14 25);
+  --color-info: oklch(73% 0.1 245);
+  --color-line: oklch(72% 0.04 265 / 0.24);
+  --color-line-strong: oklch(78% 0.1 50 / 0.62);
+  --color-focus: oklch(85% 0.14 50 / 0.72);
+  --color-shadow: oklch(5% 0.025 265 / 0.32);
+  --color-grid-line: oklch(75% 0.04 265 / 0.055);
+  --color-overlay: oklch(5% 0.03 265 / 0.78);
+  --color-overlay-settings: oklch(5% 0.03 265 / 0.76);
+  --color-on-brass-muted: oklch(20% 0.04 50 / 0.75);
+  --color-primary-soft: oklch(78% 0.13 50 / 0.14);
+  --color-accent-hover: oklch(77% 0.12 18);
+  --color-error-soft: oklch(72% 0.14 25 / 0.14);
+  --color-success-soft: oklch(75% 0.11 150 / 0.14);
+  --color-warning-soft: oklch(80% 0.12 85 / 0.14);
+  --color-ink-highlight: oklch(99% 0.01 95 / 0.04);
+  --color-focus-soft: oklch(85% 0.14 50 / 0.28);
+  --color-bg: var(--color-paper-0);
+  --color-surface: var(--color-paper-1);
+  --color-elevated: var(--color-paper-2);
+  --color-input: var(--color-paper-1);
+  --color-hover: var(--color-paper-3);
+  --color-text: var(--color-ink);
+  --color-text-muted: var(--color-ink-muted);
+  --color-text-faint: var(--color-ink-faint);
+  --color-primary: var(--color-brass);
+  --color-secondary: var(--color-coral);
+  --color-border: var(--color-line-strong);
+  --color-border-soft: var(--color-line);
+
+  /* Type. Japanese fallbacks remain first-class. */
+  --font-body: "Geist", "Noto Sans JP", "Hiragino Sans", "Yu Gothic", sans-serif;
+  --font-display: "Instrument Serif", "Noto Serif JP", "Yu Mincho", serif;
+  --font-mono: "JetBrains Mono", "Noto Sans Mono CJK JP", ui-monospace, monospace;
+  --font-size-micro: 0.61rem;
+  --font-size-label: 0.68rem;
+  --font-size-small: 0.78rem;
+  --font-size-body: 1rem;
+  --font-size-title: clamp(1.8rem, 4vw, 3rem);
+
+  /* 4pt spacing scale. */
+  --space-0: 0px;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-7: 28px;
+  --space-8: 32px;
+  --space-9: 36px;
+  --space-10: 40px;
+
+  /* Text roles. */
+  --text-primary: var(--color-ink);
+  --text-secondary: var(--color-ink-muted);
+  --text-tertiary: var(--color-ink-faint);
+  --text-label: var(--color-brass);
+  --text-on-primary: var(--color-brass-ink);
+  --text-leading-body: 1.7;
+  --text-leading-tight: 1.2;
+
+  /* Motion roles: interaction feedback only, plus functional apparatus timing. */
+  --ease-standard: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --ease-emphasized: cubic-bezier(0.16, 1, 0.3, 1);
+  --dur-instant: 0ms;
+  --dur-fast: 120ms;
+  --dur-base: 180ms;
+  --dur-slow: 320ms;
+  --dur-apparatus: 4s;
+
+  /* Rules and corners. */
+  --rule-thin: 1px solid var(--color-line);
+  --rule-strong: 1px solid var(--color-line-strong);
+  --rule-focus: 2px solid var(--color-focus);
+  --radius-none: 0px;
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 18px;
+  --radius-pill: 999px;
+  --radius-circle: 50%;
+
+  --content-max: 1240px;
+  --chat-max: 980px;
+  --header-h: 70px;
+  --footer-h: 34px;
+
+  /* Compatibility aliases used by existing feature scripts and markup. */
+  --paper-0: var(--color-paper-0);
+  --paper-1: var(--color-paper-1);
+  --paper-2: var(--color-paper-2);
+  --paper-3: var(--color-paper-3);
+  --ink: var(--color-ink);
+  --ink-muted: var(--color-ink-muted);
+  --ink-faint: var(--color-ink-faint);
+  --brass: var(--color-brass);
+  --brass-bright: var(--color-brass-bright);
+  --brass-ink: var(--color-brass-ink);
+  --coral: var(--color-coral);
+  --coral-soft: var(--color-coral-soft);
+  --violet-soft: var(--color-violet-soft);
+  --success: var(--color-success);
+  --warning: var(--color-warning);
+  --danger: var(--color-danger);
+  --info: var(--color-info);
+  --line: var(--color-line);
+  --line-strong: var(--color-line-strong);
+  --focus: var(--color-focus);
+  --shadow: 0 18px 42px var(--color-shadow);
+  --mono: var(--font-mono);
+  --body: var(--font-body);
+  --display: var(--font-display);
+  --bg: var(--color-paper-0);
+  --bg-surface: var(--color-paper-1);
+  --bg-elevated: var(--color-paper-2);
+  --bg-input: var(--color-paper-1);
+  --bg-hover: var(--color-paper-3);
+  --text: var(--text-primary);
+  --text-dim: var(--text-secondary);
+  --text-faint: var(--text-tertiary);
+  --primary: var(--color-brass);
+  --primary-hover: var(--color-brass-bright);
+  --primary-contrast: var(--color-brass-ink);
+  --primary-soft: var(--color-primary-soft);
+  --accent: var(--color-coral);
+  --accent-hover: var(--color-accent-hover);
+  --accent-soft: var(--color-coral-soft);
+  --user-bg: var(--color-paper-3);
+  --ai-bg: var(--color-paper-1);
+  --error: var(--color-danger);
+  --error-soft: var(--color-error-soft);
+  --success-soft: var(--color-success-soft);
+  --warning-soft: var(--color-warning-soft);
+  --border: var(--color-line-strong);
+  --border-soft: var(--color-line);
+  --radius: var(--radius-md);
+  --radius-xs: var(--space-2);
+  --shadow-1: 0 1px 0 var(--color-ink-highlight);
+  --shadow-2: var(--shadow);
+  --focus-ring: 0 0 0 3px var(--color-focus-soft);
+}

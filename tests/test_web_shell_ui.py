@@ -65,8 +65,10 @@ class WebShellUiTest(unittest.TestCase):
 
     def test_common_command_labels(self) -> None:
         js = self.js
-        for label in ("話す", "やること", "記録", "実績", "タスク追加"):
+        for label in ("話す", "やること", "記録", "実績", "タスク追加", "操作を検索"):
             self.assertIn(label, js)
+        self.assertIn("⌘K", js)
+        self.assertIn("shell-command-trigger", js)
 
     def test_page_specific_command_labels(self) -> None:
         js = self.js
@@ -96,6 +98,43 @@ class WebShellUiTest(unittest.TestCase):
     def test_dialog_hidden_initial(self) -> None:
         js = self.js
         self.assertIn("hidden", js)
+
+    def test_arrow_selection_keeps_searchbox_focus(self) -> None:
+        js = self.js
+        self.assertIn("function selectOption(state, nextIndex, keepInputFocus = false)", js)
+        self.assertIn("selectOption(state, currentVisible + 1, true)", js)
+        self.assertIn("selectOption(state, currentVisible - 1, true)", js)
+        self.assertIn("if (keepInputFocus) state.input.focus();", js)
+        self.assertNotIn("selected.button.focus()", js)
+
+    def test_tab_is_trapped_in_search_dialog(self) -> None:
+        js = self.js
+        self.assertIn("if (event.key === 'Tab')", js)
+        self.assertIn("event.preventDefault();", js)
+        self.assertIn("state.input.focus();", js)
+
+    def test_settings_modal_guard_helper_exists(self) -> None:
+        js = self.js
+        self.assertIn("function settingsModalOpen()", js)
+        self.assertIn("#settings-panel", js)
+        self.assertIn("aria-hidden", js)
+        self.assertIn("classList.contains('open')", js)
+
+    def test_settings_modal_guard_blocks_global_shortcuts(self) -> None:
+        js = self.js
+        # グローバル keydown の冒頭で設定モーダルを検知し early return する
+        self.assertIn("settingsModalOpen() && state.backdrop.hidden", js)
+        # 設定が閉じている通常時はショートカットが変わらない
+        self.assertIn("(event.ctrlKey || event.metaKey) && key === 'k'", js)
+        self.assertIn("event.altKey && ROUTES[event.key]", js)
+        self.assertIn("event.key === '/' && !isEditable(event.target)", js)
+
+    def test_settings_modal_guard_excludes_shell_palette(self) -> None:
+        js = self.js
+        # パレット自体は誤判定しない：settingsModalOpen は設定パネルだけを見る
+        self.assertRegex(js, r"document\.querySelector\('#settings-panel'\)")
+        # open 判定後に通常のハンドラへ進む
+        self.assertRegex(js, r"if \(settingsModalOpen\(\) && state\.backdrop\.hidden\)")
 
 
 if __name__ == "__main__":

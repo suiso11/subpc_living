@@ -20,6 +20,17 @@
     return target.matches('input, textarea, select, [contenteditable="true"]');
   };
 
+  // 設定ダイアログなど、シェル外のモーダルが開いているかを判定する。
+  // シェルのコマンドパレット自体は除外し、パレット操作中は邪魔しない。
+  function settingsModalOpen() {
+    const panel = document.querySelector('#settings-panel');
+    if (!panel) return false;
+    if (panel.getAttribute('aria-hidden') === 'false') return true;
+    if (panel.hasAttribute('open')) return true;
+    if (panel.classList && panel.classList.contains('open')) return true;
+    return false;
+  }
+
   const navigate = (path) => window.location.assign(path);
 
   function baseCommands() {
@@ -140,7 +151,7 @@
     return state.options.filter(({ button }) => !button.hidden);
   }
 
-  function selectOption(state, nextIndex, focus = false) {
+  function selectOption(state, nextIndex, keepInputFocus = false) {
     const visible = visibleOptions(state);
     state.options.forEach(({ button }) => button.setAttribute('aria-selected', 'false'));
     if (!visible.length) {
@@ -154,7 +165,7 @@
     selected.button.setAttribute('aria-selected', 'true');
     state.input.setAttribute('aria-activedescendant', selected.button.id);
     selected.button.scrollIntoView({ block: 'nearest' });
-    if (focus) selected.button.focus();
+    if (keepInputFocus) state.input.focus();
   }
 
   function filterOptions(state) {
@@ -165,7 +176,7 @@
     });
     const visible = visibleOptions(state);
     state.empty.hidden = visible.length > 0;
-    selectOption(state, 0, false);
+    selectOption(state, 0);
   }
 
   function openPalette(state) {
@@ -198,11 +209,12 @@
     if (!actions) return;
     const button = create('button', 'shell-command-trigger');
     button.type = 'button';
-    button.title = 'コマンドパレット（Ctrl+K）';
-    button.setAttribute('aria-label', 'コマンドパレットを開く');
-    const mark = create('span', '', '⌘');
-    mark.setAttribute('aria-hidden', 'true');
-    button.append(mark, create('kbd', '', 'K'));
+    button.title = '操作を検索（Ctrl+K）';
+    button.setAttribute('aria-label', '操作を検索してコマンドを開く');
+    const label = create('span', '', '操作を検索');
+    const shortcut = create('kbd', '', '⌘K');
+    shortcut.setAttribute('aria-label', 'Command または Control と K');
+    button.append(label, shortcut);
     button.addEventListener('click', open);
     actions.insertBefore(button, actions.firstChild);
   }
@@ -226,7 +238,7 @@
       item.button.addEventListener('click', () => runOption(state, item));
       item.button.addEventListener('pointerenter', () => {
         const visible = visibleOptions(state);
-        selectOption(state, visible.indexOf(item), false);
+        selectOption(state, visible.indexOf(item));
       });
     });
 
@@ -234,7 +246,10 @@
       const visible = visibleOptions(state);
       const current = state.options[state.selected];
       const currentVisible = Math.max(0, visible.indexOf(current));
-      if (event.key === 'ArrowDown') {
+      if (event.key === 'Tab') {
+        event.preventDefault();
+        state.input.focus();
+      } else if (event.key === 'ArrowDown') {
         event.preventDefault();
         selectOption(state, currentVisible + 1, true);
       } else if (event.key === 'ArrowUp') {
@@ -255,6 +270,11 @@
 
     document.addEventListener('keydown', (event) => {
       const key = event.key.toLocaleLowerCase();
+      // 設定ダイアログなどシェル外のモーダルが開いているときは、
+      // グローバルショートカットでフォーカスを奪ったりパレットを開かない。
+      if (settingsModalOpen() && state.backdrop.hidden) {
+        return;
+      }
       if ((event.ctrlKey || event.metaKey) && key === 'k') {
         event.preventDefault();
         state.backdrop.hidden ? openPalette(state) : closePalette(state);

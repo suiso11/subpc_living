@@ -1,4 +1,4 @@
-const CACHE_NAME = 'subpc-living-v22';
+const CACHE_NAME = 'subpc-living-v27';
 const STATIC_ASSETS = [
   '/',
   '/tasks',
@@ -8,9 +8,13 @@ const STATIC_ASSETS = [
   '/static/tasks.html',
   '/static/logs.html',
   '/static/achievements.html',
+  '/static/tokens.css',
   '/static/style.css',
-  '/static/pop-theme.css',
-  '/static/shell-theme.css',
+  '/static/hallmark-theme.css',
+  '/static/fonts/geist-latin.woff2',
+  '/static/fonts/instrument-serif-latin.woff2',
+  '/static/fonts/jetbrains-mono-latin.woff2',
+  '/static/fonts/LICENSES.txt',
   '/static/app.js',
   '/static/tasks.js',
   '/static/logs.js',

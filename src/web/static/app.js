@@ -29,6 +29,7 @@ const messageInput = $('#message-input');
 const sendBtn = $('#send-btn');
 const statusDot = $('#status-dot');
 const ttsToggle = $('#tts-toggle');
+const appShell = $('.app');
 const settingsPanel = $('#settings-panel');
 const voiceSelect = $('#voice-select');
 const micBtn = $('#mic-btn');
@@ -41,9 +42,81 @@ const gameToggle = $('#game-toggle');
 const gameDetails = $('#game-details');
 const GAME_PANEL_KEY = 'subpc_game_panel_open';
 let lastClaimableMissions = null;
+let settingsRestoreFocus = null;
+const runtimeStatus = { ollama: null, stt: null, tts: null, rag: null, websocket: 'connecting' };
 
 function formatCount(value) {
   return Number(value || 0).toLocaleString('ja-JP');
+}
+
+function statusWord(value) {
+  if (value === true) return 'ONLINE';
+  if (value === false) return 'OFFLINE';
+  return 'CHECKING';
+}
+
+function updateInstrumentStatus(next = {}) {
+  Object.assign(runtimeStatus, next);
+  const labels = {
+    'instrument-ollama': `LOCAL · OLLAMA · ${statusWord(runtimeStatus.ollama)}`,
+    'instrument-stt': `VOICE · STT · ${statusWord(runtimeStatus.stt)}`,
+    'instrument-tts': `VOICE · TTS · ${statusWord(runtimeStatus.tts)}`,
+    'instrument-rag': `MEMORY · RAG · ${statusWord(runtimeStatus.rag)}`,
+  };
+  Object.entries(labels).forEach(([id, text]) => {
+    const node = document.getElementById(id);
+    if (node) node.textContent = text;
+  });
+  const caption = document.getElementById('instrument-caption');
+  if (caption) {
+    caption.textContent = runtimeStatus.websocket === 'connected'
+      ? 'CONNECTED'
+      : runtimeStatus.websocket === 'disconnected' ? 'DISCONNECTED' : 'CONNECTING';
+  }
+  const wsStatus = document.getElementById('ws-status');
+  if (wsStatus) {
+    wsStatus.textContent = runtimeStatus.websocket === 'connected'
+      ? 'つながっています'
+      : runtimeStatus.websocket === 'disconnected' ? '接続がきれました' : 'つないでいます…';
+  }
+}
+
+function createWelcome(title, description) {
+  const welcome = document.createElement('div');
+  welcome.className = 'welcome';
+  const apparatus = document.createElement('div');
+  apparatus.className = 'signal-apparatus';
+  apparatus.setAttribute('role', 'group');
+  apparatus.setAttribute('aria-label', 'ローカル実行環境の接続情報');
+  const labelData = [
+    ['one', 'instrument-ollama'],
+    ['two', 'instrument-stt'],
+    ['three', 'instrument-tts'],
+    ['four', 'instrument-rag'],
+  ];
+  labelData.forEach(([className, id]) => {
+    const label = document.createElement('span');
+    label.className = `signal-label ${className}`;
+    label.id = id;
+    apparatus.appendChild(label);
+  });
+  const readout = document.createElement('span');
+  readout.className = 'signal-readout';
+  readout.setAttribute('aria-hidden', 'true');
+  const caption = document.createElement('span');
+  caption.className = 'signal-caption';
+  caption.id = 'instrument-caption';
+  apparatus.append(readout, caption);
+  const heading = document.createElement('h2');
+  heading.textContent = title;
+  const copy = document.createElement('p');
+  copy.textContent = description;
+  const link = document.createElement('a');
+  link.className = 'welcome-link';
+  link.href = '/tasks';
+  link.textContent = 'やることを見る →';
+  welcome.append(apparatus, heading, copy, link);
+  return welcome;
 }
 
 async function loadGrowth({ animate = false } = {}) {
@@ -237,21 +310,27 @@ function connect() {
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const wsUrl = `${protocol}//${location.host}/ws/chat`;
 
+  statusDot.className = 'status-dot';
+  updateInstrumentStatus({ websocket: 'connecting' });
+
   ws = new WebSocket(wsUrl);
 
   ws.onopen = () => {
     statusDot.className = 'status-dot connected';
+    updateInstrumentStatus({ websocket: 'connected' });
     console.log('[WS] Connected');
   };
 
   ws.onclose = () => {
     statusDot.className = 'status-dot error';
+    updateInstrumentStatus({ websocket: 'disconnected' });
     console.log('[WS] Disconnected, reconnecting in 3s...');
     setTimeout(connect, 3000);
   };
 
   ws.onerror = () => {
     statusDot.className = 'status-dot error';
+    updateInstrumentStatus({ websocket: 'disconnected' });
   };
 
   ws.onmessage = (event) => {
@@ -326,6 +405,9 @@ function sendMessage() {
   const text = messageInput.value.trim();
   if (!text || isStreaming || !ws || ws.readyState !== WebSocket.OPEN) return;
 
+  // 手動で上にスクロールしていても、新しい送信では必ず末尾へ追従する
+  forceScrollToBottom();
+
   // ユーザーメッセージ表示
   addMessage('user', text);
 
@@ -382,7 +464,37 @@ function createAssistantBubble() {
   msg.appendChild(bubble);
   chatArea.appendChild(msg);
   currentBubble = bubble;
-  scrollToBottom();
+  // 新しい応答バブルの冒頭は末尾へ追従させる
+  forceScrollToBottom();
+}
+
+// --- スクロール追従 ---
+// 末尾付近にいれば自動追従し、ユーザーが上にスクロールした時は位置を保持する。
+const NEAR_BOTTOM_THRESHOLD = 80;
+let autoFollow = true;
+
+function isNearBottom() {
+  return chatArea.scrollHeight - chatArea.scrollTop - chatArea.clientHeight
+    <= NEAR_BOTTOM_THRESHOLD;
+}
+
+function trackChatScroll() {
+  autoFollow = isNearBottom();
+}
+
+function scrollToBottom() {
+  if (!autoFollow) return;
+  requestAnimationFrame(() => {
+    if (!autoFollow) return;
+    chatArea.scrollTop = chatArea.scrollHeight;
+  });
+}
+
+function forceScrollToBottom() {
+  autoFollow = true;
+  requestAnimationFrame(() => {
+    chatArea.scrollTop = chatArea.scrollHeight;
+  });
 }
 
 function appendToken(token) {
@@ -395,6 +507,7 @@ function appendToken(token) {
   } else {
     currentBubble.appendChild(document.createTextNode(token));
   }
+  // 末尾付近なら追従、ユーザーが上にスクロール中なら位置を保持
   scrollToBottom();
 }
 
@@ -439,12 +552,6 @@ function showError(message) {
 function removeWelcome() {
   const welcome = $('.welcome');
   if (welcome) welcome.remove();
-}
-
-function scrollToBottom() {
-  requestAnimationFrame(() => {
-    chatArea.scrollTop = chatArea.scrollHeight;
-  });
 }
 
 function updateUI() {
@@ -782,12 +889,59 @@ function arrayBufferToBase64(buffer) {
 //  設定パネル
 // ============================================
 
+// 設定シートが開いている間は root / 背景 のスクロールを停止し、
+// シート内にスクロールを閉じ込める。shell-command-open と併存する。
+function setSettingsScrollLock(open) {
+  document.documentElement.classList.toggle('settings-open', open);
+  document.body.classList.toggle('settings-open', open);
+}
+
 function openSettings() {
+  settingsRestoreFocus = document.activeElement instanceof HTMLElement && document.activeElement !== document.body
+    ? document.activeElement : $('#settings-btn');
+  if (appShell) appShell.inert = true;
   settingsPanel.classList.add('open');
+  settingsPanel.setAttribute('aria-hidden', 'false');
+  setSettingsScrollLock(true);
+  requestAnimationFrame(() => {
+    if (!settingsPanel.classList.contains('open')) return;
+    const firstControl = settingsPanel.querySelector('select, input, textarea, button');
+    firstControl?.focus();
+  });
 }
 
 function closeSettings() {
   settingsPanel.classList.remove('open');
+  settingsPanel.setAttribute('aria-hidden', 'true');
+  setSettingsScrollLock(false);
+  if (appShell) appShell.inert = false;
+  const restoreTarget = settingsRestoreFocus;
+  settingsRestoreFocus = null;
+  if (restoreTarget?.isConnected) restoreTarget.focus();
+}
+
+function handleSettingsKeydown(event) {
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    closeSettings();
+    return;
+  }
+  if (event.key !== 'Tab') return;
+  const focusable = [...settingsPanel.querySelectorAll('button, select, input, textarea, a[href]')]
+    .filter((node) => !node.disabled && node.getClientRects().length > 0);
+  if (!focusable.length) {
+    event.preventDefault();
+    return;
+  }
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
 }
 
 async function changeVoice() {
@@ -812,14 +966,8 @@ function newSession() {
   sessionId = `web_${Date.now()}`;
   saveSessionId();
   currentBubble = null;
-  chatArea.innerHTML = `
-    <div class="welcome">
-      <div class="welcome-orb">✦</div>
-      <h2>新しい話をしよう！</h2>
-      <p>ここからは別の話題です。</p>
-      <a class="welcome-link" href="/tasks">やることを見る →</a>
-    </div>
-  `;
+  chatArea.replaceChildren(createWelcome('新しい話をしよう！', 'ここからは別の話題です。'));
+  updateInstrumentStatus();
 }
 
 // ============================================
@@ -836,6 +984,12 @@ async function init() {
 
     // STTサーバーと、ブラウザ側のHTTPS/録音APIを別々に確認する
     configureMicAvailability(status);
+    updateInstrumentStatus({
+      ollama: status.ollama,
+      stt: status.stt,
+      tts: status.tts,
+      rag: status.rag,
+    });
 
     if (status.tts_voices && voiceSelect) {
       voiceSelect.innerHTML = '';
@@ -893,6 +1047,9 @@ async function init() {
   sendBtn.addEventListener('click', sendMessage);
   micBtn.addEventListener('click', toggleRecording);
 
+  // 手動スクロール位置の受動追跡（末尾付近かどうかで自動追従を切り替える）
+  chatArea.addEventListener('scroll', trackChatScroll, { passive: true });
+
   messageInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
@@ -916,6 +1073,7 @@ async function init() {
   setGameOpen(savedGamePanel === 'open');
   voiceSelect.addEventListener('change', changeVoice);
 
+  settingsPanel.addEventListener('keydown', handleSettingsKeydown);
   settingsPanel.addEventListener('click', (e) => {
     if (e.target === settingsPanel) closeSettings();
   });
