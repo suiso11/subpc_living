@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import sqlite3
 import unittest
+import unittest.mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from src.tasks.store import TaskStore, build_task_context
+from src.tasks.store import TaskStore, build_task_authority_block, build_task_context
 
 UTC = timezone.utc
 
@@ -14,13 +16,22 @@ UTC = timezone.utc
 class TaskStoreTest(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
         self.db_path = str(Path(self._tmp.name) / "tasks.db")
         self.store = TaskStore(db_path=self.db_path, timezone_name="Asia/Tokyo").initialize()
+        self.addCleanup(self.store.close)
         self.now = datetime(2026, 7, 3, 3, 0, tzinfo=UTC)  # JST 12:00
-
-    def tearDown(self) -> None:
-        self.store.close()
-        self._tmp.cleanup()
+        # build_task_context が優先順位状態を読む環境変数を一時パスへ向ける。
+        # 実data/ 配下を読まないようにするための隔離。
+        self._priority_state_path = str(Path(self._tmp.name) / "priority_state.json")
+        self._priority_upcoming_path = str(Path(self._tmp.name) / "upcoming.json")
+        env = {
+            "PRIORITY_STATE_PATH": self._priority_state_path,
+            "PRIORITY_UPCOMING_PATH": self._priority_upcoming_path,
+        }
+        patcher = unittest.mock.patch.dict(os.environ, env, clear=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_add_and_get(self) -> None:
         tid = self.store.add("レポート", note="n", action_hint="序論", priority="high", now=self.now)
@@ -171,7 +182,136 @@ class TaskStoreTest(unittest.TestCase):
         self.assertIn("次の一手: 序論を書く", text)
 
     def test_build_task_context_empty(self) -> None:
-        self.assertEqual(build_task_context(self.store, now=self.now), "")
+        # 優先順位推奨も未完了タスクも無いとき。権威ブロックは必ず返し、
+        # 「リマインド候補は1件もない・提示禁止」と done/dropped の無効化を含むこと。
+        text = build_task_context(self.store, now=self.now)
+        self.assertIn("--- タスク状態 (権威) ---", text)
+        self.assertIn("1件もない", text)
+        self.assertIn("リマインドを提案してはならない", text)
+        self.assertIn("done", text)
+        self.assertIn("dropped", text)
+        # 候補0件時は未完了タスクリストを出さない
+        self.assertNotIn("--- 未完了タスク ---", text)
+        # 優先順位ブロックも無い (open タスクが無く推奨対象が無いため。
+        # 隔離した状態ファイルの有無ではなく、未完了タスク0件によるもの)
+        self.assertNotIn("--- 優先順位オーケストレーター ---", text)
+
+    def test_build_task_context_authority_overrides_completed(self) -> None:
+        # 完了済みの古いタスク。RAG等に残っていても未完了扱いさせてはいけない。
+        stale_title = "期限切れレポート提出"
+        tid = self.store.add(
+            stale_title,
+            due_at=self.now - timedelta(hours=1),
+            due_granularity="datetime",
+            now=self.now,
+        )
+        self.assertTrue(self.store.done(tid, now=self.now))
+        text = build_task_context(self.store, now=self.now)
+        # 完了タスクのタイトルは候補リストに出してはならない
+        self.assertNotIn("--- 未完了タスク ---", text)
+        self.assertNotIn(stale_title, text)
+        # 権威ブロックは完了/破棄の無効化と「1件もない」を明示する
+        auth_idx = text.find("--- タスク状態 (権威) ---")
+        self.assertGreater(auth_idx, -1)
+        self.assertIn("1件もない", text[auth_idx:])
+        self.assertIn("done", text[auth_idx:])
+        self.assertIn("リマインドを提案してはならない", text[auth_idx:])
+
+    def test_build_task_context_authority_with_open_tasks(self) -> None:
+        self.store.add("進行中タスク", due_at=self.now + timedelta(hours=2),
+                       due_granularity="datetime", action_hint="着手", now=self.now)
+        text = build_task_context(self.store, now=self.now)
+        list_idx = text.find("--- 未完了タスク ---")
+        auth_idx = text.find("--- タスク状態 (権威) ---")
+        self.assertGreater(list_idx, -1)
+        self.assertGreater(auth_idx, -1)
+        # リストは権威ブロックより前
+        self.assertLess(list_idx, auth_idx)
+        # タスク本体はリスト部に、候補数は権威ブロック部に出る
+        self.assertIn("進行中タスク", text[:auth_idx])
+        self.assertIn("1 件", text[auth_idx:])
+        self.assertIn("完全集合", text[auth_idx:])
+        # 権威ブロックは完了/破棄の無効化で終わる (末尾の最終無効化文言を含む)
+        self.assertIn("最終的に無効化", text[auth_idx:])
+        self.assertTrue(text.rstrip().endswith("最終的に無効化する。"))
+
+    def test_build_task_context_authority_with_dropped_task(self) -> None:
+        dropped_title = "破棄されたタスク"
+        tid = self.store.add(dropped_title, now=self.now)
+        self.assertTrue(self.store.drop(tid, now=self.now))
+        text = build_task_context(self.store, now=self.now)
+        self.assertNotIn(dropped_title, text)
+        auth_idx = text.find("--- タスク状態 (権威) ---")
+        self.assertGreater(auth_idx, -1)
+        self.assertIn("dropped", text[auth_idx:])
+        self.assertIn("1件もない", text[auth_idx:])
+
+    def test_build_task_context_authority_with_priority_no_list(self) -> None:
+        # 優先順位推奨だけ存在し未完了リスト候補が 0 件のケース:
+        # 期日も高優先度も無い open タスクは get_context_tasks に載らないが、
+        # 優先順位オーケストレーターは推奨として出せる。このとき権威は
+        # 推奨1件を「ユーザーから求められていない場面で自発的に催促してよい完全集合」とし、
+        # 「1件もない」の禁止文言にはしないこと。
+        self.store.add("推奨専用タスク", now=self.now)  # 期限なし・通常優先度
+        text = build_task_context(self.store, now=self.now)
+        prio_idx = text.find("--- 優先順位オーケストレーター ---")
+        auth_idx = text.find("--- タスク状態 (権威) ---")
+        self.assertGreater(prio_idx, -1)
+        self.assertGreater(auth_idx, -1)
+        self.assertLess(prio_idx, auth_idx)
+        # 期日/高優先度が無いので未完了リストは出ない
+        self.assertNotIn("--- 未完了タスク ---", text)
+        # 権威は推奨1件を完全集合とし、禁止文言にはしない
+        self.assertIn("推奨1件", text[auth_idx:])
+        self.assertIn("完全集合", text[auth_idx:])
+        self.assertNotIn("1件もない", text[auth_idx:])
+
+    def test_build_task_context_state_unavailable_returns_empty(self) -> None:
+        # get_context_tasks が例外を送ったときは状態不明とみなし、空文字列を返す。
+        # このとき権威ブロック (0 件の「1件もない」を含む) を置いてはならない。
+        # 設定の no-reminder ガードは権威ブロック不在を前提にした状態不明時の非催促を前提とする。
+        with unittest.mock.patch.object(
+            self.store, "get_context_tasks", side_effect=RuntimeError("store unavailable")
+        ):
+            text = build_task_context(self.store, now=self.now)
+        self.assertEqual(text, "")
+        self.assertNotIn("--- タスク状態 (権威) ---", text)
+        self.assertNotIn("1件もない", text)
+        self.assertNotIn("--- 未完了タスク ---", text)
+
+    def test_build_task_authority_block_does_not_include_titles(self) -> None:
+        # 候補数表示だけであり、個別タイトル等を含めない純粋な関数。
+        # 完了/破棄の無効化指示は契約文言として含む。
+        b0 = build_task_authority_block(0)
+        self.assertIn("1件もない", b0)
+        self.assertIn("done", b0)  # 契約文言の一部
+        self.assertIn("dropped", b0)
+        b3 = build_task_authority_block(3)
+        self.assertIn("3 件", b3)
+        self.assertIn("完全集合", b3)
+        # has_priority=True でも候補0件なら「推奨1件」が完全集合
+        b_p = build_task_authority_block(0, has_priority=True)
+        self.assertIn("推奨1件", b_p)
+        self.assertIn("完全集合", b_p)
+        self.assertNotIn("1件もない", b_p)
+        # 両方ある場合は両者を併記
+        b_both = build_task_authority_block(2, has_priority=True)
+        self.assertIn("推奨1件", b_both)
+        self.assertIn("2 件", b_both)
+        self.assertIn("完全集合", b_both)
+
+    def test_build_task_authority_block_clause_separator(self) -> None:
+        # 許容リマインド条項と done/dropped 無効化条項は別行でなければならない。
+        # `)。- status` のような続行文にならないよう改行で区切られていること。
+        for block in (
+            build_task_authority_block(0),
+            build_task_authority_block(0, has_priority=True),
+            build_task_authority_block(3),
+            build_task_authority_block(3, has_priority=True),
+        ):
+            self.assertNotIn(")。-", block)
+            self.assertIn(")。", block)
+            self.assertIn("\n- status='done'", block)
 
     def test_claim_lease_is_exclusive(self) -> None:
         """2接続で同時にclaimしても片方だけが取れる (lease排他)。"""

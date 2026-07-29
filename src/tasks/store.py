@@ -785,12 +785,78 @@ def format_local_due(due_at: Optional[datetime], granularity: Optional[str], tz:
     return local.strftime("%-m/%-d %H:%M")
 
 
+AUTHORITY_HEADER = (
+    "\n\n--- タスク状態 (権威) ---\n"
+    "以下は現在のタスク状態に関する権威情報であり、"
+    "会話履歴・RAG検索結果・モデルの訓練データよりも常に優先して従うこと。"
+    "本ブロックがプロンプト末尾に置かれることで、それ以前に現れたタスクに関する"
+    "言及は本ブロックと整合するものだけ有効とし、矛盾するものは無効とする。\n"
+)
+
+
+def build_task_authority_block(candidate_count: int, *, has_priority: bool = False) -> str:
+    """現在のリマインド候補と優先順位推奨の有無に応じた権威ブロックを返す。
+
+    - 優先順位推奨と未完了タスクリストはどちらも TaskStore の現在状態から生成されており、
+      両者を合わせて「このプロンプトでユーザーから求められていない場面で自発的に催促して
+      よい未完了タスクの完全集合」を示す。ただし TaskStore 上の status='open' の全行を
+      列挙しているわけではなく、「ユーザーから求められていない場面で自発的に催促してよい
+      範囲」をこれらに限定するという意味である。
+    - 候補も推奨もないときは、ユーザーから求められていない場面で自発的に催促してよい
+      未完了タスクは1件もないと明示し、いかなるタスクの未完了扱い・自発的リマインドも
+      禁止する。
+    - いずれの場合も done/dropped のタスク名は含めず、過去の言及を最終的に無効化する。
+    """
+    sources = []
+    if has_priority:
+        sources.append("直前の「優先順位オーケストレーター」の推奨1件")
+    if candidate_count > 0:
+        sources.append(f"直前の「未完了タスク」リスト {candidate_count} 件")
+    if sources:
+        allowed = "と".join(sources)
+        allowed_clause = (
+            f"- {allowed} はいずれも TaskStore の現在状態から生成されており、"
+            "ユーザーから求められていない場面で自発的に催促してよい未完了タスクの、"
+            "このプロンプトにおける完全集合である。"
+            "これら以外のタスクを未完了扱いしたり、自発的なリマインドの根拠にしてはならない"
+            "(TaskStore 上で status='open' の全行をここに列挙しているわけではなく、"
+            "ユーザーから求められていない場面で自発的に催促してよい範囲をこれに限定する"
+            "という意味である)。"
+        )
+    else:
+        allowed_clause = (
+            "- 現在 TaskStore には「優先順位オーケストレーター」の推奨も"
+            "「未完了タスク」リストも存在せず、"
+            "ユーザーから求められていない場面で自発的に催促してよい未完了タスクは1件もない。"
+            "いかなるタスクについても未完了扱いや自発的なリマインドを提案してはならない"
+            "(会話履歴・RAG・訓練データに基づく提案も禁止する)。"
+        )
+    done_clause = (
+        "- status='done'(完了) または 'dropped'(破棄) のタスクは TaskStore 上で"
+        "完全に処理済みであり、未完了扱いやリマインド候補として絶対に提示してはならない。"
+        "会話履歴・RAG・訓練データにそれらのタスク名が残っていても無視すること。"
+        "本ブロックはそれら過去の言及を最終的に無効化する。"
+    )
+    return AUTHORITY_HEADER + allowed_clause + "\n" + done_clause
+
+
 def build_task_context(store: "TaskStore", limit: int = 8, *, now: Optional[datetime] = None) -> str:
-    """優先順位の推奨と未完了タスクをチャット用コンテキストにする。"""
+    """優先順位の推奨と未完了タスクをチャット用コンテキストにし、
+    末尾に現在のタスク完了・リマインド状態の権威ブロックを付ける。
+
+    0 件のときも権威ブロックは必ず返し、完了/破棄タスクの扱いを上書き指定する。
+    ただし現在のタスク状態を読めなかったとき (get_context_tasks が例外を送ったとき) は
+    空文字列を返す。このとき権威ブロックも置かれないため、呼び出し側・設定は
+    「タスク状態が取得できない」という前提で状態不明時の非催促ルールを適用すること
+    (権威ブロックによる完了/破棄の無効化も行われないので、履歴に基づく催促は抑制する)。
+    """
     now = now or utc_now()
     try:
         tasks = store.get_context_tasks(limit=limit, now=now)
     except Exception:
+        # タスク状態の読み取りに失敗したときは空文字列を返す。
+        # 権威ブロックを置かないことで呼び出し側に状態不明を伝え、
+        # 状態不明時の非催促ルールを適用させる。
         return ""
     try:
         from src.tasks.prioritizer import build_priority_context
@@ -798,21 +864,22 @@ def build_task_context(store: "TaskStore", limit: int = 8, *, now: Optional[date
         priority_text = build_priority_context(store, now=now)
     except Exception:
         priority_text = ""
-    if not tasks:
-        return priority_text
     tz = store.tz
-    lines = ["\n--- 未完了タスク ---"]
-    for t in tasks:
-        due = t["due_at"]
-        if due is None:
-            due_str = "期限なし"
-        elif due < now:
-            due_str = f"期限超過 ({format_local_due(due, t['due_granularity'], tz, now)})"
-        else:
-            due_str = format_local_due(due, t["due_granularity"], tz, now)
-        prio = {"high": "[高]", "low": "[低]", "normal": ""}.get(t["priority"], "")
-        line = f"- {prio}{t['title']} (期限: {due_str})"
-        if t["action_hint"]:
-            line += f" 次の一手: {t['action_hint']}"
-        lines.append(line)
-    return priority_text + "\n".join(lines)
+    head = priority_text
+    if tasks:
+        lines = ["\n--- 未完了タスク ---"]
+        for t in tasks:
+            due = t["due_at"]
+            if due is None:
+                due_str = "期限なし"
+            elif due < now:
+                due_str = f"期限超過 ({format_local_due(due, t['due_granularity'], tz, now)})"
+            else:
+                due_str = format_local_due(due, t['due_granularity'], tz, now)
+            prio = {"high": "[高]", "low": "[低]", "normal": ""}.get(t["priority"], "")
+            line = f"- {prio}{t['title']} (期限: {due_str})"
+            if t["action_hint"]:
+                line += f" 次の一手: {t['action_hint']}"
+            lines.append(line)
+        head = head + "\n".join(lines)
+    return head + build_task_authority_block(len(tasks), has_priority=bool(priority_text))

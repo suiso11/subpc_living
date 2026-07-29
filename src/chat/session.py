@@ -67,15 +67,22 @@ class ChatSession:
         self._messages.append({"role": "user", "content": content})
         self._trim_history()
 
-    def add_assistant_message(self, content: str) -> None:
-        """アシスタントの応答を追加（RAG有効時はベクトルDBにも保存）"""
+    def add_assistant_message(self, content: str, *, store_memory: bool = True) -> None:
+        """アシスタントの応答を追加（RAG有効時はベクトルDBにも保存）
+
+        store_memory=False のときは RAG への長期記憶保存をスキップする。
+        セッション履歴の追加・トリムは常に行い、成長台帳には
+        memory_saved=False で記録する。テキスト内容に基づく分類は行わない。
+        save() は呼び出さないためファイル保存が必要なら別途呼ぶこと。
+        """
         self._messages.append({"role": "assistant", "content": content})
         self._trim_history()
 
         # RAG: 直前のuser+assistantをベクトルDBに保存
+        # store_memory=False のときは保存せず、memory_id を None のままにする。
         memory_id = None
         user_msg = None
-        if self.rag is not None and len(self._messages) >= 2:
+        if store_memory and self.rag is not None and len(self._messages) >= 2:
             user_msg = self._messages[-2]
             if user_msg.get("role") == "user":
                 memory_id = self.rag.store_turn(
@@ -85,6 +92,8 @@ class ChatSession:
                 )
 
         # 成長台帳: 本文は保存せず、成功した会話例とRAG保存成否だけを記録する。
+        # store_memory=False のときは memory_id が None のままなので
+        # memory_saved=False として記録される。
         if self.growth_tracker is not None and len(self._messages) >= 2:
             user_msg = user_msg or self._messages[-2]
             if user_msg.get("role") == "user":
@@ -168,7 +177,16 @@ class ChatSession:
             except Exception:
                 pass
 
-        # Tasks: 未完了タスクを注入 (0件なら注入しない)
+        # 感情タグの指示 (有効時のみ)。タスク状態の権威ブロックよりも前に置くことで、
+        # タスク状態がシステムプロンプトの最終権威となる。
+        if self.emotion_tags:
+            from src.chat.emotion import EMOTION_TAG_INSTRUCTION
+            separator = "\n\n" if system_content else ""
+            system_content = system_content + separator + EMOTION_TAG_INSTRUCTION
+
+        # Tasks: 未完了タスク + 現在状態の権威ブロックを末尾に置く (0件でも必ず注入)。
+        # 会話履歴・RAG・訓練データを上書きする最終権威なので、他の動的コンテキスト・
+        # 感情タグ指示の後に配置する。
         if self.task_store is not None:
             try:
                 from src.tasks.store import build_task_context
@@ -177,12 +195,6 @@ class ChatSession:
                     system_content = system_content + task_text
             except Exception:
                 pass
-
-        # 感情タグの指示 (有効時のみ、system content 末尾へ一元的に追加)
-        if self.emotion_tags:
-            from src.chat.emotion import EMOTION_TAG_INSTRUCTION
-            separator = "\n\n" if system_content else ""
-            system_content = system_content + separator + EMOTION_TAG_INSTRUCTION
 
         if system_content:
             messages.append({"role": "system", "content": system_content})

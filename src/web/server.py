@@ -1865,11 +1865,16 @@ async def _send_direct_chat_reply(
     user_text: str,
     reply: str,
     want_tts: bool,
+    store_memory: bool = True,
 ) -> None:
-    """LLMを介さないタスク/予定操作も、通常の会話と同じ形で保存・配信する。"""
+    """LLMを介さないタスク/予定操作も、通常の会話と同じ形で保存・配信する。
+
+    store_memory=False のときは RAG 長期記憶への保存をスキップする
+    (セッション履歴・save() は常に行う)。既定は通常ターンと同じく保存する。
+    """
     session = get_or_create_session(session_id)
     session.add_user_message(user_text)
-    session.add_assistant_message(reply)
+    session.add_assistant_message(reply, store_memory=store_memory)
     try:
         session.save()
     except Exception:
@@ -2131,12 +2136,15 @@ async def websocket_chat(websocket: WebSocket):
                 if idle_manager is not None and inference_started:
                     idle_manager.notify_inference_end()
                     inference_started = False
+                # タスク状態の返答はRAG長期記憶に残さない
+                # (履歴・save() は通常通り行う)。
                 await _send_direct_chat_reply(
                     websocket,
                     session_id=session_id,
                     user_text=user_text,
                     reply=task_reply,
                     want_tts=want_tts,
+                    store_memory=False,
                 )
                 continue
 
