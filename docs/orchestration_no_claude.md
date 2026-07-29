@@ -1,16 +1,22 @@
 # Pi Subagent Orchestration
 
-Claude/Anthropic系に依存せず、Piを親ランタイム、`pi-subagents`を子プロセス管理に使う。
-旧構成の「Pi親 → 独自拡張 → OpenCode worker」は廃止し、探索・実装・テスト・レビューを
-Piのnamed agentへ直接委譲する。
+Claude/Anthropic系に依存せず、Piを親ランタイムにする。
+`pi-subagents`のnamed agentは探索・テスト・レビューの読み取り専用経路とし、実装は
+OpenCode workerのGLM 5.2を既定バックエンド、Kimi K3を読み取り専用の別視点レビューへ使う。
+実装は `opencode_change` を既定とし、各変更はKimi K3の読み取り専用自動レビューを経てから
+最終承認をGPT-5.6 Solが行う。
 
 ## Components
 
 - Pi: `@earendil-works/pi-coding-agent` 0.79以上
 - Subagent runtime: `git:github.com/edxeth/pi-subagents`
-- Parent model: 既定 `openai-codex/gpt-5.5`
+- Parent model: 既定 `openai-codex/gpt-5.6-sol`
 - Project agents: `.pi/agents/subpc-*.md`
-- Launcher: `scripts/pi_codex_orchestrator.sh`
+- Pi-only launcher: `scripts/pi_codex_orchestrator.sh`
+- Combined Pi/OpenCode launcher: `pi-orch`
+- OpenCode default: `opencode-go/glm-5.2` (実装の既定バックエンド)
+- OpenCode independent review: `opencode-go/kimi-k3` (読み取り専用)
+- Implementation default tool: `opencode_change` (GLM生成 → Kimi K3読み取り専用自動レビュー → Sol最終承認)
 
 プロジェクトローカルのパッケージ設定は `.pi/settings.json` に保存する。キャッシュ本体は
 `.pi/git/` のignore対象で、リポジトリには設定とキャッシュ用 `.gitignore` だけを残す。
@@ -54,7 +60,7 @@ coordinator-only turn stopを自動解除する。
 親モデルとthinkingは上書きできる。
 
 ```bash
-PI_CODEX_MODEL=openai-codex/gpt-5.5 \
+PI_CODEX_MODEL=openai-codex/gpt-5.6-sol \
 PI_CODEX_THINKING=high \
 scripts/pi_codex_orchestrator.sh
 ```
@@ -67,25 +73,19 @@ scripts/pi_codex_orchestrator.sh
 
 - 読み取り専用
 - 関連ファイル、呼び出し経路、依存関係、既存パターンの探索
-- `openai-codex/gpt-5.4-mini`
-
-### `subpc-implementer`
-
-- read/bash/edit/writeを使用可能
-- 委譲タスクで明示した非重複パスだけを変更
-- `openai-codex/gpt-5.5`
+- `openai-codex/gpt-5.6-terra`
 
 ### `subpc-tester`
 
 - ソース編集ツールなし
 - 関連テスト、全体テスト、失敗診断
-- `openai-codex/gpt-5.4-mini`
+- `openai-codex/gpt-5.6-terra`
 
 ### `subpc-reviewer`
 
 - ソース編集ツールなし
 - 要件と現在の差分を独立レビュー
-- `openai-codex/gpt-5.5`
+- `openai-codex/gpt-5.6-sol`
 
 全子agentに以下を共通設定する。
 
@@ -96,11 +96,24 @@ scripts/pi_codex_orchestrator.sh
 - `extensions: none`
 - `skills: none`
 - `spawning: false`
+- `no-context-files: true`
 - `trust-project: false`
 - `parent-close-policy: terminate`
 
 子はプロジェクト拡張をロードせず、再帰的なsubagent起動もできない。agent本文の指示に従い、
 作業開始時に `AGENTS.md` をread toolで明示的に読む。
+
+## OpenCode role split
+
+- default / `glm`: `opencode-go/glm-5.2`。実装の既定バックエンド。探索、機械作業、実装、テスト追加
+- `kimi_k3`: `opencode-go/kimi-k3`。読み取り専用の広域・独立レビュー
+- 実装は `opencode_change` を既定ツールとする。GLMが変更候補を生成し、完了後にKimi K3が
+  読み取り専用で自動レビューを実施する。PiはKimiの指摘を確認のうえ、最終承認をGPT-5.6 Solへ渡す
+- Kimiは変更を書けず、本番データ・秘密情報・サービス操作にも触らない
+- Kimi/GLMの結論は最終承認にせず、`subpc-reviewer`または親のGPT-5.6 Solが最終判断する
+- OpenCode出力は最終承認に使わず、`subpc-reviewer`または親のGPT-5.6 Solで確認する
+
+統合構成はリポジトリルートで `pi-orch` を実行する。
 
 ## Delegation contract
 
@@ -113,6 +126,17 @@ scripts/pi_codex_orchestrator.sh
 5. 関連ファイルと、writeの場合は変更可能パス
 6. 制約と変更禁止範囲
 7. 期待する出力と検証条件
+
+### 実装タスクの分解
+
+- 実装は1タスク1関心事に分割する
+- 1つのwriteタスクが扱う変更可能パスは最大5件まで。globで広く渡さず具体パスを列挙する
+- 複数モジュールにまたがる作業や「調査 + 実装 + テスト」を含む作業は2〜4個の非重複
+  `opencode_change` タスクに分解し、GLM workerへ渡す。named agentはscout/tester/reviewerの
+  読み取り・検証・診断だけに使い、実装はnamed agentでは行わない
+- 並列writeタスクは変更可能パスが重ならないよう分割し、重なる場合は直列化する
+- 指示範囲外のファイルは変更せず、必要になったら停止して追加スコープを報告させる
+- 実装の既定はOpenCode GLM経由の `opencode_change` とし、各変更はKimi K3読み取り専用自動レビューを経てからSol最終承認へ進む
 
 例:
 

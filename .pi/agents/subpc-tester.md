@@ -2,7 +2,7 @@
 name: subpc-tester
 description: Independent verifier that runs focused tests and diagnoses failures without editing source.
 enabled: true
-model: openai-codex/gpt-5.4-mini
+model: openai-codex/gpt-5.6-terra
 thinking: high
 allow-model-override: false
 mode: background

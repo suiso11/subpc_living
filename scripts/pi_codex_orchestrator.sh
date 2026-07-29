@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-model="${PI_CODEX_MODEL:-openai-codex/gpt-5.5}"
+model="${PI_CODEX_MODEL:-openai-codex/gpt-5.6-sol}"
 thinking="${PI_CODEX_THINKING:-high}"
 coordinator_only_turn="${PI_SUBAGENT_DISABLE_COORDINATOR_ONLY_TURN:-}"
 

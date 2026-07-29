@@ -2,7 +2,7 @@
 name: subpc-reviewer
 description: Independent read-only review of requirements and the current diff for concrete defects.
 enabled: true
-model: openai-codex/gpt-5.5
+model: openai-codex/gpt-5.6-sol
 thinking: high
 allow-model-override: false
 mode: background
