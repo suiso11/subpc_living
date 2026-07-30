@@ -32,6 +32,12 @@ const metricOverdue = $('#metric-overdue');
 const metricToday = $('#metric-today');
 const metricHigh = $('#metric-high');
 const listShell = $('#task-list-shell');
+const taskInbox = $('#task-inbox');
+const taskInboxList = $('#task-inbox-list');
+const taskInboxCount = $('#task-inbox-count');
+const taskInboxStatus = $('#task-inbox-status');
+const taskInboxStatusText = $('#task-inbox-status-text');
+const taskInboxRetry = $('#task-inbox-retry');
 const calShell = $('#task-calendar-shell');
 const calTitle = $('#cal-title');
 const calMonthCount = $('#cal-month-count');
@@ -178,6 +184,209 @@ function priorityLabel(priority) {
   if (priority === 'high') return 'だいじ';
   if (priority === 'low') return 'あとで';
   return 'ふつう';
+}
+
+// --- やること候補 受信箱 ---
+// チャットで見つけた候補を GET /api/tasks/candidates から読み込み、
+// 追加 (accept) / 無視 (dismiss) できる。空なら非表示。
+
+let inboxCandidates = [];
+let inboxLoading = false;
+let inboxState = 'idle'; // 'idle' | 'loading' | 'loaded' | 'error'
+
+function formatCandidateDue(candidate) {
+  if (!candidate) return '';
+  if (candidate.due_display) return String(candidate.due_display);
+  if (!candidate.due_at) return '';
+  const due = new Date(candidate.due_at);
+  if (Number.isNaN(due.getTime())) return '';
+  const m = due.getMonth() + 1;
+  const d = due.getDate();
+  if (candidate.due_granularity === 'date') return `${m}/${d}`;
+  const hh = String(due.getHours()).padStart(2, '0');
+  const mm = String(due.getMinutes()).padStart(2, '0');
+  return `${m}/${d} ${hh}:${mm}`;
+}
+
+function renderInbox() {
+  if (!taskInbox || !taskInboxList || !taskInboxCount) return;
+  const count = inboxCandidates.length;
+  taskInboxCount.textContent = `${count}件`;
+  if (!count) {
+    taskInboxList.replaceChildren();
+  } else {
+    taskInboxList.replaceChildren(...inboxCandidates.map((candidate) => {
+    const row = document.createElement('article');
+    row.className = 'task-inbox-row';
+    row.dataset.candidateId = String(candidate.id ?? '');
+
+    const content = document.createElement('div');
+    content.className = 'task-inbox-row-content';
+    const title = document.createElement('strong');
+    title.className = 'task-inbox-row-title';
+    title.textContent = String(candidate.title || '');
+    content.appendChild(title);
+
+    const meta = document.createElement('div');
+    meta.className = 'task-inbox-row-meta';
+    const dueText = formatCandidateDue(candidate);
+    if (dueText) {
+      const dueSpan = document.createElement('span');
+      dueSpan.className = 'due-text';
+      dueSpan.textContent = dueText;
+      meta.appendChild(dueSpan);
+    }
+    const priority = candidate.priority || 'normal';
+    const badge = document.createElement('span');
+    badge.className = `priority-badge ${priority}`;
+    badge.textContent = priorityLabel(priority);
+    meta.appendChild(badge);
+    if (candidate.note) {
+      const note = document.createElement('span');
+      note.className = 'task-inbox-row-note';
+      note.textContent = String(candidate.note);
+      meta.appendChild(note);
+    }
+    content.appendChild(meta);
+    row.appendChild(content);
+
+    const actions = document.createElement('div');
+    actions.className = 'task-inbox-actions';
+    const addBtn = document.createElement('button');
+    addBtn.type = 'button';
+    addBtn.className = 'primary-btn task-inbox-add';
+    addBtn.textContent = '追加';
+    const dismissBtn = document.createElement('button');
+    dismissBtn.type = 'button';
+    dismissBtn.className = 'secondary-btn task-inbox-dismiss';
+    dismissBtn.textContent = '見送る';
+    const feedback = document.createElement('span');
+    feedback.className = 'candidate-feedback';
+    feedback.setAttribute('role', 'status');
+    feedback.setAttribute('aria-live', 'polite');
+
+    addBtn.addEventListener('click', () =>
+      acceptInboxCandidate(candidate, row, addBtn, dismissBtn, feedback));
+    dismissBtn.addEventListener('click', () =>
+      dismissInboxCandidate(candidate, row, addBtn, dismissBtn, feedback));
+
+    actions.append(addBtn, dismissBtn, feedback);
+    row.appendChild(actions);
+    return row;
+  }));
+  }
+  renderInboxStatus();
+}
+
+function renderInboxStatus() {
+  if (!taskInboxStatus || !taskInboxStatusText || !taskInboxRetry) return;
+  if (inboxState === 'loading' && !inboxCandidates.length) {
+    taskInbox.hidden = false;
+    taskInboxStatus.hidden = false;
+    taskInboxStatusText.textContent = 'やること候補を読み込み中…';
+    taskInboxRetry.hidden = true;
+  } else if (inboxState === 'error') {
+    taskInbox.hidden = false;
+    taskInboxStatus.hidden = false;
+    taskInboxRetry.hidden = false;
+    taskInboxStatusText.textContent = inboxCandidates.length
+      ? '候補の再取得に失敗しました。表示中は前回の候補です。'
+      : '候補の読み込みに失敗しました。';
+  } else {
+    taskInboxStatus.hidden = true;
+    taskInboxStatusText.textContent = '';
+    taskInboxRetry.hidden = true;
+    taskInbox.hidden = !inboxCandidates.length;
+  }
+}
+
+async function loadInbox() {
+  if (!taskInbox || inboxLoading) return;
+  inboxLoading = true;
+  if (!inboxCandidates.length) {
+    inboxState = 'loading';
+    renderInboxStatus();
+  }
+  try {
+    const data = await requestJSON('/api/tasks/candidates');
+    inboxCandidates = Array.isArray(data.candidates) ? data.candidates : [];
+    inboxState = 'loaded';
+    renderInbox();
+  } catch (err) {
+    // 一時的な取得失敗。既存の候補を保持したままエラー状態を示す。
+    inboxState = 'error';
+    renderInbox();
+  } finally {
+    inboxLoading = false;
+  }
+}
+
+async function acceptInboxCandidate(candidate, row, addBtn, dismissBtn, feedback) {
+  const id = String(candidate?.id ?? '');
+  if (!id || !addBtn || addBtn.disabled) return;
+  addBtn.disabled = true;
+  dismissBtn.disabled = true;
+  addBtn.textContent = '追加中…';
+  addBtn.classList.add('loading');
+  setInboxFeedback(feedback, '');
+  try {
+    const resp = await fetch(
+      `/api/tasks/candidates/${encodeURIComponent(id)}/accept`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' },
+    );
+    let data = {};
+    try { data = await resp.json(); } catch (_) { data = {}; }
+    if (!resp.ok || data.ok === false) {
+      throw new Error(data.error || `HTTP ${resp.status}`);
+    }
+    if (row) row.remove();
+    inboxCandidates = inboxCandidates.filter((item) => String(item.id) !== id);
+    taskInboxCount.textContent = `${inboxCandidates.length}件`;
+    if (!inboxCandidates.length) taskInbox.hidden = true;
+    // 本体タスク一覧を再読込して追加されたタスクを見せる
+    await loadTasks();
+  } catch (err) {
+    addBtn.classList.remove('loading');
+    addBtn.disabled = false;
+    dismissBtn.disabled = false;
+    addBtn.textContent = '再追加';
+    setInboxFeedback(feedback, `追加失敗: ${err.message}`, true);
+  }
+}
+
+async function dismissInboxCandidate(candidate, row, addBtn, dismissBtn, feedback) {
+  const id = String(candidate?.id ?? '');
+  if (!id || !dismissBtn || dismissBtn.disabled) return;
+  addBtn.disabled = true;
+  dismissBtn.disabled = true;
+  dismissBtn.textContent = '処理中…';
+  setInboxFeedback(feedback, '');
+  try {
+    const resp = await fetch(
+      `/api/tasks/candidates/${encodeURIComponent(id)}/dismiss`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' },
+    );
+    let data = {};
+    try { data = await resp.json(); } catch (_) { data = {}; }
+    if (!resp.ok || data.ok === false) {
+      throw new Error(data.error || `HTTP ${resp.status}`);
+    }
+    if (row) row.remove();
+    inboxCandidates = inboxCandidates.filter((item) => String(item.id) !== id);
+    taskInboxCount.textContent = `${inboxCandidates.length}件`;
+    if (!inboxCandidates.length) taskInbox.hidden = true;
+  } catch (err) {
+    dismissBtn.disabled = false;
+    addBtn.disabled = false;
+    dismissBtn.textContent = '見送る';
+    setInboxFeedback(feedback, `無視失敗: ${err.message}`, true);
+  }
+}
+
+function setInboxFeedback(feedback, message, isError) {
+  if (!feedback) return;
+  feedback.textContent = message || '';
+  feedback.classList.toggle('error', Boolean(isError));
 }
 
 function setMetric(el, value) {
@@ -1133,9 +1342,12 @@ function init() {
   });
 
   refreshBtn.addEventListener('click', async () => {
-    await Promise.all([loadTasks(), loadCalendarEvents()]);
+    await Promise.all([loadTasks(), loadCalendarEvents(), loadInbox()]);
     render();
   });
+  if (taskInboxRetry) {
+    taskInboxRetry.addEventListener('click', () => loadInbox());
+  }
   taskList.addEventListener('click', handleActionClick);
   taskList.addEventListener('submit', saveEdit);
   taskList.addEventListener('keydown', handleEditKeydown);
@@ -1168,6 +1380,7 @@ function init() {
 
 
   loadTasks();
+  loadInbox();
 
   const routeParams = new URLSearchParams(window.location.search);
   if (routeParams.get('new') === '1') {

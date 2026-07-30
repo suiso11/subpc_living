@@ -147,6 +147,24 @@ button { cursor: pointer; }
 }
 
 
+/* Conversation-derived task candidates: immediate benefit without interrupting chat. */
+.candidate-card { width: min(100%, 620px); padding: var(--space-4); color: var(--text); background: var(--paper-2); border: 1px solid var(--line-strong); }
+.candidate-head, .candidate-meta, .candidate-actions { display: flex; align-items: center; }
+.candidate-head { justify-content: space-between; margin-bottom: var(--space-2); }
+.candidate-label { color: var(--brass); font-family: var(--mono); font-size: var(--font-size-label); letter-spacing: .08em; }
+.candidate-body { min-width: 0; }
+.candidate-title { display: block; overflow-wrap: anywhere; font-size: 1rem; line-height: 1.5; }
+.candidate-note { margin: var(--space-1) 0 0; color: var(--text-dim); font-size: var(--font-size-small); }
+.candidate-meta { flex-wrap: wrap; gap: var(--space-2); margin-top: var(--space-2); }
+.candidate-actions { flex-wrap: wrap; gap: var(--space-2); margin-top: var(--space-3); }
+.candidate-actions > button { min-width: 88px; }
+.candidate-actions > button:active, .task-inbox-actions > button:active { transform: translateY(1px); }
+.candidate-actions > button:disabled, .task-inbox-actions > button:disabled { opacity: .55; cursor: not-allowed; }
+.candidate-inbox-link { min-height: 44px; display: inline-flex; align-items: center; padding-inline: var(--space-2); color: var(--brass); white-space: nowrap; }
+.candidate-feedback { flex: 1 1 100%; min-height: 1.4em; color: var(--text-dim); font-size: var(--font-size-small); }
+.candidate-feedback.error { color: var(--danger); }
+.candidate-card.accepted { border-color: var(--success); }
+
 /* Supporting game rail */
 .game-hub { margin: 0; overflow: hidden; }
 .game-hub.game-unavailable { display: none; }
@@ -260,6 +278,22 @@ button { cursor: pointer; }
 .task-summary, .achievement-overview { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-bottom: 18px; }
 .metric { min-height: 82px; display: flex; flex-direction: column; justify-content: center; gap: 6px; padding: 14px; background: var(--paper-2); border: 1px solid var(--border-soft); }
 .metric-label { color: var(--text-dim); font-family: var(--mono); font-size: .68rem; }.metric strong { font-size: 1.7rem; }.metric.danger strong, .due-text.overdue { color: var(--danger); }.metric.warn strong, .due-text.today { color: var(--warning); }.metric.high strong { color: var(--brass); }.metric.is-zero strong { color: var(--text-faint); }
+.task-inbox { margin-bottom: var(--space-4); padding: var(--space-4); border: 1px solid var(--line-strong); background: var(--paper-1); }
+.task-inbox-hint { margin: 0 0 var(--space-3); color: var(--text-dim); font-size: var(--font-size-small); }
+.task-inbox-list { display: grid; gap: var(--space-2); }
+.task-inbox-status { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--space-2); margin-bottom: var(--space-2); color: var(--text-dim); font-size: var(--font-size-small); }
+.task-inbox-status[hidden] { display: none !important; }
+.task-inbox-status-text { min-width: 0; flex: 1 1 160px; }
+.task-inbox-retry { flex: 0 0 auto; min-height: 44px; }
+.task-inbox-row { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: var(--space-4); padding: var(--space-3); background: var(--paper-2); border: 1px solid var(--border-soft); }
+.task-inbox-row-content { min-width: 0; }
+.task-inbox-row-title { display: block; overflow-wrap: anywhere; line-height: 1.5; }
+.task-inbox-row-meta, .task-inbox-actions { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-2); }
+.task-inbox-row-meta { margin-top: var(--space-2); }
+.task-inbox-row-note { color: var(--text-dim); font-size: var(--font-size-small); overflow-wrap: anywhere; }
+.task-inbox-actions { justify-content: flex-end; }
+.task-inbox-actions > button { min-width: 88px; }
+.task-inbox-actions .candidate-feedback { min-width: 100%; text-align: end; }
 .task-compose, .task-controlbar { margin-bottom: 12px; padding: 14px; }.section-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 10px; }.section-heading h2 { margin: 0; font-size: 1rem; font-weight: 500; }.section-heading span { color: var(--text-faint); font-size: .72rem; }
 .task-compose-form { display: grid; gap: 8px; }.compose-input-row { display: flex; gap: 8px; }.compose-input-row input, .task-compose-form input, .task-compose-form select, .edit-grid input, .edit-grid select, .cal-day-input, .cal-event-row.editing input, .log-toolbar select { min-width: 0; min-height: 44px; padding: 9px 11px; color: var(--text); background: var(--bg-input); border: 1px solid var(--border-soft); border-radius: var(--radius-sm); outline: 0; }.compose-input-row input { flex: 1; }.compose-input-row button { flex: 0 0 auto; }
 .task-details-section { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }.task-preview-line { padding: 7px 10px; color: var(--text-dim); background: var(--primary-soft); border-left: 2px solid var(--brass); font-size: .78rem; }.due-quick { display: flex; flex-wrap: wrap; gap: 6px; }.due-quick-sep { width: 1px; background: var(--border-soft); }.due-chip { min-height: 40px; padding: 0 10px; color: var(--text-dim); background: var(--paper-2); border: 1px solid var(--border-soft); border-radius: var(--radius-sm); }.due-chip:hover { color: var(--brass); border-color: var(--brass); }
@@ -302,6 +336,12 @@ button { cursor: pointer; }
   .growth-detail-chart { grid-template-columns: repeat(7, minmax(0, 1fr)); gap: var(--space-2); }
   .growth-day { height: 112px; }
   .growth-day-track { min-height: 54px; }
+  .candidate-actions > button { flex: 1 1 0; }
+  .candidate-inbox-link { flex: 1 1 100%; justify-content: flex-end; }
+  .task-inbox { padding: var(--space-3); }
+  .task-inbox-row { grid-template-columns: minmax(0, 1fr); gap: var(--space-3); }
+  .task-inbox-actions { justify-content: stretch; }
+  .task-inbox-actions > button { flex: 1 1 0; white-space: nowrap; }
   .pwa-install-card { grid-template-columns: minmax(0, 1fr); }
   .pwa-install-btn { width: 100%; justify-self: stretch; }
   .task-workspace { width: calc(100% - 18px); margin: 10px auto; padding: 16px 10px; }.task-summary, .achievement-overview { grid-template-columns: repeat(2, minmax(0, 1fr)); }.achievement-rank-card { grid-column: 1 / -1; }.achievement-grid { grid-template-columns: 1fr; }.achievement-next { align-items: flex-start; flex-direction: column; }.achievement-next-action { width: 100%; justify-content: space-between; }.achievement-collection { padding: 12px; }.achievement-collection-heading { align-items: flex-start; flex-direction: column; }.achievement-filter { width: 100%; }.achievement-filter-btn { flex: 1; }

@@ -507,6 +507,182 @@ function handleMessage(data) {
       setMicState('idle');
       updateUI();
       break;
+
+    case 'task_candidate':
+      renderCandidateCard(data.candidate);
+      break;
+  }
+}
+
+// --- やること候補カード ---
+// サーバーから届いた task_candidate をチャット画面にDOMで描画する。
+// innerHTML を使わず、候補の文字列はすべて textContent で安全に差し込む。
+
+const CANDIDATE_PRIORITY_LABELS = {
+  high: 'だいじ',
+  low: 'あとで',
+  normal: 'ふつう',
+};
+
+function formatCandidateDue(candidate) {
+  if (!candidate) return '';
+  if (candidate.due_display) return String(candidate.due_display);
+  if (!candidate.due_at) return '';
+  const due = new Date(candidate.due_at);
+  if (Number.isNaN(due.getTime())) return '';
+  const m = due.getMonth() + 1;
+  const d = due.getDate();
+  if (candidate.due_granularity === 'date') return `${m}/${d}`;
+  const hh = String(due.getHours()).padStart(2, '0');
+  const mm = String(due.getMinutes()).padStart(2, '0');
+  return `${m}/${d} ${hh}:${mm}`;
+}
+
+function renderCandidateCard(candidate) {
+  if (!chatArea || !candidate) return;
+  removeWelcome();
+  const id = String(candidate.id ?? '');
+  if (!id) return;
+
+  const msg = document.createElement('div');
+  msg.className = 'message assistant';
+
+  const card = document.createElement('div');
+  card.className = 'candidate-card';
+  card.dataset.candidateId = id;
+
+  const head = document.createElement('div');
+  head.className = 'candidate-head';
+  const label = document.createElement('span');
+  label.className = 'candidate-label';
+  label.textContent = 'やること候補';
+  head.appendChild(label);
+  card.appendChild(head);
+
+  const body = document.createElement('div');
+  body.className = 'candidate-body';
+  const titleEl = document.createElement('strong');
+  titleEl.className = 'candidate-title';
+  titleEl.textContent = String(candidate.title || '');
+  body.appendChild(titleEl);
+  if (candidate.note) {
+    const note = document.createElement('p');
+    note.className = 'candidate-note';
+    note.textContent = String(candidate.note);
+    body.appendChild(note);
+  }
+  const dueText = formatCandidateDue(candidate);
+  const priority = candidate.priority && CANDIDATE_PRIORITY_LABELS[candidate.priority]
+    ? candidate.priority : 'normal';
+  const meta = document.createElement('div');
+  meta.className = 'candidate-meta';
+  if (dueText) {
+    const dueSpan = document.createElement('span');
+    dueSpan.className = 'due-text';
+    dueSpan.textContent = dueText;
+    meta.appendChild(dueSpan);
+  }
+  const badge = document.createElement('span');
+  badge.className = `priority-badge ${priority}`;
+  badge.textContent = CANDIDATE_PRIORITY_LABELS[priority];
+  meta.appendChild(badge);
+  body.appendChild(meta);
+  card.appendChild(body);
+
+  const actions = document.createElement('div');
+  actions.className = 'candidate-actions';
+  const addBtn = document.createElement('button');
+  addBtn.type = 'button';
+  addBtn.className = 'primary-btn candidate-add';
+  addBtn.textContent = '追加';
+  const dismissBtn = document.createElement('button');
+  dismissBtn.type = 'button';
+  dismissBtn.className = 'secondary-btn candidate-dismiss';
+  dismissBtn.textContent = '見送る';
+  const inboxLink = document.createElement('a');
+  inboxLink.className = 'candidate-inbox-link';
+  inboxLink.href = '/tasks';
+  inboxLink.textContent = '受信箱 →';
+  const feedback = document.createElement('span');
+  feedback.className = 'candidate-feedback';
+  feedback.setAttribute('role', 'status');
+  feedback.setAttribute('aria-live', 'polite');
+
+  addBtn.addEventListener('click', () =>
+    acceptCandidate(id, addBtn, dismissBtn, feedback, card));
+  dismissBtn.addEventListener('click', () =>
+    dismissCandidate(id, addBtn, dismissBtn, feedback, card));
+
+  actions.append(addBtn, dismissBtn, inboxLink, feedback);
+  card.appendChild(actions);
+
+  msg.appendChild(card);
+  chatArea.appendChild(msg);
+  // autoFollow がオフなら追従しない（scrollToBottom が autoFollow を見る）
+  scrollToBottom();
+}
+
+function setCandidateFeedback(feedback, message, isError) {
+  if (!feedback) return;
+  feedback.textContent = message || '';
+  feedback.classList.toggle('error', Boolean(isError));
+}
+
+async function acceptCandidate(id, addBtn, dismissBtn, feedback, card) {
+  if (!id || !addBtn || addBtn.disabled) return;
+  addBtn.disabled = true;
+  dismissBtn.disabled = true;
+  addBtn.textContent = '追加中…';
+  addBtn.classList.add('loading');
+  setCandidateFeedback(feedback, '');
+  try {
+    const resp = await fetch(
+      `/api/tasks/candidates/${encodeURIComponent(id)}/accept`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' },
+    );
+    let data = {};
+    try { data = await resp.json(); } catch (_) { data = {}; }
+    if (!resp.ok || data.ok === false) {
+      throw new Error(data.error || `HTTP ${resp.status}`);
+    }
+    addBtn.classList.remove('loading');
+    addBtn.classList.add('done');
+    addBtn.textContent = '追加済み';
+    dismissBtn.hidden = true;
+    if (card) card.classList.add('accepted');
+    setCandidateFeedback(feedback, '');
+  } catch (err) {
+    addBtn.classList.remove('loading');
+    addBtn.disabled = false;
+    dismissBtn.disabled = false;
+    addBtn.textContent = '再追加';
+    setCandidateFeedback(feedback, `追加失敗: ${err.message}`, true);
+  }
+}
+
+async function dismissCandidate(id, addBtn, dismissBtn, feedback, card) {
+  if (!id || !dismissBtn || dismissBtn.disabled) return;
+  addBtn.disabled = true;
+  dismissBtn.disabled = true;
+  dismissBtn.textContent = '処理中…';
+  setCandidateFeedback(feedback, '');
+  try {
+    const resp = await fetch(
+      `/api/tasks/candidates/${encodeURIComponent(id)}/dismiss`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' },
+    );
+    let data = {};
+    try { data = await resp.json(); } catch (_) { data = {}; }
+    if (!resp.ok || data.ok === false) {
+      throw new Error(data.error || `HTTP ${resp.status}`);
+    }
+    const msg = card?.closest('.message');
+    if (msg) msg.remove();
+  } catch (err) {
+    dismissBtn.disabled = false;
+    addBtn.disabled = false;
+    dismissBtn.textContent = '見送る';
+    setCandidateFeedback(feedback, `無視失敗: ${err.message}`, true);
   }
 }
 

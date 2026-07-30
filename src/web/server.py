@@ -8,6 +8,7 @@ import os
 import json
 import asyncio
 import base64
+import hashlib
 import socket
 import secrets
 import subprocess
@@ -49,6 +50,7 @@ from src.service.idle import IdleManager
 from src.discord_bot.task_ui import parse_due, parse_snooze, split_quick_input
 from src.tasks.store import TaskStore
 from src.tasks.chat_editor import TaskChatEditor
+from src.tasks import extractor as task_extractor
 from src.growth.tracker import GrowthTracker
 from src.service.log_setup import setup_logging, DEFAULT_LOG_DIR
 from src.chat import history_admin
@@ -79,6 +81,11 @@ task_calendar_sync = None  # TaskCalendarSync | None (Webで作ったタスク�
 calendar_client = None  # GoogleCalendarMCPClient | None (イベント CRUD 用)
 tasks_calendar_id: str = "primary"
 UPCOMING_PATH = PROJECT_ROOT / "data" / "calendar" / "upcoming.json"
+
+# 低温度 Web 抽出の資源上限。本流の num_ctx/num_predict とは独立に小さく抑える。
+_EXTRACTION_NUM_CTX = 2048
+_EXTRACTION_NUM_PREDICT = 256
+_candidate_offer_tasks: set[asyncio.Task] = set()
 
 
 def get_local_ip() -> str:
@@ -366,6 +373,11 @@ async def lifespan(app: FastAPI):
         await watchdog_task
     except asyncio.CancelledError:
         pass
+
+    # 応答後の候補抽出タスクを停止してから共有クライアント/DBを閉じる。
+    pending_candidates = list(_candidate_offer_tasks)
+    if pending_candidates:
+        await asyncio.gather(*pending_candidates, return_exceptions=True)
 
     # 終了処理
     # IdleManager 停止
@@ -1066,6 +1078,59 @@ async def tasks_snooze(task_id: int, request: Request):
     if not ok:
         return JSONResponse({"error": "task not found or not open"}, status_code=404)
     return {"ok": True, "until": until.isoformat()}
+
+
+# --- 会話由来タスク候補 Inbox API ---
+
+@app.get("/api/tasks/candidates")
+async def task_candidates_list(status: str = "pending", limit: int = 100):
+    unavailable = _require_task_store()
+    if unavailable is not None:
+        return unavailable
+    safe_status = status if status in ("pending", "accepted", "dismissed") else "pending"
+    safe_limit = max(1, min(int(limit), 200))
+    rows = await asyncio.to_thread(task_store.list_candidates, safe_status, safe_limit)
+    return {"candidates": [_candidate_to_json(row) for row in rows], "status": safe_status}
+
+
+@app.post("/api/tasks/candidates/{candidate_id}/accept")
+async def task_candidate_accept(candidate_id: int):
+    unavailable = _require_task_store()
+    if unavailable is not None:
+        return unavailable
+    candidate = await asyncio.to_thread(task_store.get_candidate, candidate_id)
+    if candidate is None:
+        return JSONResponse({"error": "candidate not found"}, status_code=404)
+    try:
+        task_id, created = await asyncio.to_thread(task_store.accept_candidate, candidate_id)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=409)
+    if task_id is None:
+        return JSONResponse({"error": "candidate has no task"}, status_code=409)
+    task = await asyncio.to_thread(task_store.get, task_id)
+    resolved = await asyncio.to_thread(task_store.get_candidate, candidate_id)
+    return {
+        "ok": True,
+        "created": created,
+        "candidate": _candidate_to_json(resolved),
+        "task": _task_to_json(task),
+    }
+
+
+@app.post("/api/tasks/candidates/{candidate_id}/dismiss")
+async def task_candidate_dismiss(candidate_id: int):
+    unavailable = _require_task_store()
+    if unavailable is not None:
+        return unavailable
+    candidate = await asyncio.to_thread(task_store.get_candidate, candidate_id)
+    if candidate is None:
+        return JSONResponse({"error": "candidate not found"}, status_code=404)
+    try:
+        changed = await asyncio.to_thread(task_store.dismiss_candidate, candidate_id)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=409)
+    resolved = await asyncio.to_thread(task_store.get_candidate, candidate_id)
+    return {"ok": True, "changed": changed, "candidate": _candidate_to_json(resolved)}
 
 
 # --- Google Calendar イベント API ---
@@ -1839,6 +1904,167 @@ async def history_session_delete(filename: str):
 
 # --- WebSocket チャット ---
 
+def _extraction_enabled() -> bool:
+    """TASKS_CHAT_EXTRACTION_ENABLED は既定 true。無効化は "false" のみ。"""
+    val = os.environ.get("TASKS_CHAT_EXTRACTION_ENABLED", "").strip().lower()
+    if val in ("false", "0", "no", "off"):
+        return False
+    return True
+
+
+def _candidate_to_json(cand: dict) -> dict:
+    """候補1件を API/WS 配信用の JSON 形式へ直列化する。"""
+    due_at = cand.get("due_at")
+    created_at = cand.get("created_at")
+    decided_at = cand.get("decided_at")
+    return {
+        "id": cand["id"],
+        "title": cand.get("title") or "",
+        "due_at": due_at.isoformat() if isinstance(due_at, datetime) else due_at,
+        "due_granularity": cand.get("due_granularity"),
+        "priority": cand.get("priority") or "normal",
+        "status": cand.get("status") or "pending",
+        "task_id": cand.get("task_id"),
+        "created_at": created_at.isoformat() if isinstance(created_at, datetime) else created_at,
+        "decided_at": decided_at.isoformat() if isinstance(decided_at, datetime) else decided_at,
+    }
+
+
+def _make_source_ref(session_id: str, turn: int, utterance: str) -> str:
+    """安全な session_id・番号・発言ダイジェストから source_ref を作る。
+
+    生発言は一切保存しない。session_id は WebSocket 入口で安全判定済みだが、
+    ここでも念のため sanitize して異常値は "unknown" に丸める。
+    """
+    safe_sid = session_id if history_admin.is_safe_session_id(session_id) else "unknown"
+    digest = hashlib.sha256(utterance.encode("utf-8")).hexdigest()[:16]
+    return f"web:{safe_sid}:t{int(turn)}:{digest}"
+
+
+def _extraction_timeout_seconds() -> float:
+    raw = os.environ.get("TASKS_CHAT_EXTRACTION_TIMEOUT_SECONDS", "15").strip()
+    try:
+        return max(3.0, min(float(raw), 60.0))
+    except ValueError:
+        return 15.0
+
+
+def _extract_task_candidates(user_text: str) -> list[dict]:
+    """人格会話とは分離した低温度JSON抽出。失敗時は空配列。"""
+    if not _extraction_enabled() or task_store is None or llm is None or config is None:
+        return []
+    # 秘密らしい文字列をモデルへ渡さない。抽出後タイトルもvalidatorで再検査する。
+    if task_extractor.is_sensitive_text(user_text):
+        logger.info("task candidate extraction skipped: sensitive text detected")
+        return []
+    now_local = datetime.now(_tasks_tz())
+    messages = [
+        {"role": "system", "content": task_extractor.build_multi_extraction_prompt(now_local)},
+        {"role": "user", "content": user_text},
+    ]
+    try:
+        raw = llm.generate(
+            messages,
+            temperature=0.0,
+            num_ctx=min(int(config.num_ctx), _EXTRACTION_NUM_CTX),
+            num_predict=_EXTRACTION_NUM_PREDICT,
+            timeout=_extraction_timeout_seconds(),
+        )
+    except Exception as exc:
+        logger.warning("task candidate extraction failed: %s", exc)
+        return []
+    validated = task_extractor.validate_multi_extraction(raw, assume_tz=_tasks_tz())
+    return list(validated.get("tasks") or []) if validated else []
+
+
+async def _offer_task_candidates(
+    websocket: WebSocket,
+    *,
+    user_text: str,
+    session_id: str,
+    turn: int,
+) -> None:
+    """候補を抽出・永続化し、新規候補だけWebSocketへ送る。"""
+    if not _extraction_enabled() or task_store is None:
+        return
+    extracted = await asyncio.to_thread(_extract_task_candidates, user_text)
+    if not extracted:
+        return
+    source_ref = _make_source_ref(session_id, turn, user_text)
+    for index, item in enumerate(extracted[:3]):
+        title = item.get("title") or ""
+        if task_extractor.is_sensitive_text(title):
+            logger.warning("sensitive task candidate rejected after extraction")
+            continue
+        candidate_now = datetime.now(timezone.utc)
+        candidate_id = await asyncio.to_thread(
+            task_store.create_candidate,
+            title=title,
+            due_at=item.get("due_at"),
+            due_granularity=item.get("due_granularity"),
+            priority=item.get("priority") or "normal",
+            source="chat",
+            now=candidate_now,
+        )
+        if candidate_id is None:
+            continue
+        candidate = await asyncio.to_thread(task_store.get_candidate, candidate_id)
+        # create_candidate が既存pendingを返した場合は再提示しない。
+        if candidate is None or candidate.get("created_at") != candidate_now:
+            continue
+        logger.info("task candidate created: %s:%s id=%s", source_ref, index, candidate_id)
+        await websocket.send_json({
+            "type": "task_candidate",
+            "candidate": _candidate_to_json(candidate),
+        })
+
+
+async def _run_task_candidate_offer(
+    websocket: WebSocket,
+    *,
+    user_text: str,
+    session_id: str,
+    turn: int,
+) -> None:
+    """候補処理専用の例外境界。通常応答・TTSへ失敗を伝播させない。"""
+    try:
+        await asyncio.wait_for(
+            _offer_task_candidates(
+                websocket,
+                user_text=user_text,
+                session_id=session_id,
+                turn=turn,
+            ),
+            timeout=_extraction_timeout_seconds() + 2.0,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("task candidate extraction timed out")
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning("task candidate offer failed: %s", exc)
+
+
+def _launch_task_candidate_offer(
+    websocket: WebSocket,
+    *,
+    user_text: str,
+    session_id: str,
+    turn: int,
+) -> None:
+    """done後にbest-effort候補処理を起動し、受信ループを止めない。"""
+    if not _extraction_enabled() or task_store is None:
+        return
+    task = asyncio.create_task(_run_task_candidate_offer(
+        websocket,
+        user_text=user_text,
+        session_id=session_id,
+        turn=turn,
+    ))
+    _candidate_offer_tasks.add(task)
+    task.add_done_callback(_candidate_offer_tasks.discard)
+
+
 def _try_register_event_text(text: str) -> Optional[str]:
     """予定登録の意図があれば Google Calendar に登録して結果文を返す (無ければ None)。
 
@@ -2046,6 +2272,7 @@ async def websocket_chat(websocket: WebSocket):
         {"type": "done", "full_text": "..."}       # 応答完了
         {"type": "audio", "data": "base64..."}     # TTS音声 (base64 WAV)
         {"type": "stt_result", "text": "..."}      # STT認識結果
+        {"type": "task_candidate", "candidate": {}} # 会話から見つけた候補
         {"type": "error", "message": "..."}        # エラー
     """
     await websocket.accept()
@@ -2240,6 +2467,14 @@ async def websocket_chat(websocket: WebSocket):
                     "type": "done",
                     "full_text": full_response,
                 })
+
+                # 返答を先に見せてから、人格モデルと分離した抽出器で候補を提示する。
+                _launch_task_candidate_offer(
+                    websocket,
+                    user_text=user_text,
+                    session_id=session_id,
+                    turn=len(session.messages),
+                )
 
                 # TTS
                 if want_tts and tts is not None and full_response:

@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 
 import discord
 
-from src.tasks.store import VALID_PRIORITY
+from src.tasks.extractor import build_extraction_prompt, validate_extraction
 
 UTC = timezone.utc
 
@@ -410,84 +410,6 @@ def parse_snooze(text: str, now: datetime, tz: ZoneInfo) -> Optional[datetime]:
     # 「30分後」等も許容
     due, _ = parse_due(s, now, tz)
     return due
-
-
-def validate_extraction(raw: Any, assume_tz: Optional[ZoneInfo] = None) -> Optional[dict]:
-    """LLM 抽出結果 (strict JSON) を検証・正規化する。
-
-    期待形: {"is_task": bool, "title": str, "due": ISO or null, "priority": str}
-    不正・is_task=false・title 空 の場合は None。
-    タイムゾーンなしの due は assume_tz (既定 Asia/Tokyo) の時刻として解釈する —
-    抽出プロンプトが現在日時を Asia/Tokyo で提示しているため。
-    """
-    if isinstance(raw, str):
-        raw = raw.strip()
-        # ```json ... ``` フェンスを剥がす
-        if raw.startswith("```"):
-            raw = re.sub(r"^```[a-zA-Z]*\n?", "", raw)
-            raw = re.sub(r"\n?```$", "", raw).strip()
-        try:
-            obj = json.loads(raw)
-        except (json.JSONDecodeError, ValueError):
-            return None
-    elif isinstance(raw, dict):
-        obj = raw
-    else:
-        return None
-
-    if not isinstance(obj, dict):
-        return None
-    if obj.get("is_task") is not True:
-        return None
-    title = obj.get("title")
-    if not isinstance(title, str) or not title.strip():
-        return None
-
-    due_at: Optional[datetime] = None
-    due_val = obj.get("due")
-    if isinstance(due_val, str) and due_val.strip():
-        try:
-            dt = datetime.fromisoformat(due_val.strip().replace("Z", "+00:00"))
-            local_tz = assume_tz or ZoneInfo("Asia/Tokyo")
-            due_at = dt if dt.tzinfo else dt.replace(tzinfo=local_tz)
-            due_at = due_at.astimezone(UTC)
-        except (ValueError, TypeError):
-            due_at = None
-
-    priority = obj.get("priority")
-    if priority not in VALID_PRIORITY:
-        priority = "normal"
-
-    return {
-        "title": title.strip()[:200],
-        "due_at": due_at,
-        "priority": priority,
-    }
-
-
-def build_extraction_prompt(now_local: datetime) -> str:
-    """自然会話からタスクを抽出させるためのシステムプロンプト。"""
-    weekday_ja = "月火水木金土日"[now_local.weekday()]
-    now_str = now_local.strftime("%Y-%m-%d %H:%M")
-    # LLMの日付計算は信用できないので、相対表現の換算表を計算済みで渡す
-    tomorrow = now_local + timedelta(days=1)
-    next_monday = now_local + timedelta(days=7 - now_local.weekday())
-    next_friday = next_monday + timedelta(days=4)
-    return (
-        "あなたはユーザーの発言から『やるべきタスク』を抽出する抽出器です。"
-        f"現在日時は {now_str}、今日は{weekday_ja}曜日です (Asia/Tokyo)。\n"
-        "出力は必ず次の厳密なJSONのみ。前置き・説明・コードフェンスは禁止。\n"
-        '{"is_task": true/false, "title": "簡潔なタスク名", '
-        '"due": "ISO8601の絶対日時 または null", "priority": "high/normal/low"}\n'
-        "- 依頼・締切・予定・やること が含まれるときだけ is_task=true。\n"
-        "- 相対表現(明日・来週など)は現在日時を基準に絶対日時へ変換する。\n"
-        f"- 日付換算表 (これに従うこと): 明日={tomorrow:%Y-%m-%d}、"
-        f"来週の月曜={next_monday:%Y-%m-%d}、来週の金曜={next_friday:%Y-%m-%d}。"
-        "他の曜日も「来週の月曜」からの日数で数える。\n"
-        "- 時刻が不明で日付だけなら、その日の 23:59 を due にする。\n"
-        "- 期限が全く不明なら due は null。\n"
-        "- 雑談・感想・質問など、やることでないものは is_task=false。"
-    )
 
 
 def _refresh_board(state: Any) -> None:

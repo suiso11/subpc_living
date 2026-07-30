@@ -126,6 +126,7 @@ class OllamaClient:
         repeat_penalty: float = 1.1,
         num_ctx: int = 8192,
         num_predict: int | None = None,
+        timeout: float | None = None,
     ) -> str:
         """非ストリーミングでチャット応答を生成"""
         payload = {
@@ -143,7 +144,10 @@ class OllamaClient:
                 num_predict=num_predict,
             ),
         }
-        resp = self._client.post("/api/chat", json=payload)
+        request_kwargs = {"json": payload}
+        if timeout is not None:
+            request_kwargs["timeout"] = timeout
+        resp = self._client.post("/api/chat", **request_kwargs)
         resp.raise_for_status()
         raw = resp.json()["message"]["content"]
         return self._sanitize_response(raw)

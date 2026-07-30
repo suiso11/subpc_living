@@ -2,9 +2,17 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from src.discord_bot.task_ui import parse_due, parse_snooze, validate_extraction
+from src.tasks.extractor import (
+    build_extraction_prompt,
+    build_multi_extraction_prompt,
+    is_sensitive_text,
+    validate_extraction as extractor_validate_extraction,
+    validate_multi_extraction,
+)
 
 UTC = timezone.utc
 JST = ZoneInfo("Asia/Tokyo")
@@ -237,6 +245,280 @@ class ValidateExtractionTest(unittest.TestCase):
         out = validate_extraction({"is_task": True, "title": "x", "due": "2026-07-05T23:59:00"})
         self.assertEqual(out["due_at"].astimezone(JST).hour, 23)
         self.assertEqual(out["due_at"].astimezone(UTC).hour, 14)
+
+    def test_task_ui_reexport_matches_extractor(self) -> None:
+        # task_ui.validate_extraction は src.tasks.extractor からの再エクスポート
+        self.assertIs(validate_extraction, extractor_validate_extraction)
+        self.assertIsNotNone(build_extraction_prompt(datetime(2026, 7, 3, 10, 0, tzinfo=JST)))
+
+    def test_discord_offer_preserves_extracted_due_granularity(self) -> None:
+        source = Path("src/discord_bot/bot.py").read_text(encoding="utf-8")
+        start = source.index("async def maybe_offer_task_from_chat")
+        end = source.index("async def handle_voice_reply", start)
+        block = source[start:end]
+        self.assertIn('granularity = extracted.get("due_granularity")', block)
+        self.assertIn("due_granularity=granularity", block)
+
+
+class ValidateMultiExtractionTest(unittest.TestCase):
+    def _cand(self, title="x", due=None, priority="normal", is_task=True):
+        return {"is_task": is_task, "title": title, "due": due, "priority": priority}
+
+    def test_one_valid(self) -> None:
+        out = validate_multi_extraction({"tasks": [self._cand("買い物", priority="high")]})
+        self.assertIsNotNone(out)
+        self.assertEqual(len(out["tasks"]), 1)
+        self.assertEqual(out["tasks"][0]["title"], "買い物")
+        self.assertEqual(out["tasks"][0]["priority"], "high")
+        self.assertIsNone(out["tasks"][0]["due_at"])
+
+    def test_three_valid(self) -> None:
+        raw = {"tasks": [
+            self._cand("A", due="2026-07-10T15:00:00+09:00"),
+            self._cand("B", priority="low"),
+            self._cand("C"),
+        ]}
+        out = validate_multi_extraction(raw)
+        self.assertIsNotNone(out)
+        self.assertEqual([t["title"] for t in out["tasks"]], ["A", "B", "C"])
+        self.assertEqual(out["tasks"][0]["due_at"].astimezone(JST).hour, 15)
+        self.assertEqual(out["tasks"][1]["priority"], "low")
+
+    def test_json_string(self) -> None:
+        out = validate_multi_extraction(
+            '{"tasks": [{"is_task": true, "title": "x", "due": null, "priority": "normal"}]}'
+        )
+        self.assertIsNotNone(out)
+        self.assertEqual(out["tasks"][0]["title"], "x")
+
+    def test_code_fence_stripped(self) -> None:
+        out = validate_multi_extraction(
+            '```json\n{"tasks": [{"is_task": true, "title": "x", "due": null, "priority": "low"}]}\n```'
+        )
+        self.assertIsNotNone(out)
+        self.assertEqual(out["tasks"][0]["title"], "x")
+
+    def test_empty_array_is_valid_no_candidates(self) -> None:
+        self.assertEqual(validate_multi_extraction({"tasks": []}), {"tasks": []})
+        self.assertEqual(validate_multi_extraction('{"tasks": []}'), {"tasks": []})
+
+    def test_four_candidates_fails_closed(self) -> None:
+        raw = {"tasks": [self._cand("a"), self._cand("b"), self._cand("c"), self._cand("d")]}
+        self.assertIsNone(validate_multi_extraction(raw))
+
+    def test_is_task_false_candidate_fails_closed(self) -> None:
+        raw = {"tasks": [self._cand("ok"), self._cand("chat", is_task=False)]}
+        self.assertIsNone(validate_multi_extraction(raw))
+
+    def test_empty_title_candidate_fails_closed(self) -> None:
+        raw = {"tasks": [self._cand("ok"), self._cand("   ")]}
+        self.assertIsNone(validate_multi_extraction(raw))
+
+    def test_tasks_not_list_fails_closed(self) -> None:
+        self.assertIsNone(validate_multi_extraction({"tasks": {"is_task": True}}))
+        self.assertIsNone(validate_multi_extraction({"tasks": "x"}))
+
+    def test_missing_tasks_key_fails_closed(self) -> None:
+        self.assertIsNone(validate_multi_extraction({"is_task": True, "title": "x"}))
+
+    def test_root_extra_key_fails_closed(self) -> None:
+        raw = {"tasks": [self._cand("x")], "unexpected": True}
+        self.assertIsNone(validate_multi_extraction(raw))
+
+    def test_bad_json_fails_closed(self) -> None:
+        self.assertIsNone(validate_multi_extraction("not json at all"))
+        self.assertIsNone(validate_multi_extraction(123))
+        self.assertIsNone(validate_multi_extraction(None))
+
+    def test_unsafe_priority_fails_closed(self) -> None:
+        self.assertIsNone(
+            validate_multi_extraction({"tasks": [self._cand("x", priority="urgent")]})
+        )
+        self.assertIsNone(
+            validate_multi_extraction({"tasks": [self._cand("x", priority=None)]})
+        )
+
+    def test_missing_due_key_fails_closed(self) -> None:
+        raw = {"tasks": [{"is_task": True, "title": "x", "priority": "normal"}]}
+        self.assertIsNone(validate_multi_extraction(raw))
+
+    def test_extra_key_fails_closed(self) -> None:
+        candidate = self._cand("x")
+        candidate["note"] = "unexpected"
+        self.assertIsNone(validate_multi_extraction({"tasks": [candidate]}))
+
+    def test_invalid_non_null_due_fails_closed(self) -> None:
+        self.assertIsNone(
+            validate_multi_extraction({"tasks": [self._cand("x", due="not-a-date")]})
+        )
+        self.assertIsNone(
+            validate_multi_extraction({"tasks": [self._cand("x", due="2026-13-99")]})
+        )
+
+    def test_null_due_still_accepted(self) -> None:
+        out = validate_multi_extraction({"tasks": [self._cand("x", due=None)]})
+        self.assertIsNotNone(out)
+        self.assertIsNone(out["tasks"][0]["due_at"])
+        self.assertIsNone(out["tasks"][0]["due_granularity"])
+
+    def test_naive_due_assumed_local(self) -> None:
+        out = validate_multi_extraction({"tasks": [self._cand("x", due="2026-07-05T23:59:00")]})
+        self.assertEqual(out["tasks"][0]["due_at"].astimezone(JST).hour, 23)
+        self.assertEqual(out["tasks"][0]["due_at"].astimezone(UTC).hour, 14)
+
+    def test_z_suffix_due(self) -> None:
+        out = validate_multi_extraction({"tasks": [self._cand("x", due="2026-07-10T06:00:00Z")]})
+        self.assertEqual(out["tasks"][0]["due_at"].astimezone(UTC).hour, 6)
+
+    def test_title_truncated_to_200(self) -> None:
+        long_title = "あ" * 250
+        out = validate_multi_extraction({"tasks": [self._cand(long_title)]})
+        self.assertEqual(len(out["tasks"][0]["title"]), 200)
+
+    def test_returns_tasks_key(self) -> None:
+        out = validate_multi_extraction({"tasks": [self._cand("x")]})
+        self.assertEqual(list(out.keys()), ["tasks"])
+        self.assertIsInstance(out["tasks"], list)
+
+    def test_multi_prompt_has_tasks_shape(self) -> None:
+        prompt = build_multi_extraction_prompt(datetime(2026, 7, 3, 10, 0, tzinfo=JST))
+        self.assertIn('"tasks":', prompt)
+        self.assertIn("Asia/Tokyo", prompt)
+        self.assertIn("1〜3件", prompt)
+        self.assertIn("4件以上は禁止", prompt)
+        self.assertIn("YYYY-MM-DD の日付だけ", prompt)
+
+
+class IsSensitiveTextTest(unittest.TestCase):
+    """高信頼度クレデンシャル検出器。実際の秘密値は一切含めない (サンプル・構造化形式のみ)。"""
+
+    def test_non_string_is_not_sensitive(self) -> None:
+        self.assertFalse(is_sensitive_text(None))
+        self.assertFalse(is_sensitive_text(123))
+        self.assertFalse(is_sensitive_text(""))
+
+    def test_benign_text_not_sensitive(self) -> None:
+        self.assertFalse(is_sensitive_text("APIキーの再発行をお願い"))
+        self.assertFalse(is_sensitive_text("パスワードを忘れた"))
+        self.assertFalse(is_sensitive_text("明日の会議の準備"))
+
+    def test_github_token_structured_sample_is_sensitive(self) -> None:
+        self.assertTrue(is_sensitive_text("ghp_" + "a" * 36))
+        self.assertTrue(is_sensitive_text("token: ghp_" + "a" * 36))
+
+    def test_aws_access_key_structured_sample_is_sensitive(self) -> None:
+        self.assertTrue(is_sensitive_text("AKIA" + "A" * 16))
+
+    def test_google_api_key_structured_sample_is_sensitive(self) -> None:
+        self.assertTrue(is_sensitive_text("AIza" + "a" * 35))
+
+    def test_stripe_key_structured_sample_is_sensitive(self) -> None:
+        self.assertTrue(is_sensitive_text("sk_live_" + "a" * 24))
+
+    def test_openai_style_token_structured_sample_is_sensitive(self) -> None:
+        self.assertTrue(is_sensitive_text("sk-" + "a" * 24))
+
+    def test_private_key_block_is_sensitive(self) -> None:
+        self.assertTrue(
+            is_sensitive_text("-----BEGIN RSA PRIVATE KEY-----\nMIIE...")
+        )
+
+    def test_key_value_assignment_is_sensitive(self) -> None:
+        self.assertTrue(is_sensitive_text("password=AbCdEfGh12345678XyZ"))
+        self.assertTrue(is_sensitive_text("api_key: " + "a" * 20))
+
+    def test_explicit_short_secret_assignment_is_sensitive(self) -> None:
+        self.assertTrue(is_sensitive_text("password=short"))
+
+    def test_japanese_secret_assignment_is_sensitive(self) -> None:
+        self.assertTrue(is_sensitive_text("パスワードは hunter2"))
+
+
+class DueGranularityTest(unittest.TestCase):
+    """シングル/マルチ検証結果の due_granularity (date vs datetime vs None)。"""
+
+    def test_single_date_only_due_is_date(self) -> None:
+        out = validate_extraction({"is_task": True, "title": "x", "due": "2026-07-10"})
+        self.assertIsNotNone(out)
+        self.assertEqual(out["due_granularity"], "date")
+        local = out["due_at"].astimezone(JST)
+        self.assertEqual((local.month, local.hour, local.minute), (7, 23, 59))
+
+    def test_single_datetime_due_is_datetime(self) -> None:
+        out = validate_extraction(
+            {"is_task": True, "title": "x", "due": "2026-07-10T15:00:00+09:00"}
+        )
+        self.assertIsNotNone(out)
+        self.assertEqual(out["due_granularity"], "datetime")
+
+    def test_single_null_due_is_none(self) -> None:
+        out = validate_extraction({"is_task": True, "title": "x", "due": None})
+        self.assertIsNotNone(out)
+        self.assertIsNone(out["due_granularity"])
+        self.assertIsNone(out["due_at"])
+
+    def test_multi_date_only_due_is_date(self) -> None:
+        out = validate_multi_extraction(
+            {"tasks": [{"is_task": True, "title": "x", "due": "2026-07-10", "priority": "normal"}]}
+        )
+        self.assertIsNotNone(out)
+        self.assertEqual(out["tasks"][0]["due_granularity"], "date")
+        local = out["tasks"][0]["due_at"].astimezone(JST)
+        self.assertEqual((local.hour, local.minute), (23, 59))
+
+    def test_multi_datetime_due_is_datetime(self) -> None:
+        out = validate_multi_extraction(
+            {"tasks": [{"is_task": True, "title": "x", "due": "2026-07-10T15:00:00", "priority": "normal"}]}
+        )
+        self.assertIsNotNone(out)
+        self.assertEqual(out["tasks"][0]["due_granularity"], "datetime")
+
+
+class SensitiveTitleRejectionTest(unittest.TestCase):
+    """抽出済み title にクレデンシャルが含まれる場合は棄却 (シングルもマルチも fail closed)。"""
+
+    def _secret_title(self) -> str:
+        return "token: ghp_" + "a" * 36
+
+    def test_single_sensitive_title_rejected(self) -> None:
+        out = validate_extraction(
+            {"is_task": True, "title": self._secret_title(), "due": None, "priority": "normal"}
+        )
+        self.assertIsNone(out)
+
+    def test_single_benign_title_kept(self) -> None:
+        out = validate_extraction({"is_task": True, "title": "買い物", "due": None, "priority": "normal"})
+        self.assertIsNotNone(out)
+        self.assertEqual(out["title"], "買い物")
+
+    def test_multi_sensitive_title_fails_closed(self) -> None:
+        raw = {"tasks": [
+            {"is_task": True, "title": "OK task", "due": None, "priority": "normal"},
+            {"is_task": True, "title": self._secret_title(), "due": None, "priority": "normal"},
+        ]}
+        self.assertIsNone(validate_multi_extraction(raw))
+
+    def test_multi_benign_title_kept(self) -> None:
+        raw = {"tasks": [
+            {"is_task": True, "title": "OK task", "due": None, "priority": "normal"},
+        ]}
+        out = validate_multi_extraction(raw)
+        self.assertIsNotNone(out)
+        self.assertEqual(out["tasks"][0]["title"], "OK task")
+
+
+class PromptNoEchoCredentialsTest(unittest.TestCase):
+    """プロンプトにクレデンシャル非エコー指示が含まれる。"""
+
+    def test_single_prompt_instructs_no_echo(self) -> None:
+        prompt = build_extraction_prompt(datetime(2026, 7, 3, 10, 0, tzinfo=JST))
+        self.assertIn("クレデンシャル", prompt)
+        self.assertIn("転写・引用", prompt)
+
+    def test_multi_prompt_instructs_no_echo(self) -> None:
+        prompt = build_multi_extraction_prompt(datetime(2026, 7, 3, 10, 0, tzinfo=JST))
+        self.assertIn("クレデンシャル", prompt)
+        self.assertIn("転写・引用", prompt)
 
 
 if __name__ == "__main__":

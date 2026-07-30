@@ -1720,7 +1720,7 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
             return
         tz = ZoneInfo(state.tasks_timezone)
         due_at = extracted["due_at"]
-        granularity = "datetime" if due_at is not None else None
+        granularity = extracted.get("due_granularity")
         due_str = make_due_summary(due_at, tz)
         prio = extracted["priority"]
         view = TaskConfirmView(

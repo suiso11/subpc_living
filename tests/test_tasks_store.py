@@ -336,5 +336,447 @@ class TaskStoreTest(unittest.TestCase):
         self.assertEqual(self.store.claim_due_notifications("o", self.now), [])
 
 
+class TaskCandidateStoreTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.db_path = str(Path(self._tmp.name) / "tasks.db")
+        self.store = TaskStore(db_path=self.db_path, timezone_name="Asia/Tokyo").initialize()
+        self.addCleanup(self.store.close)
+        self.now = datetime(2026, 7, 3, 3, 0, tzinfo=UTC)  # JST 12:00
+
+    # --- create / list / get ---
+
+    def test_create_returns_id_and_lists_pending(self) -> None:
+        cid = self.store.create_candidate(
+            title="レポートを書く",
+            due_at=self.now + timedelta(days=1),
+            priority="high",
+            source="chat",
+            now=self.now,
+        )
+        self.assertIsNotNone(cid)
+        pending = self.store.list_candidates("pending")
+        self.assertEqual([c["id"] for c in pending], [cid])
+        got = self.store.get_candidate(cid)
+        self.assertEqual(got["title"], "レポートを書く")
+        self.assertEqual(got["status"], "pending")
+        self.assertEqual(got["priority"], "high")
+        self.assertIsNone(got["task_id"])
+        self.assertIsNone(got["decided_at"])
+        # registered candidate may follow the normal task_events not being polluted
+        self.assertEqual(self.store.events(limit=1000), [])
+
+    def test_create_validates_title(self) -> None:
+        with self.assertRaises(ValueError):
+            self.store.create_candidate(title="  ", now=self.now)
+
+    def test_create_rejects_sensitive_title_at_store_boundary(self) -> None:
+        with self.assertRaises(ValueError):
+            self.store.create_candidate(title="password=short", now=self.now)
+
+    def test_create_normalizes_invalid_priority_and_source(self) -> None:
+        cid = self.store.create_candidate(
+            title="x", priority="xxx", source="unknown", now=self.now
+        )
+        c = self.store.get_candidate(cid)
+        self.assertEqual(c["priority"], "normal")
+        self.assertEqual(c["source"], "chat")
+
+    def test_create_nfkc_equivalence_dedups(self) -> None:
+        # 半角/全角・結合文字は NFKC で同じ指紋になるはず。
+        cid1 = self.store.create_candidate(title="ﾚﾎﾟｰﾄ", now=self.now)
+        cid2 = self.store.create_candidate(title="レポート", now=self.now)
+        self.assertEqual(cid1, cid2)
+        self.assertEqual(len(self.store.list_candidates("pending")), 1)
+
+    # --- dedup ---
+
+    def test_create_dedups_pending_same_source(self) -> None:
+        cid1 = self.store.create_candidate(
+            title="掃除", due_at=self.now + timedelta(days=1), priority="normal", source="voice",
+            now=self.now,
+        )
+        cid2 = self.store.create_candidate(
+            title="掃除", due_at=self.now + timedelta(days=1), priority="normal", source="voice",
+            now=self.now,
+        )
+        self.assertEqual(cid1, cid2)
+        self.assertEqual(len(self.store.list_candidates("pending")), 1)
+
+    def test_create_dedups_pending_different_source(self) -> None:
+        cid1 = self.store.create_candidate(
+            title="掃除", due_at=self.now + timedelta(days=1), priority="normal", source="chat",
+            now=self.now,
+        )
+        cid2 = self.store.create_candidate(
+            title="掃除", due_at=self.now + timedelta(days=1), priority="normal", source="voice",
+            now=self.now,
+        )
+        self.assertEqual(cid1, cid2)
+
+    def test_create_does_not_dedup_equivalent_different_due_only(self) -> None:
+        c1 = self.store.create_candidate(title="掃除", due_at=self.now + timedelta(days=1), now=self.now)
+        c2 = self.store.create_candidate(title="掃除", due_at=self.now + timedelta(days=2), now=self.now)
+        self.assertNotEqual(c1, c2)
+        self.assertEqual(len(self.store.list_candidates("pending")), 2)
+
+    def test_create_does_not_dedup_different_granularity_only(self) -> None:
+        # 同 title/due/priority でも granularity が違う候補は別の指紋。
+        due = self.now + timedelta(days=1)
+        c1 = self.store.create_candidate(
+            title="掃除", due_at=due, due_granularity="datetime", priority="normal",
+            source="chat", now=self.now,
+        )
+        c2 = self.store.create_candidate(
+            title="掃除", due_at=due, due_granularity="date", priority="normal",
+            source="chat", now=self.now,
+        )
+        self.assertNotEqual(c1, c2)
+        self.assertEqual(len(self.store.list_candidates("pending")), 2)
+        self.assertEqual(self.store.get_candidate(c1)["due_granularity"], "datetime")
+        self.assertEqual(self.store.get_candidate(c2)["due_granularity"], "date")
+
+    # --- suppression ---
+
+    def test_create_suppressed_within_30_days_after_accept(self) -> None:
+        # 候補受入直後に同一指紋 (granularity 含む) で送り直しても抑制される。
+        cid = self.store.create_candidate(
+            title="掃除", due_at=self.now + timedelta(days=1),
+            due_granularity="datetime", priority="normal", now=self.now,
+        )
+        tid, created = self.store.accept_candidate(cid, now=self.now)
+        self.assertTrue(created)
+        result = self.store.create_candidate(
+            title="掃除", due_at=self.now + timedelta(days=1),
+            due_granularity="datetime", priority="normal", now=self.now,
+        )
+        self.assertIsNone(result)  # 抑制
+        self.assertEqual(len(self.store.list_candidates("pending")), 0)
+        self.assertEqual(len(self.store.list_candidates("accepted")), 1)
+
+    def test_create_suppressed_within_30_days_after_dismiss(self) -> None:
+        cid = self.store.create_candidate(
+            title="掃除", due_at=self.now + timedelta(days=1),
+            due_granularity="datetime", priority="normal", now=self.now,
+        )
+        self.assertTrue(self.store.dismiss_candidate(cid, now=self.now))
+        result = self.store.create_candidate(
+            title="掃除", due_at=self.now + timedelta(days=1),
+            due_granularity="datetime", priority="normal",
+            now=self.now + timedelta(days=29),
+        )
+        self.assertIsNone(result)  # 29日後は抑制
+        self.assertEqual(len(self.store.list_candidates("pending")), 0)
+
+    def test_create_suppressed_at_exactly_30_days_after_accept(self) -> None:
+        # ちょうど30日後でも、cutoff (now - 30日) と decided_at が同じ時刻なので
+        # decided_at >= cutoff が成立して抑制される。
+        cid = self.store.create_candidate(
+            title="掃除", due_at=self.now + timedelta(days=1),
+            due_granularity="datetime", priority="normal", now=self.now,
+        )
+        self.store.accept_candidate(cid, now=self.now)
+        later = self.now + timedelta(days=30)
+        result = self.store.create_candidate(
+            title="掃除", due_at=self.now + timedelta(days=1),
+            due_granularity="datetime", priority="normal", now=later,
+        )
+        self.assertIsNone(result)  # ちょうど30日 = 抑制
+        self.assertEqual(len(self.store.list_candidates("pending")), 0)
+
+    def test_create_allowed_just_beyond_30_days_after_accept(self) -> None:
+        # 30日 + 1秒 では cutoff が decided_at を超えるので抑制されない。
+        cid = self.store.create_candidate(
+            title="掃除", due_at=self.now + timedelta(days=1),
+            due_granularity="datetime", priority="normal", now=self.now,
+        )
+        self.store.accept_candidate(cid, now=self.now)
+        later = self.now + timedelta(days=30, seconds=1)
+        result = self.store.create_candidate(
+            title="掃除", due_at=self.now + timedelta(days=1),
+            due_granularity="datetime", priority="normal", now=later,
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(len(self.store.list_candidates("pending")), 1)
+        self.assertEqual(len(self.store.list_candidates("accepted")), 1)
+
+    def test_create_suppressed_at_exactly_30_days_after_dismiss(self) -> None:
+        cid = self.store.create_candidate(
+            title="掃除", due_at=self.now + timedelta(days=1),
+            due_granularity="datetime", priority="normal", now=self.now,
+        )
+        self.assertTrue(self.store.dismiss_candidate(cid, now=self.now))
+        later = self.now + timedelta(days=30)
+        result = self.store.create_candidate(
+            title="掃除", due_at=self.now + timedelta(days=1),
+            due_granularity="datetime", priority="normal", now=later,
+        )
+        self.assertIsNone(result)
+        self.assertEqual(len(self.store.list_candidates("pending")), 0)
+
+    def test_create_allowed_just_beyond_30_days_after_dismiss(self) -> None:
+        cid = self.store.create_candidate(
+            title="掃除", due_at=self.now + timedelta(days=1),
+            due_granularity="datetime", priority="normal", now=self.now,
+        )
+        self.assertTrue(self.store.dismiss_candidate(cid, now=self.now))
+        later = self.now + timedelta(days=30, seconds=1)
+        result = self.store.create_candidate(
+            title="掃除", due_at=self.now + timedelta(days=1),
+            due_granularity="datetime", priority="normal", now=later,
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(len(self.store.list_candidates("pending")), 1)
+        self.assertEqual(len(self.store.list_candidates("dismissed")), 1)
+
+    # --- accept ---
+
+    def test_accept_creates_regular_task_and_updates_candidate(self) -> None:
+        cid = self.store.create_candidate(
+            title="レポート", due_at=self.now + timedelta(days=1), priority="high",
+            source="chat", now=self.now,
+        )
+        fired: list[tuple[int, str]] = []
+        self.store.on_change = lambda i, e: fired.append((i, e))
+        tid, created = self.store.accept_candidate(cid, now=self.now)
+        self.assertTrue(created)
+        self.assertGreater(tid, 0)
+        # regular task
+        task = self.store.get(tid)
+        self.assertIsNotNone(task)
+        self.assertEqual(task["title"], "レポート")
+        self.assertEqual(task["priority"], "high")
+        self.assertEqual(task["status"], "open")
+        self.assertEqual(task["source"], "chat")
+        self.assertEqual(task["due_granularity"], "datetime")
+        self.assertTrue(task["action_hint"])
+        self.assertGreaterEqual(len(task["steps"]), 1)
+        # candidate updated
+        cand = self.store.get_candidate(cid)
+        self.assertEqual(cand["status"], "accepted")
+        self.assertEqual(cand["task_id"], tid)
+        self.assertIsNotNone(cand["decided_at"])
+        # exactly one on_change fire, exactly one event log entry
+        self.assertEqual(fired, [(tid, "accept")])
+        evs = self.store.events(task_id=tid)
+        self.assertEqual(len(evs), 1)
+        self.assertEqual(evs[0]["event"], "accept")
+
+    def test_accept_idempotent_repeat(self) -> None:
+        cid = self.store.create_candidate(title="x", now=self.now)
+        tid, created1 = self.store.accept_candidate(cid, now=self.now)
+        self.assertTrue(created1)
+        tid2, created2 = self.store.accept_candidate(cid, now=self.now)
+        self.assertFalse(created2)
+        self.assertEqual(tid, tid2)
+        # no second regular task
+        self.assertEqual(len(self.store.list("open", limit=1000)), 1)
+        self.assertEqual(len(self.store.list_candidates("accepted")), 1)
+
+    def test_accept_idempotent_under_concurrency(self) -> None:
+        cid = self.store.create_candidate(title="x", now=self.now)
+        store2 = TaskStore(db_path=self.db_path, timezone_name="Asia/Tokyo").initialize()
+        try:
+            fired1: list[tuple[int, str]] = []
+            fired2: list[tuple[int, str]] = []
+            self.store.on_change = lambda i, e: fired1.append((i, e))
+            store2.on_change = lambda i, e: fired2.append((i, e))
+            t1, c1 = self.store.accept_candidate(cid, now=self.now)
+            t2, c2 = store2.accept_candidate(cid, now=self.now)
+            # exactly one created; second is no-op returning same task id
+            self.assertNotEqual(c1, c2)
+            self.assertEqual(t1, t2)
+            self.assertEqual(len(self.store.list("open", limit=1000)), 1)
+            self.assertEqual(fired1 + fired2, [(t1, "accept")])
+        finally:
+            store2.close()
+
+    def test_accept_dismissed_conflicts(self) -> None:
+        cid = self.store.create_candidate(title="x", now=self.now)
+        self.assertTrue(self.store.dismiss_candidate(cid, now=self.now))
+        with self.assertRaises(ValueError):
+            self.store.accept_candidate(cid, now=self.now)
+
+    def test_accept_unknown_candidate_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            self.store.accept_candidate(9999, now=self.now)
+
+    def test_accept_task_inherits_candidate_source(self) -> None:
+        cid = self.store.create_candidate(title="x", source="voice", now=self.now)
+        tid, _ = self.store.accept_candidate(cid, now=self.now)
+        self.assertEqual(self.store.get(tid)["source"], "voice")
+
+    def test_accept_preserves_date_granularity(self) -> None:
+        # date 粒度の候補を受け入れた場合、生成タスクも date 粒度を保持する。
+        due = self.now + timedelta(days=2)
+        cid = self.store.create_candidate(
+            title="定例会議", due_at=due, due_granularity="date",
+            priority="normal", source="chat", now=self.now,
+        )
+        cand = self.store.get_candidate(cid)
+        self.assertEqual(cand["due_granularity"], "date")
+        tid, created = self.store.accept_candidate(cid, now=self.now)
+        self.assertTrue(created)
+        task = self.store.get(tid)
+        self.assertEqual(task["due_granularity"], "date")
+        self.assertEqual(task["due_at"], due)
+
+    def test_accept_without_due_has_null_granularity(self) -> None:
+        # due_at が無い候補を受け入れた場合、タスクの granularity は NULL となる。
+        cid = self.store.create_candidate(title="期限なし", now=self.now)
+        tid, _ = self.store.accept_candidate(cid, now=self.now)
+        task = self.store.get(tid)
+        self.assertIsNone(task["due_at"])
+        self.assertIsNone(task["due_granularity"])
+
+    def test_create_candidate_infers_datetime_when_omitted(self) -> None:
+        # 旧呼び出し側との後方互換: due_at を渡して granularity 省略時に datetime。
+        cid = self.store.create_candidate(
+            title="掃除", due_at=self.now + timedelta(days=1), now=self.now
+        )
+        cand = self.store.get_candidate(cid)
+        self.assertEqual(cand["due_granularity"], "datetime")
+        # 暗黙 datetime と明示 datetime は同一指紋 → dedup
+        cid2 = self.store.create_candidate(
+            title="掃除", due_at=self.now + timedelta(days=1),
+            due_granularity="datetime", now=self.now,
+        )
+        self.assertEqual(cid, cid2)
+
+    def test_accept_candidate_does_not_create_notification_storm(self) -> None:
+        cid = self.store.create_candidate(
+            title="x", due_at=self.now + timedelta(days=1), now=self.now
+        )
+        tid, _ = self.store.accept_candidate(cid, now=self.now)
+        with self.store._tx() as conn:
+            n = conn.execute(
+                "SELECT COUNT(*) AS c FROM task_notifications WHERE task_id = ?", (tid,)
+            ).fetchone()["c"]
+        self.assertEqual(n, 1)
+
+    # --- dismiss ---
+
+    def test_dismiss_pending_returns_true_then_idempotent_false(self) -> None:
+        cid = self.store.create_candidate(title="x", now=self.now)
+        self.assertTrue(self.store.dismiss_candidate(cid, now=self.now))
+        self.assertFalse(self.store.dismiss_candidate(cid, now=self.now))  # already dismissed
+        cand = self.store.get_candidate(cid)
+        self.assertEqual(cand["status"], "dismissed")
+        self.assertIsNotNone(cand["decided_at"])
+
+    def test_dismiss_does_not_fire_on_change(self) -> None:
+        cid = self.store.create_candidate(title="x", now=self.now)
+        fired: list[tuple[int, str]] = []
+        self.store.on_change = lambda i, e: fired.append((i, e))
+        self.assertTrue(self.store.dismiss_candidate(cid, now=self.now))
+        self.assertFalse(self.store.dismiss_candidate(cid, now=self.now))
+        self.assertEqual(fired, [])
+
+    def test_dismiss_conflicts_with_accepted(self) -> None:
+        cid = self.store.create_candidate(title="x", now=self.now)
+        self.store.accept_candidate(cid, now=self.now)
+        with self.assertRaises(ValueError):
+            self.store.dismiss_candidate(cid, now=self.now)
+
+    def test_dismiss_unknown_candidate_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            self.store.dismiss_candidate(9999, now=self.now)
+
+    # --- migration / legacy compatibility ---
+
+    def test_candidate_table_created_on_legacy_db(self) -> None:
+        """候補テーブルが無い古いDBを初期化しても壊さず候補テーブルが作られる。"""
+        legacy_path = str(Path(self._tmp.name) / "legacy.db")
+        conn = sqlite3.connect(legacy_path)
+        conn.execute(
+            """CREATE TABLE tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, note TEXT,
+                action_hint TEXT, due_at TEXT, due_granularity TEXT,
+                priority TEXT NOT NULL DEFAULT 'normal', status TEXT NOT NULL DEFAULT 'open',
+                source TEXT NOT NULL DEFAULT 'command', created_at TEXT NOT NULL,
+                completed_at TEXT, breakdown_json TEXT NOT NULL DEFAULT '[]'
+            )"""
+        )
+        conn.execute(
+            "INSERT INTO tasks (title, status, source, created_at) VALUES (?, 'open', 'command', ?)",
+            ("旧タスク", self.now.isoformat()),
+        )
+        conn.commit()
+        conn.close()
+
+        legacy = TaskStore(legacy_path, timezone_name="Asia/Tokyo").initialize()
+        try:
+            # existing tasks still readable
+            self.assertEqual(legacy.get(1)["title"], "旧タスク")
+            # candidate Inbox available
+            cid = legacy.create_candidate(title="新候補", now=self.now)
+            self.assertIsNotNone(cid)
+            self.assertEqual(len(legacy.list_candidates("pending")), 1)
+        finally:
+            legacy.close()
+
+    def test_candidate_table_migrates_legacy_due_granularity(self) -> None:
+        """due_granularity カラム無しの task_candidates 旧DBを壊さずに ALTER する。"""
+        legacy_path = str(Path(self._tmp.name) / "legacy_cand.db")
+        conn = sqlite3.connect(legacy_path)
+        conn.execute(
+            """CREATE TABLE tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, note TEXT,
+                action_hint TEXT, due_at TEXT, due_granularity TEXT,
+                priority TEXT NOT NULL DEFAULT 'normal', status TEXT NOT NULL DEFAULT 'open',
+                source TEXT NOT NULL DEFAULT 'command', created_at TEXT NOT NULL,
+                completed_at TEXT, breakdown_json TEXT NOT NULL DEFAULT '[]'
+            )"""
+        )
+        # due_granularity カラム無しの候補テーブル (本変更より前のスキーマ)
+        conn.execute(
+            """CREATE TABLE task_candidates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                title TEXT NOT NULL,
+                due_at TEXT,
+                priority TEXT NOT NULL DEFAULT 'normal',
+                status TEXT NOT NULL DEFAULT 'pending',
+                task_id INTEGER,
+                created_at TEXT NOT NULL,
+                decided_at TEXT
+            )"""
+        )
+        conn.execute(
+            "INSERT INTO task_candidates (source, fingerprint, title, due_at, priority, "
+            "status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)",
+            ("chat", "fp0", "旧候補", "2026-08-01T00:00:00+00:00",
+             "normal", "2026-07-01T00:00:00+00:00"),
+        )
+        conn.commit()
+        conn.close()
+
+        legacy = TaskStore(legacy_path, timezone_name="Asia/Tokyo").initialize()
+        try:
+            # 旧行は datetime 粒度と新fingerprintへ移行される。
+            cand = legacy.list_candidates("pending")[0]
+            self.assertEqual(cand["title"], "旧候補")
+            self.assertEqual(cand["due_granularity"], "datetime")
+            duplicate = legacy.create_candidate(
+                title="旧候補", due_at=datetime(2026, 8, 1, tzinfo=UTC),
+                due_granularity="datetime", priority="normal", now=self.now,
+            )
+            self.assertEqual(duplicate, cand["id"])
+            # 受け入れでも datetime を維持する
+            tid, created = legacy.accept_candidate(cand["id"], now=self.now)
+            self.assertTrue(created)
+            self.assertEqual(legacy.get(tid)["due_granularity"], "datetime")
+            # 新規候補は due_granularity を保存する
+            cid = legacy.create_candidate(
+                title="新候補", due_at=self.now + timedelta(days=1),
+                due_granularity="date", now=self.now,
+            )
+            self.assertEqual(legacy.get_candidate(cid)["due_granularity"], "date")
+        finally:
+            legacy.close()
+
+
 if __name__ == "__main__":
     unittest.main()

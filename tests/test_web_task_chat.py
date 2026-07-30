@@ -38,8 +38,11 @@ class WebTaskChatTest(unittest.TestCase):
         task_branch = source.index("task_reply = await asyncio.to_thread", websocket_start)
         event_branch = source.index("event_reply = await asyncio.to_thread", websocket_start)
         llm_branch = source.index("token_queue = llm.generate_stream_queue", websocket_start)
+        candidate_branch = source.index("_launch_task_candidate_offer(", llm_branch)
         self.assertLess(task_branch, event_branch)
         self.assertLess(task_branch, llm_branch)
+        self.assertLess(event_branch, llm_branch)
+        self.assertLess(llm_branch, candidate_branch)
 
     def test_task_reply_branch_passes_store_memory_false(self) -> None:
         """task_reply ブランチだけ _send_direct_chat_reply に store_memory=False を渡す。"""

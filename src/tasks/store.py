@@ -12,9 +12,11 @@ src/monitor/storage.py の WAL パターンを踏襲する。
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import threading
+import unicodedata
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -22,6 +24,7 @@ from typing import Any, Callable, Iterable, Optional
 from zoneinfo import ZoneInfo
 
 from src.tasks.decomposer import decompose_task
+from src.tasks.safety import is_sensitive_text
 
 UTC = timezone.utc
 DEFAULT_TZ = "Asia/Tokyo"
@@ -30,6 +33,9 @@ VALID_PRIORITY = ("high", "normal", "low")
 VALID_STATUS = ("open", "done", "dropped")
 VALID_GRANULARITY = ("date", "datetime")
 VALID_SOURCE = ("command", "chat", "voice", "context_menu", "board", "web")
+VALID_CANDIDATE_STATUS = ("pending", "accepted", "dismissed")
+# 受け入れ/却下済み候補と等価な候補の再送信を抑制する日数。
+CANDIDATE_SUPPRESS_DAYS = 30
 
 # priority の並び順 (数値が小さいほど優先)
 _PRIORITY_RANK = {"high": 0, "normal": 1, "low": 2}
@@ -177,10 +183,40 @@ class TaskStore:
                 )
                 """
             )
+            # --- タスク候補 Inbox ---
+            # 抽出器 (Discord/Web/音声) が提案する未確定タスクを置く場所。
+            # 生の会話テキストは一切保存しない。title+due+priority を NFKC 正規化して
+            # SHA-256 指紋を取り、同指紋の pending 重複と 30 日以内の accepted/dismissed
+            # を抑制する。
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS task_candidates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    due_at TEXT,
+                    due_granularity TEXT,
+                    priority TEXT NOT NULL DEFAULT 'normal',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    task_id INTEGER,
+                    created_at TEXT NOT NULL,
+                    decided_at TEXT,
+                    FOREIGN KEY (task_id) REFERENCES tasks (id) ON DELETE SET NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_candidates_fp_status "
+                "ON task_candidates (fingerprint, status)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_candidates_status_created "
+                "ON task_candidates (status, created_at)"
+            )
             self._migrate(conn)
 
-    @staticmethod
-    def _migrate(conn: sqlite3.Connection) -> None:
+    def _migrate(self, conn: sqlite3.Connection) -> None:
         """既存DBを壊さずにカラムを追加する冪等マイグレーション。"""
         cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
         if "calendar_event_id" not in cols:
@@ -189,6 +225,30 @@ class TaskStore:
             conn.execute("ALTER TABLE tasks ADD COLUMN calendar_synced_at TEXT")
         if "breakdown_json" not in cols:
             conn.execute("ALTER TABLE tasks ADD COLUMN breakdown_json TEXT NOT NULL DEFAULT '[]'")
+        # task_candidates は CREATE TABLE IF NOT EXISTS で新規DBには due_granularity 付きで
+        # 作られる。旧DBに同テーブルが既に存在してカラム無しの場合だけ ALTER する。
+        # テーブル自体が無い場合は上の CREATE で新スキーマが作られているので何もしない。
+        cand_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_candidates)").fetchall()
+        }
+        if cand_cols and "due_granularity" not in cand_cols:
+            conn.execute("ALTER TABLE task_candidates ADD COLUMN due_granularity TEXT")
+            # 旧fingerprintは granularity を含まない。全旧行を同じ新規則へ移し、
+            # pending重複・accepted/dismissedの30日抑制をアップグレード後も維持する。
+            rows = conn.execute(
+                "SELECT id, title, due_at, priority FROM task_candidates"
+            ).fetchall()
+            for row in rows:
+                due_at = from_iso(row["due_at"])
+                granularity = "datetime" if due_at is not None else None
+                priority = row["priority"] if row["priority"] in VALID_PRIORITY else "normal"
+                fingerprint = self._candidate_fingerprint(
+                    str(row["title"]), due_at, priority, granularity
+                )
+                conn.execute(
+                    "UPDATE task_candidates SET due_granularity = ?, fingerprint = ? WHERE id = ?",
+                    (granularity, fingerprint, int(row["id"])),
+                )
 
     # --- 内部ユーティリティ ---
 
@@ -771,6 +831,229 @@ class TaskStore:
             }
             for r in rows
         ]
+
+    # --- タスク候補 Inbox ---
+
+    @staticmethod
+    def _candidate_fingerprint(
+        title: str,
+        due_at: Optional[datetime],
+        priority: str,
+        due_granularity: Optional[str],
+    ) -> str:
+        """NFKC 正規化した title+due+priority+due_granularity の SHA-256 指紋を返す。
+        生の会話テキストは含めず、候補の等価性判定だけに使う。
+        """
+        norm_title = unicodedata.normalize("NFKC", title)
+        norm_due = unicodedata.normalize("NFKC", to_iso(due_at) or "")
+        norm_prio = unicodedata.normalize("NFKC", priority)
+        norm_gran = unicodedata.normalize("NFKC", due_granularity or "")
+        payload = f"{norm_title}|{norm_due}|{norm_prio}|{norm_gran}"
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _row_to_candidate(row: sqlite3.Row) -> dict:
+        return {
+            "id": int(row["id"]),
+            "source": row["source"],
+            "fingerprint": row["fingerprint"],
+            "title": row["title"],
+            "due_at": from_iso(row["due_at"]),
+            "due_granularity": row["due_granularity"],
+            "priority": row["priority"],
+            "status": row["status"],
+            "task_id": row["task_id"],
+            "created_at": from_iso(row["created_at"]),
+            "decided_at": from_iso(row["decided_at"]),
+        }
+
+    def create_candidate(
+        self,
+        *,
+        title: str,
+        due_at: Optional[datetime] = None,
+        due_granularity: Optional[str] = None,
+        priority: str = "normal",
+        source: str = "chat",
+        now: Optional[datetime] = None,
+    ) -> Optional[int]:
+        """タスク候補を Inbox に追加する。
+
+        - title は NFKC 正規化して保存する (生の会話テキストは保存しない)。
+        - due_granularity は due_at があるときだけ意味を持つ。未指定の場合は
+          'datetime' とみなして指紋・保存する (旧呼び出し側との後方互換)。
+          due_at が無ければ granularity は保存しない (NULL)。
+        - 同指紋の pending 候補が既に存在すれば、新規作成せずにその id を返す (重複抑制)。
+        - 直近30日以内に同じ指紋の accepted/dismissed 候補が存在すれば、新規作成を
+          抑制して None を返す。
+        戻り値: 新規作成候補 id、dedup で既存を使った場合その id、抑制された場合は None。
+        """
+        norm_title = unicodedata.normalize("NFKC", (title or "").strip())[:200]
+        if not norm_title:
+            raise ValueError("title は必須です")
+        if is_sensitive_text(norm_title):
+            raise ValueError("秘密情報を含む候補は保存できません")
+        if priority not in VALID_PRIORITY:
+            priority = "normal"
+        if source not in VALID_SOURCE:
+            source = "chat"
+        if due_at is not None and due_granularity not in VALID_GRANULARITY:
+            due_granularity = "datetime"
+        elif due_at is None:
+            due_granularity = None
+        fingerprint = self._candidate_fingerprint(norm_title, due_at, priority, due_granularity)
+        now = now or utc_now()
+        now_iso = to_iso(now)
+        with self._tx(immediate=True) as conn:
+            # 同指紋の pending 候補があれば dedup (同一/横断どちらも既存を使う)
+            existing = conn.execute(
+                "SELECT id FROM task_candidates WHERE fingerprint = ? AND status = 'pending' "
+                "ORDER BY id DESC LIMIT 1",
+                (fingerprint,),
+            ).fetchone()
+            if existing is not None:
+                return int(existing["id"])
+            # 30日以内に accepted/dismissed の同指紋候補があれば抑制
+            cutoff_iso = to_iso(now - timedelta(days=CANDIDATE_SUPPRESS_DAYS))
+            decided = conn.execute(
+                "SELECT id FROM task_candidates "
+                "WHERE fingerprint = ? AND status IN ('accepted','dismissed') "
+                "AND decided_at IS NOT NULL AND decided_at >= ? "
+                "ORDER BY id DESC LIMIT 1",
+                (fingerprint, cutoff_iso),
+            ).fetchone()
+            if decided is not None:
+                return None
+            cur = conn.execute(
+                """
+                INSERT INTO task_candidates
+                    (source, fingerprint, title, due_at, due_granularity,
+                     priority, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+                """,
+                (source, fingerprint, norm_title, to_iso(due_at), due_granularity,
+                 priority, now_iso),
+            )
+            return int(cur.lastrowid)
+
+    def list_candidates(self, status: str = "pending", limit: int = 100) -> list[dict]:
+        """指定 status の候補を新しい順に最大 limit 件返す。"""
+        conn = self._require()
+        with self._lock:
+            rows = conn.execute(
+                "SELECT * FROM task_candidates WHERE status = ? ORDER BY id DESC LIMIT ?",
+                (status, limit),
+            ).fetchall()
+        return [self._row_to_candidate(r) for r in rows]
+
+    def get_candidate(self, candidate_id: int) -> Optional[dict]:
+        conn = self._require()
+        with self._lock:
+            row = conn.execute(
+                "SELECT * FROM task_candidates WHERE id = ?",
+                (candidate_id,),
+            ).fetchone()
+        return self._row_to_candidate(row) if row else None
+
+    def accept_candidate(
+        self,
+        candidate_id: int,
+        *,
+        now: Optional[datetime] = None,
+    ) -> tuple[Optional[int], bool]:
+        """候補を受け入れ、通常タスクを1件作成する。
+
+        - pending 候補: 新規に task/notification/breakdown を1つずつ作り、
+          task_events に 'accept' を1件記録し、候補を status='accepted' に更新する。
+          トランザクションコミット後に on_change を1回だけ発火する。
+        - 既に accepted: 既存の task_id と created=False を返す (冪等・再作成しない)。
+        - dismissed: ValueError を送出する (却下済との衝突)。
+        戻り値: (task_id, created)。created=False は on_change を発火しない。
+        """
+        now = now or utc_now()
+        now_iso = to_iso(now)
+        task_id: int
+        created: bool
+        with self._tx(immediate=True) as conn:
+            row = conn.execute(
+                "SELECT * FROM task_candidates WHERE id = ?",
+                (candidate_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"候補 {candidate_id} が見つかりません")
+            status = row["status"]
+            if status == "accepted":
+                return (int(row["task_id"]) if row["task_id"] is not None else None), False
+            if status == "dismissed":
+                raise ValueError("dismissed 済みの候補は受け入れられません")
+            # pending -> 正規タスクを1件作成
+            title = str(row["title"])
+            due_at = from_iso(row["due_at"])
+            priority = row["priority"] if row["priority"] in VALID_PRIORITY else "normal"
+            source = row["source"] if row["source"] in VALID_SOURCE else "chat"
+            due_granularity = row["due_granularity"]
+            if due_at is not None and due_granularity not in VALID_GRANULARITY:
+                due_granularity = "datetime"
+            elif due_at is None:
+                due_granularity = None
+            generated_hint, generated_steps = self._generated_breakdown(title, None, None)
+            breakdown_json = self._encode_breakdown(generated_steps)
+            cur = conn.execute(
+                """
+                INSERT INTO tasks
+                    (title, note, action_hint, due_at, due_granularity,
+                     priority, status, source, created_at, completed_at, breakdown_json)
+                VALUES (?, NULL, ?, ?, ?, ?, 'open', ?, ?, NULL, ?)
+                """,
+                (title, generated_hint, to_iso(due_at), due_granularity,
+                 priority, source, now_iso, breakdown_json),
+            )
+            task_id = int(cur.lastrowid)
+            conn.execute(
+                """
+                INSERT INTO task_notifications
+                    (task_id, last_stage, last_notified_at, next_notify_at,
+                     snoozed_until, repeat_count, lease_owner, lease_until)
+                VALUES (?, NULL, NULL, NULL, NULL, 0, NULL, NULL)
+                """,
+                (task_id,),
+            )
+            self._log_event(conn, task_id, "accept", f"candidate={candidate_id}", now)
+            conn.execute(
+                "UPDATE task_candidates SET status = 'accepted', task_id = ?, decided_at = ? "
+                "WHERE id = ?",
+                (task_id, now_iso, candidate_id),
+            )
+            created = True
+        if created:
+            self._fire_change(task_id, "accept")
+        return task_id, created
+
+    def dismiss_candidate(self, candidate_id: int, *, now: Optional[datetime] = None) -> bool:
+        """候補を却下する。
+
+        - pending: status='dismissed', decided_at=now に更新し、True を返す。
+        - dismissed: 何もせず False を返す (冪等)。
+        - accepted: ValueError を送出する (受け入れ済みとの衝突)。
+        """
+        now = now or utc_now()
+        with self._tx(immediate=True) as conn:
+            row = conn.execute(
+                "SELECT status FROM task_candidates WHERE id = ?",
+                (candidate_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"候補 {candidate_id} が見つかりません")
+            status = row["status"]
+            if status == "accepted":
+                raise ValueError("accepted 済みの候補は却下できません")
+            if status == "dismissed":
+                return False
+            conn.execute(
+                "UPDATE task_candidates SET status = 'dismissed', decided_at = ? WHERE id = ?",
+                (to_iso(now), candidate_id),
+            )
+        return True
 
 
 # --- LLM コンテキスト用フォーマッタ ---

@@ -88,7 +88,7 @@ class HallmarkWebThemeTest(unittest.TestCase):
 
     def test_service_worker_caches_hallmark_revision(self) -> None:
         worker = (STATIC / "service-worker.js").read_text(encoding="utf-8")
-        self.assertIn("subpc-living-v30", worker)
+        self.assertIn("subpc-living-v31", worker)
         self.assertIn("/static/tokens.css", worker)
         self.assertIn("/static/hallmark-theme.css", worker)
         for asset in ("geist-latin.woff2", "instrument-serif-latin.woff2", "jetbrains-mono-latin.woff2", "LICENSES.txt"):
