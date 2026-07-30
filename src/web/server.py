@@ -243,19 +243,27 @@ async def lifespan(app: FastAPI):
         logger.warning("TTS ロード失敗: %s", e)
         tts = None
 
-    # RAG 初期化 (Phase 4)
-    logger.info("[4/7] RAG (長期記憶) 初期化...")
-    try:
-        vector_store = VectorStore(
-            persist_dir=str(PROJECT_ROOT / "data" / "vectordb"),
-        )
-        vector_store.initialize()
-        rag = RAGRetriever(vector_store=vector_store)
-        stats = rag.get_stats()
-        logger.info("✅ RAG OK (会話: %s件, 知識: %s件)", stats['conversations'], stats['knowledge'])
-    except Exception as e:
-        logger.warning("RAG 初期化失敗 (RAGなしで続行): %s", e)
+    # RAG 初期化 (Phase 4)。ネイティブ依存の起動障害時にもWeb UIだけは復旧できるよう、
+    # 明示的なfalseで安全にバイパスできる運用スイッチを持つ。
+    rag_enabled = os.environ.get("WEB_RAG_ENABLED", "true").strip().lower() not in {
+        "0", "false", "no", "off",
+    }
+    if rag_enabled:
+        logger.info("[4/7] RAG (長期記憶) 初期化...")
+        try:
+            vector_store = VectorStore(
+                persist_dir=str(PROJECT_ROOT / "data" / "vectordb"),
+            )
+            vector_store.initialize()
+            rag = RAGRetriever(vector_store=vector_store)
+            stats = rag.get_stats()
+            logger.info("✅ RAG OK (会話: %s件, 知識: %s件)", stats['conversations'], stats['knowledge'])
+        except Exception as e:
+            logger.warning("RAG 初期化失敗 (RAGなしで続行): %s", e)
+            rag = None
+    else:
         rag = None
+        logger.warning("RAG 無効 (WEB_RAG_ENABLED=false)")
 
     # Vision 初期化 (Phase 5)
     logger.info("[5/7] Vision (映像入力) 初期化...")

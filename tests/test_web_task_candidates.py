@@ -174,6 +174,11 @@ class WebTaskCandidateTest(unittest.TestCase):
         conflict = asyncio.run(server.task_candidate_accept(candidate_id))
         self.assertEqual(conflict.status_code, 409)
 
+    def test_rag_startup_has_explicit_recovery_flag(self) -> None:
+        source = Path(server.__file__).read_text(encoding="utf-8")
+        self.assertIn('os.environ.get("WEB_RAG_ENABLED", "true")', source)
+        self.assertIn('logger.warning("RAG 無効 (WEB_RAG_ENABLED=false)")', source)
+
     def test_static_ui_and_done_order_contract(self) -> None:
         root = Path(server.PROJECT_ROOT)
         app = (root / "src/web/static/app.js").read_text(encoding="utf-8")
