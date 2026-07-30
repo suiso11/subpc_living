@@ -1,6 +1,7 @@
-const CACHE_NAME = 'subpc-living-v28';
+const CACHE_NAME = 'subpc-living-v30';
 const STATIC_ASSETS = [
   '/',
+  '/?source=pwa',
   '/tasks',
   '/logs',
   '/achievements',
@@ -21,6 +22,9 @@ const STATIC_ASSETS = [
   '/static/achievements.js',
   '/static/shell-ui.js',
   '/static/favicon.svg',
+  '/static/icon-192.png',
+  '/static/icon-512.png',
+  '/static/icon-maskable-512.png',
   '/static/manifest.json',
 ];
 
@@ -45,6 +49,14 @@ self.addEventListener('fetch', (event) => {
   const url = new URL(request.url);
   if (request.method !== 'GET' || url.origin !== location.origin) return;
   if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/ws/')) return;
+
+  // Query付きnavigationにはタスク名などが含まれ得るため、URLキーを永続保存しない。
+  if (request.mode === 'navigate' && url.search) {
+    event.respondWith(
+      fetch(request).catch(() => caches.match(request).then((cached) => cached || caches.match('/')))
+    );
+    return;
+  }
 
   event.respondWith(
     caches.match(request).then((cached) => {

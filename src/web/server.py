@@ -413,6 +413,20 @@ async def favicon():
     return FileResponse(svg_path, media_type="image/svg+xml")
 
 
+@app.get("/service-worker.js")
+async def service_worker():
+    """PWA workerをルートscopeで配信する。"""
+    worker_path = STATIC_DIR / "service-worker.js"
+    return FileResponse(
+        worker_path,
+        media_type="application/javascript",
+        headers={
+            "Service-Worker-Allowed": "/",
+            "Cache-Control": "no-cache",
+        },
+    )
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
     """メインページ"""

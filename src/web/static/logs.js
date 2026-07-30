@@ -229,9 +229,6 @@ function init() {
     const open = event.target.closest('.history-open[data-file]');
     if (open) openSession(open.dataset.file);
   });
-  if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('/static/service-worker.js').catch(() => {});
-  }
   loadJournal();
 }
 

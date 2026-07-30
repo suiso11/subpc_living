@@ -1,6 +1,12 @@
 (() => {
   'use strict';
 
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/service-worker.js', { scope: '/' }).catch((error) => {
+      console.warn('[PWA] Service worker registration failed:', error);
+    });
+  }
+
   const ROUTES = {
     '1': '/',
     '2': '/tasks',

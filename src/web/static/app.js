@@ -49,6 +49,66 @@ const GAME_PANEL_KEY = 'subpc_game_panel_open';
 let lastClaimableMissions = null;
 let settingsRestoreFocus = null;
 const runtimeStatus = { ollama: null, stt: null, tts: null, rag: null, websocket: 'connecting' };
+const pwaInstallButton = $('#pwa-install-btn');
+const pwaInstallStatus = $('#pwa-install-status');
+let deferredInstallPrompt = null;
+
+function isStandaloneApp() {
+  return window.matchMedia('(display-mode: standalone)').matches
+    || window.navigator.standalone === true;
+}
+
+function setPwaInstallState(message, { action = false, state = 'idle' } = {}) {
+  if (!pwaInstallStatus || !pwaInstallButton) return;
+  const moveFocus = !action && !pwaInstallButton.hidden
+    && settingsPanel?.classList.contains('open');
+  pwaInstallStatus.textContent = message;
+  pwaInstallStatus.dataset.state = state;
+  if (moveFocus) $('#settings-close')?.focus({ preventScroll: true });
+  pwaInstallButton.hidden = !action;
+  pwaInstallButton.disabled = false;
+}
+
+function refreshPwaInstallState() {
+  if (isStandaloneApp()) {
+    setPwaInstallState('この端末にはインストール済みです。', { state: 'success' });
+  } else if (deferredInstallPrompt) {
+    setPwaInstallState('ホーム画面から全画面で起動できます。', { action: true });
+  } else {
+    setPwaInstallState('Chromeの︙メニューから「ホーム画面に追加」も選べます。');
+  }
+}
+
+async function installPwa() {
+  if (!deferredInstallPrompt || !pwaInstallButton || pwaInstallButton.disabled) return;
+  pwaInstallButton.disabled = true;
+  pwaInstallStatus.textContent = 'Androidの確認画面を開いています…';
+  pwaInstallStatus.dataset.state = 'loading';
+  try {
+    await deferredInstallPrompt.prompt();
+    const choice = await deferredInstallPrompt.userChoice;
+    deferredInstallPrompt = null;
+    if (choice.outcome === 'accepted') {
+      setPwaInstallState('ホーム画面へ追加しました。', { state: 'success' });
+    } else {
+      setPwaInstallState('今回は追加しませんでした。Chromeの︙メニューからいつでも追加できます。');
+    }
+  } catch (error) {
+    setPwaInstallState('追加画面を開けませんでした。Chromeの︙メニューから「ホーム画面に追加」を選んでください。', { state: 'error' });
+    console.warn('[PWA] Install prompt failed:', error);
+  }
+}
+
+window.addEventListener('beforeinstallprompt', (event) => {
+  event.preventDefault();
+  deferredInstallPrompt = event;
+  refreshPwaInstallState();
+});
+
+window.addEventListener('appinstalled', () => {
+  deferredInstallPrompt = null;
+  setPwaInstallState('この端末にインストールしました。', { state: 'success' });
+});
 
 function formatCount(value) {
   return Number(value || 0).toLocaleString('ja-JP');
@@ -1161,17 +1221,13 @@ async function init() {
   try { savedGamePanel = localStorage.getItem(GAME_PANEL_KEY) || 'closed'; } catch (e) {}
   setGameOpen(savedGamePanel === 'open');
   voiceSelect.addEventListener('change', changeVoice);
+  pwaInstallButton?.addEventListener('click', installPwa);
+  refreshPwaInstallState();
 
   settingsPanel.addEventListener('keydown', handleSettingsKeydown);
   settingsPanel.addEventListener('click', (e) => {
     if (e.target === settingsPanel) closeSettings();
   });
-
-  if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('/static/service-worker.js').catch((e) => {
-      console.warn('[PWA] Service worker registration failed:', e);
-    });
-  }
 
   // 「やること」の最初の一歩を、現在の会話へ持ち込む。自動送信はせず確認できる状態にする。
   const prompt = new URLSearchParams(window.location.search).get('prompt');

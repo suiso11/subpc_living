@@ -1166,11 +1166,6 @@ function init() {
 
   document.addEventListener('keydown', handleGlobalKeydown);
 
-  if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('/static/service-worker.js').catch((err) => {
-      console.warn('[PWA] Service worker registration failed:', err);
-    });
-  }
 
   loadTasks();
 

@@ -358,6 +358,18 @@ https://haruka-hp-elitedesk-800-g4-twr.tail7f2f23.ts.net
 
 > ℹ️ MagicDNS 名は `tailscale status --json | jq -r '.Self.DNSName'` で確認可能
 
+#### Androidへアプリとして追加
+
+1. AndroidのTailscaleを接続する。
+2. Chromeで上記HTTPS URLを開く。
+3. Web UI右上の設定を開き、**Androidアプリ → この端末に追加**をタップする。
+4. Androidの確認画面で **インストール** を選ぶ。
+5. 以後はホーム画面の **BUDDY** アイコンから全画面で起動する。
+
+インストールボタンが表示されない場合は、Chromeの **︙ → ホーム画面に追加** を選ぶ。
+更新が反映されない場合は、Chromeでページを一度再読み込みしてからアプリを開き直す。
+Tailscale接続中のみサブPCへ到達できるため、外出先でも一般公開せず利用できる。
+
 #### 操作方法
 
 1. **テキスト入力**: メッセージ欄にテキストを入力 → 送信ボタン

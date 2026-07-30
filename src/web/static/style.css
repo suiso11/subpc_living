@@ -243,6 +243,15 @@ button { cursor: pointer; }
 .setting-group { margin-bottom: 16px; }.setting-group label { display: block; margin-bottom: 6px; color: var(--text-dim); font-size: .78rem; }.conn-label { margin: 0 0 6px; color: var(--text-dim); font-size: .78rem; }
 .setting-group select, .conn-info { width: 100%; min-height: 44px; padding: 10px 12px; color: var(--text); background: var(--bg-input); border: 1px solid var(--border-soft); }
 .conn-info { color: var(--text-dim); font-size: .82rem; line-height: 1.7; }.conn-info strong { color: var(--text); }
+.pwa-install-card { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: var(--space-2) var(--space-4); padding-block: var(--space-4); border-block: 1px solid var(--border-soft); }
+.pwa-install-card .conn-label { grid-column: 1 / -1; margin: 0; }
+.pwa-install-status { min-width: 0; margin: 0; color: var(--text-dim); font-size: var(--font-size-small); line-height: 1.55; overflow-wrap: anywhere; }
+.pwa-install-status[data-state="success"] { color: var(--success); }
+.pwa-install-status[data-state="error"] { color: var(--danger); }
+.pwa-install-btn { justify-self: end; }
+.pwa-install-btn:active { transform: translateY(1px); }
+.pwa-install-btn:disabled { opacity: .55; cursor: not-allowed; }
+
 
 /* Auxiliary pages */
 .tasks-page { background: var(--bg); }.task-app { min-height: 100dvh; display: flex; flex-direction: column; }
@@ -293,6 +302,8 @@ button { cursor: pointer; }
   .growth-detail-chart { grid-template-columns: repeat(7, minmax(0, 1fr)); gap: var(--space-2); }
   .growth-day { height: 112px; }
   .growth-day-track { min-height: 54px; }
+  .pwa-install-card { grid-template-columns: minmax(0, 1fr); }
+  .pwa-install-btn { width: 100%; justify-self: stretch; }
   .task-workspace { width: calc(100% - 18px); margin: 10px auto; padding: 16px 10px; }.task-summary, .achievement-overview { grid-template-columns: repeat(2, minmax(0, 1fr)); }.achievement-rank-card { grid-column: 1 / -1; }.achievement-grid { grid-template-columns: 1fr; }.achievement-next { align-items: flex-start; flex-direction: column; }.achievement-next-action { width: 100%; justify-content: space-between; }.achievement-collection { padding: 12px; }.achievement-collection-heading { align-items: flex-start; flex-direction: column; }.achievement-filter { width: 100%; }.achievement-filter-btn { flex: 1; }
   .compose-input-row { flex-wrap: wrap; }.compose-input-row input { flex-basis: 100%; }.task-details-section { grid-template-columns: 1fr; }.task-row { align-items: flex-start; }.task-meta { padding-left: 38px; }.cal-toolbar, .cal-day-head { flex-wrap: wrap; align-items: flex-start; }.cal-toolbar > *, .cal-day-head > * { min-width: 0; }.cal-nav { flex: 1 1 100%; justify-content: space-between; }.cal-toolbar .task-toolbar-actions { width: 100%; justify-content: space-between; flex-wrap: wrap; }.cal-day-head > span:first-child { flex: 1 1 100%; white-space: nowrap; }.cal-day-head-actions { width: 100%; flex-wrap: wrap; }.cal-day-head-actions > * { flex: 1 1 auto; white-space: nowrap; }.cal-event-row { flex-wrap: wrap; }.cal-event-title { min-width: min(100%, 180px); }.cal-event-actions { flex-wrap: wrap; }.cal-cell { min-height: 60px; padding: 4px; }.cal-chip, .cal-more { display: none; }.cal-dots { display: block; }.log-file-meta, .history-meta { white-space: normal; }.site-footer { padding-bottom: max(6px, env(safe-area-inset-bottom)); }
 }
