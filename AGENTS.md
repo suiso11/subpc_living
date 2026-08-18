@@ -5,16 +5,44 @@
 サブPC常駐のパーソナルAIアシスタント。ローカルLLM (Ollama) + STT (faster-whisper) + TTS を
 Web UI・Discord bot・音声パイプラインから使う。
 
-- 仮想環境: `.venv/bin/python`
+- 仮想環境: サブPCでは `.venv/bin/python`
 - テスト: `.venv/bin/python -m unittest discover -s tests -q`
+  - Windows開発機では `python -m unittest discover -s tests/<対象> -t . -q`。
+    全体実行はWindows環境依存のエラーが元から多数出るため、変更範囲だけ回す
 - サービス反映: `systemctl --user restart subpc-discord.service subpc-web.service`
 - 実設定 `config/discord.env` は git 管理外。例は `config/discord.env.example`
 
-## Pi Subagent Orchestration
+## 委譲workerとして起動された場合 (最優先)
 
-開発時の親ランタイムは Pi。通常の探索・テスト・最終レビューは `pi-subagents` の
-named agentへ、実装と機械作業・別モデル視点はOpenCode workerへ委譲する。親は
-計画・分解・高リスク判断・統合・最終確認に専念する。
+親オーケストレーターからブリーフ (指示書) を渡されて起動されたときは、次を守る。
+これは以下のどのオーケストレーション記述よりも優先する。
+
+- **ブリーフが唯一の仕様**。設計の再検討や範囲拡大をしない
+- **ブリーフが列挙した「変更してよいパス」以外を1行も変更しない**。
+  必要になったら停止し、追加スコープを親へ報告する
+- **さらに下位へ再委譲しない**。scout や subagent を起動せず、自分で読んで自分で実装する
+- 読み取り専用と指定されたら、ファイルの作成・編集・削除とgitの書き込み操作を一切しない
+- `git commit` はしない。コミット判断は親とユーザーが行う
+- 自分の成果を自分で「検証済み・レビュー済み」と申告しない。検証と承認は別のエージェントが行う
+- 出力は要点・変更ファイル・検証結果に絞る。長い思考過程やファイル全文を返さない
+
+## 親オーケストレーター
+
+現在の既定は Claude Code (Opus 5) が親。役割分担、委譲ブリーフの要件、
+codex の起動方法 (このWindows機ではサンドボックスが起動できないため
+`--dangerously-bypass-approvals-and-sandbox` が必要) は `CLAUDE.md` に記載する。
+
+| 役 | 実体 | 担当 |
+| --- | --- | --- |
+| 統括 | Claude Code (Opus 5) | 計画、分解、ブリーフ作成、統合、最終判断 |
+| 実装 | `gpt-5.6-sol` (high) | 実装・修正のみ |
+| 検証 | Sonnet 5 (`verifier` サブエージェント) | テスト実行、実測、診断 |
+| レビュー | `gpt-5.6-luna` (high) | 受け入れ条件との独立レビュー |
+
+## Pi Subagent Orchestration (Piを親にする場合)
+
+Pi ランタイムを親にして開発するときだけ適用する。Claude Code や codex が親のときは
+上の「委譲workerとして起動された場合」に従い、この節の委譲ルールは使わない。
 
 OpenCodeを含む統合起動:
 
@@ -34,7 +62,7 @@ scripts/pi_codex_orchestrator.sh
 
 ### 原則
 
-- Claude/Anthropic系には依存しない。親と最終承認は `openai-codex/gpt-5.6-sol`
+- 親と最終承認は `openai-codex/gpt-5.6-sol`
 - 通常探索・テストは `openai-codex/gpt-5.6-terra`
 - 実装の既定バックエンドは OpenCode GLM (`opencode-go/glm-5.2`) を単独で使う。実装用の
   名前付き実装agentは置かない
@@ -77,11 +105,7 @@ named agentでは実装しない。
 Kimiへwrite、本番データ操作、秘密情報、サービス操作を渡さない。Kimi/GLMの結論は最終承認にせず、
 `subpc-reviewer` または親のGPT-5.6 Solが最終判断する。
 
-`opencode_change` は実装の既定ツール。GLMが変更候補を生成し、完了してKimi K3が読み取り専用で
-自動レビューを実施する。PiはKimiの指摘を確認のうえ、最終承認をGPT-5.6 Solへ渡す。
-Kimiは変更を書けず、本番データ・秘密情報・サービス操作にも触らない。
-
-### 委譲プロンプトの要件
+## 委譲プロンプトの要件 (共通)
 
 - machine name、3〜8語のtitle、agent名、目的、関連ファイル、制約、期待出力を必ず含める
 - writeタスクは変更可能ファイルまたはディレクトリを具体的に列挙する。globで広く渡さない
@@ -90,14 +114,12 @@ Kimiは変更を書けず、本番データ・秘密情報・サービス操作�
 - 必要なコード・ログだけを渡し、リポジトリ全体の再読込や同じ調査の重複を避ける
 - 出力は要点、変更ファイル、検証結果に絞らせ、長い思考過程やファイル全文を要求しない
 
-### 委譲後の確認
+## 委譲後の確認 (共通)
 
-- `git diff --stat` と関連テストで結果を検証する
+- `git status --short`、`git diff --stat` と関連テストで結果を検証する
 - 未コミット変更が多い場合はユーザー作業を戻さず、今回触った範囲だけ扱う
-- 実装結果を同じエージェント自身の説明だけで承認しない。`subpc-tester` または
-  `subpc-reviewer` に独立確認させ、オーケストレーターが最終判断する
-- すべてのソース変更は、自動または明示的なKimi K3読み取り専用レビューを経てから
-  GPT-5.6 Solの最終承認へ進める。Kimi単独で承認しない
+- 実装結果を同じエージェント自身の説明だけで承認しない。独立した検証役に確認させ、
+  オーケストレーターが最終判断する
 
 ## Resource Check Before LLM-Heavy Work
 
