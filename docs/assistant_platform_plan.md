@@ -14,8 +14,9 @@
 - [x] `GenerationOptions`とProvider共通例外
 - [x] 既存`OllamaClient`へ委譲する`OllamaProvider`
 - [x] `ProviderRegistry`と決定的`StaticRouter`
-- [ ] `AssistantService`（次アクション）
-- [ ] CLI Adapter移行
+- [x] `AssistantService`
+- [x] CLI Adapter移行
+- [ ] 内部バッチ処理をProvider型へ寄せる（次アクション）
 - [ ] Web、Discord、Voice移行
 - [ ] `ContextBlock`と`ContextPolicy`
 
@@ -474,9 +475,9 @@ Phase J完了前は着手しない。
    既存Clientを変更せず共通Providerへ包む。
 2. **Registry + StaticRouter**（完了）
    まだ単一Local Providerでも、RouteDecisionを値として残す。
-3. **AssistantService + Fakeテスト**（次）
+3. **AssistantService + Fakeテスト**（完了）
    構築済みmessagesを受ける安全な最小Serviceを作る。
-4. **CLI移行**
+4. **CLI移行**（完了）
    最も小さい入口でEnd-to-End経路を確認する。
 
 この4タスクが終わるまで、Web、Discord、Voice、Cloud、LangGraph、3D UIへ広げない。
