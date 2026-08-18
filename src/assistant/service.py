@@ -1,6 +1,7 @@
 """経路選択とProvider fallbackを統合するAssistantサービス。"""
 
 from collections.abc import Callable, Iterable, Iterator, Sequence
+import threading
 import time
 from typing import NoReturn
 
@@ -161,14 +162,23 @@ class StreamResult(Iterable[str]):
         self._options = options
         self._clock = clock
         self._started = False
+        self._closed = False
+        self._state_lock = threading.Lock()
+        self._iterator: Iterator[str] | None = None
         self._response: AssistantResponse | None = None
         self._parts: list[str] = []
 
     def __iter__(self) -> Iterator[str]:
         """候補Providerからtokenを順に返し、正常終了時に応答を確定する。"""
-        if self._started:
-            raise AssistantError("stream already consumed")
-        self._started = True
+        with self._state_lock:
+            if self._started:
+                raise AssistantError("stream already consumed")
+            self._started = True
+            self._iterator = self._iterate()
+            return self._iterator
+
+    def _iterate(self) -> Iterator[str]:
+        """選択済み候補を反復する内部generator。"""
 
         candidates = _candidate_ids(self._decision)
         attempts: list[tuple[str, str]] = []
@@ -202,6 +212,9 @@ class StreamResult(Iterable[str]):
                     **self._options.as_stream_kwargs(),
                 )
                 for chunk in chunks:
+                    with self._state_lock:
+                        if self._closed:
+                            return
                     emitted = True
                     self._parts.append(chunk)
                     yield chunk
@@ -217,15 +230,34 @@ class StreamResult(Iterable[str]):
                     close()
 
             latency_ms = int(max(0.0, self._clock() - started_at) * 1000)
-            self._response = AssistantResponse(
-                text="".join(self._parts),
-                route=_actual_route(self._decision, entry, candidates, attempts),
-                latency_ms=latency_ms,
-                stats=dict(entry.provider.last_stats),
-            )
+            with self._state_lock:
+                if self._closed:
+                    return
+                self._response = AssistantResponse(
+                    text="".join(self._parts),
+                    route=_actual_route(self._decision, entry, candidates, attempts),
+                    latency_ms=latency_ms,
+                    stats=dict(entry.provider.last_stats),
+                )
             return
 
         _raise_generation_error(attempts, last_error)
+
+    def close(self) -> None:
+        """内部generatorを閉じ、以後の反復を停止する。"""
+        with self._state_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._started = True
+            iterator = self._iterator
+
+        if iterator is not None:
+            try:
+                iterator.close()
+            except ValueError:
+                # 別threadで実行中のgeneratorは閉じられないため停止フラグに委ねる。
+                pass
 
     @property
     def response(self) -> AssistantResponse:

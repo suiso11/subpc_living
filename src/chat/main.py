@@ -11,13 +11,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.assistant import AssistantRequest, AssistantService
+from src.assistant.factory import build_local_service
 from src.chat.config import ChatConfig
 from src.chat.session import ChatSession
 from src.chat.web_search import create_web_search_context
 from src.growth.tracker import GrowthTracker
-from src.llm import GenerationOptions, ProviderRegistry
-from src.llm.providers.ollama import OllamaProvider
-from src.llm.routing.static import StaticRouter
+from src.llm import ProviderRegistry
 
 
 # --- ANSI カラーコード ---
@@ -67,24 +66,7 @@ def format_stats(stats: dict) -> str:
 
 def build_cli_service(config, *, provider=None) -> tuple[AssistantService, ProviderRegistry]:
     """CLI用のAssistantサービスとProvider Registryを構築する。"""
-    if provider is None:
-        provider = OllamaProvider(
-            base_url=config.ollama_base_url,
-            model=config.model,
-        )
-
-    registry = ProviderRegistry()
-    registry.register("ollama", provider, local=True)
-    router = StaticRouter(registry, default_provider_id="ollama")
-    options = GenerationOptions(
-        temperature=config.temperature,
-        top_p=config.top_p,
-        top_k=config.top_k,
-        repeat_penalty=config.repeat_penalty,
-        num_ctx=config.num_ctx,
-        num_predict=config.num_predict,
-    )
-    return AssistantService(registry, router, options=options), registry
+    return build_local_service(config, provider=provider)
 
 
 def run_chat_loop(config, session, service, *, read_input=input) -> None:

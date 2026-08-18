@@ -9,6 +9,7 @@ from src.assistant.contracts import (
     AssistantResponse,
 )
 from src.assistant.service import AssistantService, StreamResult
+from src.assistant.stream_queue import QueueStream, stream_to_queue
 
 
 __all__ = [
@@ -19,5 +20,7 @@ __all__ = [
     "AssistantRequest",
     "AssistantResponse",
     "AssistantService",
+    "QueueStream",
     "StreamResult",
+    "stream_to_queue",
 ]
