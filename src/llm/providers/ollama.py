@@ -75,11 +75,11 @@ class OllamaProvider:
             )
         except httpx.TimeoutException as exc:
             raise ProviderTimeoutError(
-                self.provider_id, "generate", "request timed out"
+                self.provider_id, "generate", f"request timed out: {exc!r}"
             ) from exc
         except httpx.HTTPError as exc:
             raise ProviderRequestError(
-                self.provider_id, "generate", "request failed"
+                self.provider_id, "generate", f"request failed: {exc!r}"
             ) from exc
 
     def generate_stream(
@@ -105,11 +105,11 @@ class OllamaProvider:
             )
         except httpx.TimeoutException as exc:
             raise ProviderTimeoutError(
-                self.provider_id, "generate_stream", "request timed out"
+                self.provider_id, "generate_stream", f"request timed out: {exc!r}"
             ) from exc
         except httpx.HTTPError as exc:
             raise ProviderRequestError(
-                self.provider_id, "generate_stream", "request failed"
+                self.provider_id, "generate_stream", f"request failed: {exc!r}"
             ) from exc
 
     @property
