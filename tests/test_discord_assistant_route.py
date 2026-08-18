@@ -142,6 +142,115 @@ class DiscordAssistantRouteTest(unittest.TestCase):
         self.assertIs(state.provider_registry.get("first").provider, provider)
         self.assertIs(state.provider_registry.get("second").provider, provider)
 
+    def test_initialize_profile_caches_builds_all_profiles_and_fixes_cache(self) -> None:
+        default_profile = _profile("default")
+        fast = _profile("fast", base_url="http://ollama", model="shared")
+        strong = _profile("strong", base_url="http://ollama", model="shared")
+        state = DiscordConsoleState()
+        state.llm_profiles = {
+            "default": default_profile,
+            "fast": fast,
+            "strong": strong,
+        }
+
+        with patch(
+            "src.discord_bot.bot.OllamaProvider",
+            side_effect=lambda **kwargs: FakeProvider(model=kwargs["model"]),
+        ) as factory:
+            state.llm = state._llm_for_profile(default_profile)
+            state._initialize_profile_caches()
+            self.assertEqual(factory.call_count, 2)
+            state._initialize_profile_caches()
+            self.assertEqual(factory.call_count, 2)
+
+        self.assertEqual(set(state.assistant_services), {"default", "fast", "strong"})
+        assert state.provider_registry is not None
+        shared = state.provider_registry.get("fast").provider
+        self.assertIs(state.provider_registry.get("strong").provider, shared)
+        self.assertIs(state.llm, state.provider_registry.get("default").provider)
+        self.assertIs(
+            state._service_for_profile(strong), state.assistant_services["strong"]
+        )
+
+    def test_parallel_first_use_of_same_profile_builds_service_once(self) -> None:
+        profile = _profile("fast", base_url="http://ollama", model="shared")
+        state = DiscordConsoleState()
+        state.llm_profiles = {"default": _profile("default"), "fast": profile}
+
+        barrier = threading.Barrier(8)
+        services: list[AssistantService] = []
+        errors: list[Exception] = []
+
+        def _first_use() -> None:
+            barrier.wait()
+            try:
+                services.append(state._service_for_profile(profile))
+            except Exception as e:
+                errors.append(e)
+
+        with patch(
+            "src.discord_bot.bot.OllamaProvider",
+            side_effect=lambda **kwargs: FakeProvider(model=kwargs["model"]),
+        ) as factory:
+            threads = [threading.Thread(target=_first_use) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(services), 8)
+        for service in services:
+            self.assertIs(service, state.assistant_services["fast"])
+        factory.assert_called_once()
+        assert state.provider_registry is not None
+        self.assertIs(
+            state.provider_registry.get("fast").provider,
+            state._llm_providers[("http://ollama", "shared")],
+        )
+
+    def test_parallel_first_use_of_same_endpoint_profiles_shares_one_provider(self) -> None:
+        fast = _profile("fast", base_url="http://ollama", model="shared")
+        strong = _profile("strong", base_url="http://ollama", model="shared")
+        state = DiscordConsoleState()
+        state.llm_profiles = {
+            "default": _profile("default"),
+            "fast": fast,
+            "strong": strong,
+        }
+
+        barrier = threading.Barrier(8)
+        errors: list[Exception] = []
+
+        def _first_use(profile: DiscordLLMProfile) -> None:
+            barrier.wait()
+            try:
+                state._service_for_profile(profile)
+            except Exception as e:
+                errors.append(e)
+
+        with patch(
+            "src.discord_bot.bot.OllamaProvider",
+            side_effect=lambda **kwargs: FakeProvider(model=kwargs["model"]),
+        ) as factory:
+            threads = [
+                threading.Thread(
+                    target=_first_use,
+                    args=(fast if index % 2 == 0 else strong,),
+                )
+                for index in range(8)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+        self.assertEqual(errors, [])
+        factory.assert_called_once()
+        assert state.provider_registry is not None
+        shared = state.provider_registry.get("fast").provider
+        self.assertIs(state.provider_registry.get("strong").provider, shared)
+
     def test_profile_generation_options_reach_each_provider(self) -> None:
         first_profile = _profile(
             "first",

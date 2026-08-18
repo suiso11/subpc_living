@@ -190,6 +190,12 @@ class AssistantServiceTest(unittest.TestCase):
         self.assertIsInstance(raised.exception.__cause__, ProviderRequestError)
         self.assertIn("failing.generate", str(raised.exception.__cause__))
 
+        message = str(raised.exception)
+        self.assertIn("all provider candidates failed", message)
+        self.assertIn("primary=ProviderRequestError", message)
+        self.assertIn("fallback=ProviderRequestError", message)
+        self.assertIn("failing.generate: planned failure", message)
+
     def test_non_local_provider_is_never_called(self) -> None:
         cloud = FakeProvider("cloud")
         fallback = FakeProvider("local")

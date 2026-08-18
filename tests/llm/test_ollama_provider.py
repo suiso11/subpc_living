@@ -5,6 +5,7 @@ from typing import Any
 
 import httpx
 
+from src.chat.client import OllamaResponseError
 from src.llm.contracts import GenerationOptions
 from src.llm.errors import ProviderRequestError, ProviderTimeoutError
 from src.llm.provider import LLMProvider
@@ -117,6 +118,16 @@ class OllamaProviderTest(unittest.TestCase):
         self.assertEqual(raised.exception.operation, "generate")
         self.assertIsInstance(raised.exception.__cause__, httpx.ConnectError)
 
+    def test_generate_response_error_is_normalized_with_cause(self) -> None:
+        self.client.generate_error = OllamaResponseError("bad payload")
+
+        with self.assertRaises(ProviderRequestError) as raised:
+            self.provider.generate([{"role": "user", "content": "hello"}])
+
+        self.assertEqual(raised.exception.provider_id, "local-strong")
+        self.assertEqual(raised.exception.operation, "generate")
+        self.assertIsInstance(raised.exception.__cause__, OllamaResponseError)
+
     def test_stream_error_is_normalized_during_iteration(self) -> None:
         self.client.stream_error = httpx.ConnectError("stream stopped")
         stream = self.provider.generate_stream(
@@ -130,11 +141,41 @@ class OllamaProviderTest(unittest.TestCase):
         self.assertEqual(raised.exception.operation, "generate_stream")
         self.assertIsInstance(raised.exception.__cause__, httpx.ConnectError)
 
+    def test_stream_response_error_is_normalized_during_iteration(self) -> None:
+        self.client.stream_error = OllamaResponseError("bad chunk")
+        stream = self.provider.generate_stream(
+            [{"role": "user", "content": "hello"}]
+        )
+
+        self.assertEqual(next(stream), "first")
+        with self.assertRaises(ProviderRequestError) as raised:
+            next(stream)
+
+        self.assertEqual(raised.exception.provider_id, "local-strong")
+        self.assertEqual(raised.exception.operation, "generate_stream")
+        self.assertIsInstance(raised.exception.__cause__, OllamaResponseError)
+
     def test_arbitrary_programming_error_is_not_reclassified(self) -> None:
         self.client.generate_error = ValueError("bad test setup")
 
         with self.assertRaisesRegex(ValueError, "bad test setup"):
             self.provider.generate([{"role": "user", "content": "hello"}])
+
+    def test_generate_arbitrary_type_error_is_not_reclassified(self) -> None:
+        self.client.generate_error = TypeError("bad test setup")
+
+        with self.assertRaises(TypeError):
+            self.provider.generate([{"role": "user", "content": "hello"}])
+
+    def test_stream_arbitrary_type_error_is_not_reclassified(self) -> None:
+        self.client.stream_error = TypeError("bad test setup")
+        stream = self.provider.generate_stream(
+            [{"role": "user", "content": "hello"}]
+        )
+
+        self.assertEqual(next(stream), "first")
+        with self.assertRaises(TypeError):
+            next(stream)
 
 
 if __name__ == "__main__":

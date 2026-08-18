@@ -5,12 +5,12 @@ from typing import Any
 
 import httpx
 
-from src.chat.client import OllamaClient
+from src.chat.client import OllamaClient, OllamaResponseError
 from src.llm.errors import ProviderRequestError, ProviderTimeoutError
 
 
 class OllamaProvider:
-    """OllamaClientへ委譲し、通信例外だけを共通形式へ変換する。"""
+    """OllamaClientへ委譲し、通信例外と応答解析例外 (OllamaResponseError) を共通形式へ変換する。"""
 
     def __init__(
         self,
@@ -81,6 +81,10 @@ class OllamaProvider:
             raise ProviderRequestError(
                 self.provider_id, "generate", f"request failed: {exc!r}"
             ) from exc
+        except OllamaResponseError as exc:
+            raise ProviderRequestError(
+                self.provider_id, "generate", f"invalid response: {exc}"
+            ) from exc
 
     def generate_stream(
         self,
@@ -110,6 +114,10 @@ class OllamaProvider:
         except httpx.HTTPError as exc:
             raise ProviderRequestError(
                 self.provider_id, "generate_stream", f"request failed: {exc!r}"
+            ) from exc
+        except OllamaResponseError as exc:
+            raise ProviderRequestError(
+                self.provider_id, "generate_stream", f"invalid response: {exc}"
             ) from exc
 
     @property

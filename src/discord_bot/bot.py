@@ -265,6 +265,7 @@ class DiscordConsoleState:
     provider_registry: ProviderRegistry | None = None
     assistant_services: dict[str, AssistantService] = field(default_factory=dict)
     _llm_providers: dict[tuple[str, str], LLMProvider] = field(default_factory=dict)
+    _profile_cache_lock: threading.RLock = field(default_factory=threading.RLock)
     llm_profiles: dict[str, DiscordLLMProfile] = field(default_factory=dict)
     channel_profile_map: dict[int, str] = field(default_factory=dict)
     tts: Any | None = None
@@ -319,6 +320,7 @@ class DiscordConsoleState:
         self.llm_profiles = self._load_llm_profiles()
         self.channel_profile_map = self._load_channel_profile_map()
         self.llm = self._llm_for_profile(self.llm_profiles["default"])
+        self._initialize_profile_caches()
         self.allowed_user_ids = parse_id_set(os.environ.get("DISCORD_ALLOWED_USER_IDS"))
         self.allowed_channel_ids = parse_id_set(os.environ.get("DISCORD_ALLOWED_CHANNEL_IDS"))
         self.auto_reply_channel_ids = parse_id_set(os.environ.get("DISCORD_AUTO_REPLY_CHANNEL_IDS"))
@@ -731,44 +733,56 @@ class DiscordConsoleState:
             mapping[channel_id] = profile_name
         return mapping
 
+    def _initialize_profile_caches(self) -> None:
+        """全LLM profileのProviderとAssistantServiceを先行構築してキャッシュを固定する。
+
+        メッセージ受付前に単一スレッドで呼ぶことで、同一非default profileへの
+        並行初回要求でもProvider/Service生成が競合しない。同一endpoint/modelの
+        provider共有は _llm_for_profile の既存挙動をそのまま使う。
+        """
+        for profile in self.llm_profiles.values():
+            self._service_for_profile(profile)
+
     def _llm_for_profile(self, profile: DiscordLLMProfile) -> LLMProvider:
-        if self.provider_registry is None:
-            self.provider_registry = ProviderRegistry()
         key = (profile.ollama_base_url, profile.model)
-        if profile.name in self.provider_registry:
-            provider = self.provider_registry.get(profile.name).provider
-            self._llm_providers.setdefault(key, provider)
+        with self._profile_cache_lock:
+            if self.provider_registry is None:
+                self.provider_registry = ProviderRegistry()
+            if profile.name in self.provider_registry:
+                provider = self.provider_registry.get(profile.name).provider
+                self._llm_providers.setdefault(key, provider)
+                return provider
+            if key not in self._llm_providers:
+                self._llm_providers[key] = OllamaProvider(
+                    base_url=profile.ollama_base_url,
+                    model=profile.model,
+                    provider_id=profile.name,
+                )
+            provider = self._llm_providers[key]
+            self.provider_registry.register(profile.name, provider, local=True)
             return provider
-        if key not in self._llm_providers:
-            self._llm_providers[key] = OllamaProvider(
-                base_url=profile.ollama_base_url,
-                model=profile.model,
-                provider_id=profile.name,
-            )
-        provider = self._llm_providers[key]
-        self.provider_registry.register(profile.name, provider, local=True)
-        return provider
 
     def _service_for_profile(self, profile: DiscordLLMProfile) -> AssistantService:
-        if profile.name not in self.assistant_services:
-            self._llm_for_profile(profile)
-            assert self.provider_registry is not None
-            self.assistant_services[profile.name] = AssistantService(
-                self.provider_registry,
-                StaticRouter(
+        with self._profile_cache_lock:
+            if profile.name not in self.assistant_services:
+                self._llm_for_profile(profile)
+                assert self.provider_registry is not None
+                self.assistant_services[profile.name] = AssistantService(
                     self.provider_registry,
-                    default_provider_id=profile.name,
-                ),
-                options=GenerationOptions(
-                    temperature=profile.temperature,
-                    top_p=profile.top_p,
-                    top_k=profile.top_k,
-                    repeat_penalty=profile.repeat_penalty,
-                    num_ctx=profile.num_ctx,
-                    num_predict=profile.num_predict,
-                ),
-            )
-        return self.assistant_services[profile.name]
+                    StaticRouter(
+                        self.provider_registry,
+                        default_provider_id=profile.name,
+                    ),
+                    options=GenerationOptions(
+                        temperature=profile.temperature,
+                        top_p=profile.top_p,
+                        top_k=profile.top_k,
+                        repeat_penalty=profile.repeat_penalty,
+                        num_ctx=profile.num_ctx,
+                        num_predict=profile.num_predict,
+                    ),
+                )
+            return self.assistant_services[profile.name]
 
     def profile_for_channel_ids(self, channel_ids: set[int]) -> DiscordLLMProfile:
         for channel_id in channel_ids:

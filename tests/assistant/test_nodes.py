@@ -174,6 +174,22 @@ class NodeInventoryTest(unittest.TestCase):
         self.assertIn("fallback", response.route.reason)
         self.assertIn("local-strong=unavailable", response.route.reason)
 
+    def test_unavailable_profile_primary_falls_back_to_default_provider(self) -> None:
+        service, _, providers, _ = self.build(
+            NodeInventory.from_mapping(self.mapping())
+        )
+        providers["local-fast"].available = False
+
+        response = service.generate(
+            self.request("voice_fast"),
+            [{"role": "user", "content": "hello"}],
+        )
+
+        self.assertEqual(response.route.provider_id, "local-strong")
+        self.assertEqual(response.text, "local-strong")
+        self.assertIn("fallback from local-fast", response.route.reason)
+        self.assertIn("local-fast=unavailable", response.route.reason)
+
     def test_duplicate_profile_keeps_first_defined_provider(self) -> None:
         data = self.mapping()
         data["nodes"][1]["providers"][0]["profiles"].append("chat_auto")
