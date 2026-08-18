@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 from src.diary.collector import DiaryCollector, DiarySources
 
 if TYPE_CHECKING:
-    from src.chat.client import OllamaClient
+    from src.llm.provider import LLMProvider
 
 
 DIARY_SYSTEM_PROMPT = """\
@@ -44,7 +44,7 @@ class DailyDiaryService:
         self,
         *,
         project_root: str | Path,
-        llm: "OllamaClient",
+        llm: "LLMProvider",
         collector: DiaryCollector,
         data_dir: str | Path = "data/diary",
         timezone: str = "Asia/Tokyo",

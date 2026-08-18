@@ -8,9 +8,11 @@ from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from src.diary.collector import DiaryCollector
+from src.diary.collector import DiaryCollector, DiarySources
 from src.diary.service import DailyDiaryService
 from src.integrations.google_calendar import GoogleCalendarMCPClient
+from src.llm.errors import ProviderRequestError
+from src.llm.providers.fake import FakeProvider
 from src.persona.daily_personalizer import DailyPersonalizer
 
 
@@ -20,6 +22,27 @@ class FakeLLM:
 
     def generate(self, messages, **kwargs):
         return self.text
+
+
+class FailingProvider:
+    def generate(self, messages, **kwargs):
+        raise ProviderRequestError("test", "generate", "forced failure")
+
+
+class FakeDiaryCollector:
+    def collect(self, target_date, **kwargs):
+        return DiarySources(
+            target_date=target_date.isoformat(),
+            timezone="Asia/Tokyo",
+            generated_at="2026-07-02T00:00:00+09:00",
+            calendar={"enabled": False, "events": [], "error": ""},
+            manual_schedule=[],
+            discord_turns=[],
+            voice_transcripts=[],
+            recent_summaries=[],
+            metrics_summary={"available": False},
+            profile={},
+        )
 
 
 class DiaryCollectorTest(unittest.TestCase):
@@ -141,6 +164,49 @@ class DiaryCollectorTest(unittest.TestCase):
 
 
 class DailyDiaryServiceTest(unittest.TestCase):
+    def test_generate_accepts_provider_and_forwards_options(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            provider = FakeProvider(response="# 2026-07-01 の日記\n\nProviderで生成した。")
+            service = DailyDiaryService(
+                project_root=root,
+                llm=provider,
+                collector=FakeDiaryCollector(),
+                timezone="Asia/Tokyo",
+                temperature=0.25,
+                num_ctx=4096,
+            )
+
+            result = service.generate(
+                date(2026, 7, 1),
+                save=False,
+                include_calendar=False,
+            )
+
+            self.assertEqual(result.markdown, "# 2026-07-01 の日記\n\nProviderで生成した。\n")
+            self.assertEqual(len(provider.calls), 1)
+            self.assertEqual(provider.calls[0]["options"]["temperature"], 0.25)
+            self.assertEqual(provider.calls[0]["options"]["num_ctx"], 4096)
+
+    def test_provider_error_returns_fallback_markdown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = DailyDiaryService(
+                project_root=root,
+                llm=FailingProvider(),
+                collector=FakeDiaryCollector(),
+                timezone="Asia/Tokyo",
+            )
+
+            result = service.generate(
+                date(2026, 7, 1),
+                save=False,
+                include_calendar=False,
+            )
+
+            self.assertIn("LLMでの日記生成に失敗したため", result.markdown)
+            self.assertIn("test.generate: forced failure", result.markdown)
+
     def test_generate_saves_markdown_and_reuses_existing_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

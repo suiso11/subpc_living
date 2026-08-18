@@ -16,8 +16,8 @@
 - [x] `ProviderRegistry`と決定的`StaticRouter`
 - [x] `AssistantService`
 - [x] CLI Adapter移行
-- [ ] 内部バッチ処理をProvider型へ寄せる（次アクション）
-- [ ] Web、Discord、Voice移行
+- [x] 内部バッチ処理をProvider型へ寄せる
+- [ ] Web、Discord、Voice移行（次アクション）
 - [ ] `ContextBlock`と`ContextPolicy`
 
 ## 1. ゴール

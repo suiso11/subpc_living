@@ -9,8 +9,8 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.chat.client import OllamaClient
 from src.chat.config import ChatConfig
+from src.llm.providers.ollama import OllamaProvider
 from src.persona.daily_personalizer import DailyPersonalizer
 
 
@@ -26,7 +26,7 @@ def main() -> None:
     args = parse_args()
     target_date = date.fromisoformat(args.date)
     config = ChatConfig.load(PROJECT_ROOT / "config" / "chat_config.json")
-    llm = OllamaClient(base_url=config.ollama_base_url, model=config.model)
+    llm = OllamaProvider(base_url=config.ollama_base_url, model=config.model)
     personalizer = DailyPersonalizer(
         project_root=PROJECT_ROOT,
         llm=llm,

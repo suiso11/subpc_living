@@ -9,11 +9,11 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.chat.client import OllamaClient
 from src.chat.config import ChatConfig
 from src.diary.collector import DiaryCollector
 from src.diary.service import DailyDiaryService
 from src.integrations.google_calendar import GoogleCalendarMCPClient
+from src.llm.providers.ollama import OllamaProvider
 
 
 def parse_args() -> argparse.Namespace:
@@ -31,7 +31,7 @@ def main() -> None:
     args = parse_args()
     target_date = date.fromisoformat(args.date)
     config = ChatConfig.load(PROJECT_ROOT / "config" / "chat_config.json")
-    llm = OllamaClient(base_url=config.ollama_base_url, model=config.model)
+    llm = OllamaProvider(base_url=config.ollama_base_url, model=config.model)
     calendar_client = None if args.no_calendar else GoogleCalendarMCPClient.from_env()
     collector = DiaryCollector(
         PROJECT_ROOT,
