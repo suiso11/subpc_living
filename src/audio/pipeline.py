@@ -41,7 +41,7 @@ from src.persona.profile import UserProfile
 from src.persona.summarizer import ConversationSummarizer
 from src.persona.preloader import SessionPreloader
 from src.persona.proactive import ProactiveEngine
-from src.service.idle import IdleManager
+from src.service.idle import IdleManager, create_idle_manager
 from src.growth.tracker import GrowthTracker
 
 
@@ -270,8 +270,8 @@ class VoicePipeline:
                 threshold=wakeword_threshold,
             )
 
-        # アイドル管理
-        self.idle_manager = IdleManager()
+        # アイドル管理は複数プロセス間でGPU制限が競合するため、既定は無効。
+        self.idle_manager: Optional[IdleManager] = create_idle_manager()
 
         # 状態
         self._state = self.STATE_IDLE
@@ -458,19 +458,22 @@ class VoicePipeline:
         elif self.enable_wakeword:
             print(f"\n[10/{total_steps}] WakeWord (ウェイクワード検知) スキップ")
 
-        # IdleManager 起動
-        print(f"\n[{total_steps + 1}/{total_steps + 1}] IdleManager (アイドル電力管理) 初期化...")
-        try:
-            self.idle_manager.start(
-                monitor_context=self.monitor_context,
-                vision_context=self.vision_context,
-            )
-            if self.idle_manager.gpu_power_control_enabled:
-                print("✅ IdleManager OK (GPU電力の動的切替有効)")
-            else:
-                print(f"✅ IdleManager OK (GPU電力制御は無効: {self.idle_manager.gpu_power_control_reason})")
-        except Exception as e:
-            print(f"⚠️  IdleManager 初期化失敗 (続行): {e}")
+        # IdleManager 起動 (明示的に opt-in した場合のみ)
+        if self.idle_manager is not None:
+            print(f"\n[{total_steps + 1}/{total_steps + 1}] IdleManager (アイドル電力管理) 初期化...")
+            try:
+                self.idle_manager.start(
+                    monitor_context=self.monitor_context,
+                    vision_context=self.vision_context,
+                )
+                if self.idle_manager.gpu_power_control_enabled:
+                    print("✅ IdleManager OK (GPU電力の動的切替有効)")
+                else:
+                    print(f"✅ IdleManager OK (GPU電力制御は無効: {self.idle_manager.gpu_power_control_reason})")
+            except Exception as e:
+                print(f"⚠️  IdleManager 初期化失敗 (続行): {e}")
+        else:
+            print("\nℹ️  IdleManager 無効 (IDLE_MANAGER_ENABLED=true で明示的に有効化)")
 
         print("\n" + "=" * 50)
         print(" ✅ 初期化完了！")
@@ -547,16 +550,19 @@ class VoicePipeline:
         # --- STT ---
         self._state = self.STATE_PROCESSING
         print("\n🔄 音声認識中...")
-        self.idle_manager.notify_inference_start(wait_for_gpu=True)
+        if self.idle_manager is not None:
+            self.idle_manager.notify_inference_start(wait_for_gpu=True)
         try:
             user_text = self.stt.transcribe(speech_audio)
         except Exception:
-            self.idle_manager.notify_inference_end()
+            if self.idle_manager is not None:
+                self.idle_manager.notify_inference_end()
             raise
 
         if not user_text:
             print("  (音声を認識できませんでした)")
-            self.idle_manager.notify_inference_end()
+            if self.idle_manager is not None:
+                self.idle_manager.notify_inference_end()
             return None
 
         print(f"\n👤 あなた: {user_text}")
@@ -572,7 +578,8 @@ class VoicePipeline:
                 self.player.play_wav(wav_data, blocking=True)
             except Exception as e:
                 print(f"⚠️  応答再生失敗: {e}")
-            self.idle_manager.notify_inference_end()
+            if self.idle_manager is not None:
+                self.idle_manager.notify_inference_end()
             return event_reply
 
         # --- LLM → TTS (ストリーミング) ---
@@ -597,7 +604,8 @@ class VoicePipeline:
                 self.session._messages.pop()
             return None
         finally:
-            self.idle_manager.notify_inference_end()
+            if self.idle_manager is not None:
+                self.idle_manager.notify_inference_end()
 
         self._state = self.STATE_IDLE
         return response_text
@@ -888,7 +896,8 @@ class VoicePipeline:
     def cleanup(self) -> None:
         """リソースの解放"""
         self._running = False
-        self.idle_manager.stop()
+        if self.idle_manager is not None:
+            self.idle_manager.stop()
         if self.wakeword_detector is not None:
             self.wakeword_detector.cleanup()
         if self.proactive is not None:

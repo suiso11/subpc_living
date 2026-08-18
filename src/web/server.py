@@ -46,7 +46,7 @@ from src.persona.profile import UserProfile
 from src.persona.summarizer import ConversationSummarizer
 from src.persona.preloader import SessionPreloader
 from src.service.healthcheck import HealthChecker
-from src.service.idle import IdleManager
+from src.service.idle import IdleManager, create_idle_manager
 from src.discord_bot.task_ui import parse_due, parse_snooze, split_quick_input
 from src.tasks.store import TaskStore
 from src.tasks.chat_editor import TaskChatEditor
@@ -356,13 +356,18 @@ async def lifespan(app: FastAPI):
         summarizer = None
         preloader = None
 
-    # IdleManager 初期化
-    idle_manager = IdleManager()
-    idle_manager.start(monitor_context=monitor, vision_context=vision)
-    if idle_manager.gpu_power_control_enabled:
-        logger.info("✅ IdleManager OK (GPU電力の動的切替有効)")
+    # IdleManager は明示的に opt-in した場合のみ起動する。
+    # Web/Voice の複数プロセスが同じ GPU 制限を競合更新するため、既定は無効。
+    idle_manager = create_idle_manager()
+    if idle_manager is not None:
+        idle_manager.start(monitor_context=monitor, vision_context=vision)
+        if idle_manager.gpu_power_control_enabled:
+            logger.info("✅ IdleManager OK (GPU電力の動的切替有効)")
+        else:
+            logger.info("✅ IdleManager OK (GPU電力制御は無効: %s)", idle_manager.gpu_power_control_reason)
     else:
-        logger.info("✅ IdleManager OK (GPU電力制御は無効: %s)", idle_manager.gpu_power_control_reason)
+        idle_manager = None
+        logger.info("IdleManager 無効 (IDLE_MANAGER_ENABLED=true で明示的に有効化)")
 
     local_ip = get_local_ip()
     logger.info("✅ サーバー起動完了! PC: http://localhost:8000 / スマホ: http://%s:8000", local_ip)
