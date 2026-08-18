@@ -19,8 +19,9 @@
 - [x] 内部バッチ処理をProvider型へ寄せる
 - [x] Web移行
 - [x] Voice移行 (`src/audio/pipeline.py`)
-- [ ] Discord移行（次アクション）
-- [ ] Voice CLIエントリポイント (`src/audio/main.py`)
+- [x] Discord移行
+- [x] Voice CLIエントリポイント (`src/audio/main.py`)
+- [ ] 実行ログ（次アクション）
 - [ ] `ContextBlock`と`ContextPolicy`
 
 ## 1. ゴール

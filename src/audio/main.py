@@ -100,9 +100,10 @@ def run_voice_mode(args):
 
 def run_text_to_speech_mode(args):
     """テキスト入力 → LLM応答 → TTS再生モード"""
+    from src.assistant import AssistantRequest
+    from src.assistant.factory import build_local_service
     from src.audio.audio_io import AudioPlayer
     from src.audio.tts_factory import backend_name, create_tts_backend
-    from src.chat.client import OllamaClient
     from src.chat.session import ChatSession
     from src.chat.config import ChatConfig
     from src.chat.web_search import create_web_search_context
@@ -121,7 +122,8 @@ def run_text_to_speech_mode(args):
     player = AudioPlayer(sample_rate=24000)
 
     # LLM初期化
-    client = OllamaClient(base_url=config.ollama_base_url, model=config.model)
+    service, registry = build_local_service(config)
+    client = registry.get("ollama").provider
     if not client.is_available():
         print(f"{Color.RED}Ollamaに接続できません{Color.RESET}")
         sys.exit(1)
@@ -154,19 +156,18 @@ def run_text_to_speech_mode(args):
 
             session.add_user_message(user_input)
             messages = session.build_messages()
+            request = AssistantRequest(
+                text=user_input,
+                conversation_id=session.session_id,
+                channel="voice",
+                profile="voice_fast",
+                privacy="local_only",
+            )
 
             # LLM応答生成
             print(f"{Color.CYAN}{Color.BOLD}AI> {Color.RESET}", end="", flush=True)
             response = ""
-            for token in client.generate_stream(
-                messages,
-                temperature=config.temperature,
-                top_p=config.top_p,
-                top_k=config.top_k,
-                num_ctx=config.num_ctx,
-                repeat_penalty=config.repeat_penalty,
-                num_predict=config.num_predict,
-            ):
+            for token in service.generate_stream(request, messages):
                 print(token, end="", flush=True)
                 response += token
             print()
@@ -187,7 +188,7 @@ def run_text_to_speech_mode(args):
     if session.turn_count > 0:
         saved = session.save()
         print(f"{Color.DIM}会話を保存しました: {saved}{Color.RESET}")
-    client.close()
+    registry.close()
 
 
 if __name__ == "__main__":
