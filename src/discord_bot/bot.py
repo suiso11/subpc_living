@@ -34,7 +34,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.audio.tts_factory import all_tts_voices, backend_name, create_tts_backend
-from src.chat.client import OllamaClient
+from src.assistant.contracts import AssistantRequest
+from src.assistant.service import AssistantService
 from src.chat.config import ChatConfig
 from src.chat.emotion import parse_emotion_tag
 from src.chat.session import ChatSession
@@ -72,6 +73,11 @@ from src.tasks.reminder import TaskReminderEngine, parse_quiet_hours
 from src.tasks.prioritizer import PriorityController, format_focus_decision
 from src.tasks.store import TaskStore
 from src.growth.tracker import GrowthTracker
+from src.llm.contracts import GenerationOptions
+from src.llm.provider import LLMProvider
+from src.llm.providers.ollama import OllamaProvider
+from src.llm.registry import ProviderRegistry
+from src.llm.routing.static import StaticRouter
 
 from src.service.log_setup import setup_logging
 logger = setup_logging("subpc-discord")
@@ -255,8 +261,10 @@ class DiscordLLMProfile:
 @dataclass
 class DiscordConsoleState:
     config: ChatConfig | None = None
-    llm: OllamaClient | None = None
-    llm_clients: dict[tuple[str, str], OllamaClient] = field(default_factory=dict)
+    llm: LLMProvider | None = None
+    provider_registry: ProviderRegistry | None = None
+    assistant_services: dict[str, AssistantService] = field(default_factory=dict)
+    _llm_providers: dict[tuple[str, str], LLMProvider] = field(default_factory=dict)
     llm_profiles: dict[str, DiscordLLMProfile] = field(default_factory=dict)
     channel_profile_map: dict[int, str] = field(default_factory=dict)
     tts: Any | None = None
@@ -600,8 +608,8 @@ class DiscordConsoleState:
             self.screen_context.stop()
         if self.voice_stt is not None:
             self.voice_stt.close()
-        for client in set(self.llm_clients.values()):
-            client.close()
+        if self.provider_registry is not None:
+            self.provider_registry.close()
 
     def is_allowed(self, interaction: discord.Interaction) -> bool:
         if self.allowed_user_ids and interaction.user.id not in self.allowed_user_ids:
@@ -723,14 +731,44 @@ class DiscordConsoleState:
             mapping[channel_id] = profile_name
         return mapping
 
-    def _llm_for_profile(self, profile: DiscordLLMProfile) -> OllamaClient:
+    def _llm_for_profile(self, profile: DiscordLLMProfile) -> LLMProvider:
+        if self.provider_registry is None:
+            self.provider_registry = ProviderRegistry()
         key = (profile.ollama_base_url, profile.model)
-        if key not in self.llm_clients:
-            self.llm_clients[key] = OllamaClient(
+        if profile.name in self.provider_registry:
+            provider = self.provider_registry.get(profile.name).provider
+            self._llm_providers.setdefault(key, provider)
+            return provider
+        if key not in self._llm_providers:
+            self._llm_providers[key] = OllamaProvider(
                 base_url=profile.ollama_base_url,
                 model=profile.model,
+                provider_id=profile.name,
             )
-        return self.llm_clients[key]
+        provider = self._llm_providers[key]
+        self.provider_registry.register(profile.name, provider, local=True)
+        return provider
+
+    def _service_for_profile(self, profile: DiscordLLMProfile) -> AssistantService:
+        if profile.name not in self.assistant_services:
+            self._llm_for_profile(profile)
+            assert self.provider_registry is not None
+            self.assistant_services[profile.name] = AssistantService(
+                self.provider_registry,
+                StaticRouter(
+                    self.provider_registry,
+                    default_provider_id=profile.name,
+                ),
+                options=GenerationOptions(
+                    temperature=profile.temperature,
+                    top_p=profile.top_p,
+                    top_k=profile.top_k,
+                    repeat_penalty=profile.repeat_penalty,
+                    num_ctx=profile.num_ctx,
+                    num_predict=profile.num_predict,
+                ),
+            )
+        return self.assistant_services[profile.name]
 
     def profile_for_channel_ids(self, channel_ids: set[int]) -> DiscordLLMProfile:
         for channel_id in channel_ids:
@@ -758,6 +796,13 @@ class DiscordConsoleState:
         user_id: int,
     ) -> str:
         return f"discord-ephemeral:{guild_id or 0}:{channel_id or 0}:{user_id}"
+
+    def _conversation_id_for_session(self, session: ChatSession) -> str:
+        with self.sessions_lock:
+            for key, current_session in self.sessions.items():
+                if current_session is session:
+                    return key
+        return session.session_id
 
     def _session_for_key(
         self,
@@ -916,6 +961,7 @@ class DiscordConsoleState:
                 ),
             },
         ]
+        # 修正候補は呼び出し側指定の temperature を使うため Provider を直接呼ぶ。
         return llm.generate(
             messages,
             temperature=temperature,
@@ -961,19 +1007,22 @@ class DiscordConsoleState:
         """(clean_text, emotion) を返す。履歴・トレーニングにはタグ除去後のテキストを保存する。"""
         if self.llm is None or self.config is None:
             raise RuntimeError("LLM is not initialized")
-        llm = self._llm_for_profile(profile)
+        service = self._service_for_profile(profile)
         with lock:
             session.add_user_message(prompt)
             try:
-                response = llm.generate(
-                    session.build_messages(),
-                    temperature=profile.temperature,
-                    top_p=profile.top_p,
-                    top_k=profile.top_k,
-                    repeat_penalty=profile.repeat_penalty,
-                    num_ctx=profile.num_ctx,
-                    num_predict=profile.num_predict,
+                request = AssistantRequest(
+                    text=prompt,
+                    conversation_id=self._conversation_id_for_session(session),
+                    channel="discord",
+                    profile="chat_auto",
+                    privacy="local_only",
+                    requested_provider=profile.name,
                 )
+                response = service.generate(
+                    request,
+                    session.build_messages(),
+                ).text
             except Exception:
                 if session._messages and session._messages[-1]["role"] == "user":
                     session._messages.pop()
@@ -1045,6 +1094,7 @@ class DiscordConsoleState:
                 num_ctx=profile.num_ctx,
                 num_predict=profile.num_predict,
             )
+        # 通知言い換えは関数側が生成引数を受け取るため Provider を直接呼ぶ。
         return rewrite_message(
             self.llm, system_prompt=system_prompt, message=message, **gen_kwargs
         )
@@ -1059,6 +1109,7 @@ class DiscordConsoleState:
             {"role": "user", "content": user_text},
         ]
         try:
+            # JSON抽出は固定の生成引数を使うため Provider を直接呼ぶ。
             raw = self.llm.generate(
                 messages,
                 temperature=0.0,
