@@ -22,7 +22,8 @@ from src.audio.tts_factory import backend_name, create_tts_backend
 from src.audio.vad import EnergyVAD, create_vad
 from src.audio.audio_io import AudioRecorder, AudioPlayer
 from src.audio.wakeword import WakeWordDetector
-from src.chat.client import OllamaClient
+from src.assistant.contracts import AssistantRequest
+from src.assistant.factory import build_local_service
 from src.chat.session import ChatSession
 from src.chat.config import ChatConfig
 from src.chat.emotion import (
@@ -97,10 +98,8 @@ class VoicePipeline:
         self.player = AudioPlayer(sample_rate=24000)
 
         # LLM
-        self.llm = OllamaClient(
-            base_url=self.config.ollama_base_url,
-            model=self.config.model,
-        )
+        self._assistant_service, self._provider_registry = build_local_service(self.config)
+        self.llm = self._provider_registry.get("ollama").provider
         self.web_search: Optional[WebSearchContext] = create_web_search_context(self.config)
 
         # RAG (Phase 4: 長期記憶)
@@ -597,9 +596,11 @@ class VoicePipeline:
                 self.session._messages.pop()
             return None
         finally:
+            # 応答が空だった経路と例外経路でも待機状態へ戻す。ここを抜けたまま
+            # STATE_PROCESSING が残ると、次のターンを受け付けなくなる。
+            self._state = self.STATE_IDLE
             self.idle_manager.notify_inference_end()
 
-        self._state = self.STATE_IDLE
         return response_text
 
     def _stream_llm_with_tts(self, messages: list[dict]) -> str:
@@ -631,16 +632,24 @@ class VoicePipeline:
         tts_thread.start()
 
         self._state = self.STATE_PROCESSING
+        user_text = next(
+            (
+                str(message.get("content") or "")
+                for message in reversed(messages)
+                if message.get("role") == "user"
+            ),
+            "",
+        )
+        request = AssistantRequest(
+            text=user_text,
+            conversation_id=getattr(self.session, "session_id", "voice") or "voice",
+            channel="voice",
+            profile="voice_fast",
+            privacy="local_only",
+        )
         try:
-            for token in self.llm.generate_stream(
-                messages,
-                temperature=self.config.temperature,
-                top_p=self.config.top_p,
-                top_k=self.config.top_k,
-                num_ctx=self.config.num_ctx,
-                repeat_penalty=self.config.repeat_penalty,
-                num_predict=self.config.num_predict,
-            ):
+            stream = self._assistant_service.generate_stream(request, messages)
+            for token in stream:
                 piece = emo_filter.feed(token) if emo_filter is not None else token
                 if not piece:
                     continue
@@ -725,15 +734,23 @@ class VoicePipeline:
     def _sequential_llm_then_tts(self, messages: list[dict]) -> str:
         """従来のシーケンシャル方式: LLM全文完了後にTTS"""
         response_text = ""
-        for token in self.llm.generate_stream(
-            messages,
-            temperature=self.config.temperature,
-            top_p=self.config.top_p,
-            top_k=self.config.top_k,
-            num_ctx=self.config.num_ctx,
-            repeat_penalty=self.config.repeat_penalty,
-            num_predict=self.config.num_predict,
-        ):
+        user_text = next(
+            (
+                str(message.get("content") or "")
+                for message in reversed(messages)
+                if message.get("role") == "user"
+            ),
+            "",
+        )
+        request = AssistantRequest(
+            text=user_text,
+            conversation_id=getattr(self.session, "session_id", "voice") or "voice",
+            channel="voice",
+            profile="voice_fast",
+            privacy="local_only",
+        )
+        stream = self._assistant_service.generate_stream(request, messages)
+        for token in stream:
             response_text += token
             print(token, end="", flush=True)
         print()
@@ -883,7 +900,14 @@ class VoicePipeline:
             if self.session.turn_count > 0:
                 saved = self.session.save()
                 print(f"会話を保存しました: {saved}")
-            self.llm.close()
+            self._close_provider_registry()
+
+    def _close_provider_registry(self) -> None:
+        """Provider Registryを一度だけ終了する。"""
+        registry = self._provider_registry
+        self._provider_registry = None
+        if registry is not None:
+            registry.close()
 
     def cleanup(self) -> None:
         """リソースの解放"""
@@ -901,4 +925,4 @@ class VoicePipeline:
             self.screen_context.stop()
         if self.task_store is not None:
             self.task_store.close()
-        self.llm.close()
+        self._close_provider_registry()

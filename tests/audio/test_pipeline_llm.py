@@ -1,0 +1,211 @@
+from contextlib import redirect_stdout
+import io
+import queue
+from types import SimpleNamespace
+import unittest
+
+import numpy as np
+
+from src.assistant.factory import build_local_service
+from src.audio.pipeline import VoicePipeline
+from src.chat.config import ChatConfig
+from src.llm.errors import ProviderRequestError
+from src.llm.providers.fake import FakeProvider
+from src.llm.routing.static import StaticRouter
+
+
+class RecordingRouter:
+    def __init__(self, delegate) -> None:
+        self.delegate = delegate
+        self.requests = []
+
+    def route(self, request):
+        self.requests.append(request)
+        return self.delegate.route(request)
+
+
+class NoopTTS:
+    def synthesize(self, text, *, style=None):
+        return b""
+
+
+class NoopPlayer:
+    def play_wav(self, wav_data, *, blocking=True) -> None:
+        pass
+
+
+class TestSession:
+    def __init__(self, session_id: str = "voice-session") -> None:
+        self.session_id = session_id
+        self._messages = []
+
+    def add_user_message(self, content: str) -> None:
+        self._messages.append({"role": "user", "content": content})
+
+    def add_assistant_message(self, content: str) -> None:
+        self._messages.append({"role": "assistant", "content": content})
+
+    def build_messages(self):
+        return [dict(message) for message in self._messages]
+
+
+class IdleManagerStub:
+    def __init__(self) -> None:
+        self.started = 0
+        self.ended = 0
+
+    def notify_inference_start(self, *, wait_for_gpu: bool) -> None:
+        self.started += 1
+
+    def notify_inference_end(self) -> None:
+        self.ended += 1
+
+
+class FailOnceProvider(FakeProvider):
+    def __init__(self) -> None:
+        super().__init__(stream_chunks=("次", "ターン"))
+        self.attempts = 0
+
+    def generate_stream(self, messages, **options):
+        self.attempts += 1
+        self.calls.append(
+            {
+                "kind": "generate_stream",
+                "messages": [dict(message) for message in messages],
+                "options": dict(options),
+            }
+        )
+        if self.attempts == 1:
+            raise ProviderRequestError(
+                "fake", "generate_stream", "planned first-turn failure"
+            )
+        yield from self.stream_chunks
+
+
+class CountingCloseProvider(FakeProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.close_count = 0
+
+    def close(self) -> None:
+        self.close_count += 1
+        super().close()
+
+
+class VoicePipelineLLMTest(unittest.TestCase):
+    @staticmethod
+    def make_pipeline(provider, config=None, session=None):
+        config = config or ChatConfig(emotion_tag_enabled=False)
+        service, registry = build_local_service(config, provider=provider)
+        recording_router = RecordingRouter(
+            StaticRouter(registry, default_provider_id="ollama")
+        )
+        service._router = recording_router
+
+        pipeline = VoicePipeline.__new__(VoicePipeline)
+        pipeline.config = config
+        pipeline._assistant_service = service
+        pipeline._provider_registry = registry
+        pipeline.llm = provider
+        pipeline.session = session or TestSession()
+        pipeline.tts = NoopTTS()
+        pipeline.player = NoopPlayer()
+        pipeline._tts_queue = queue.Queue()
+        pipeline._state = pipeline.STATE_IDLE
+        return pipeline, recording_router
+
+    def test_streaming_tts_generation_preserves_provider_tokens(self) -> None:
+        provider = FakeProvider(stream_chunks=("スト", "リーム", "。"))
+        pipeline, router = self.make_pipeline(provider)
+        messages = [{"role": "user", "content": "話して"}]
+
+        with redirect_stdout(io.StringIO()):
+            response = pipeline._stream_llm_with_tts(messages)
+
+        self.assertEqual(response, "ストリーム。")
+        self.assertEqual(len(router.requests), 1)
+        self.assertEqual(provider.calls[0]["kind"], "generate_stream")
+
+    def test_fake_provider_stream_and_voice_request_preserve_config(self) -> None:
+        config = ChatConfig(
+            temperature=0.23,
+            top_p=0.81,
+            top_k=17,
+            repeat_penalty=1.37,
+            num_ctx=3456,
+            num_predict=123,
+            emotion_tag_enabled=False,
+        )
+        provider = FakeProvider(stream_chunks=("応", "答", "です"))
+        pipeline, router = self.make_pipeline(provider, config=config)
+        messages = [
+            {"role": "user", "content": "最初の質問"},
+            {"role": "assistant", "content": "最初の応答"},
+            {"role": "user", "content": "最後の質問"},
+        ]
+
+        with redirect_stdout(io.StringIO()):
+            response = pipeline._sequential_llm_then_tts(messages)
+
+        self.assertEqual(response, "応答です")
+        self.assertEqual(len(router.requests), 1)
+        request = router.requests[0]
+        self.assertEqual(request.text, "最後の質問")
+        self.assertEqual(request.conversation_id, "voice-session")
+        self.assertEqual(request.channel, "voice")
+        self.assertEqual(request.profile, "voice_fast")
+        self.assertEqual(request.privacy, "local_only")
+        self.assertEqual(
+            provider.calls[0]["options"],
+            {
+                "temperature": 0.23,
+                "top_p": 0.81,
+                "top_k": 17,
+                "repeat_penalty": 1.37,
+                "num_ctx": 3456,
+                "num_predict": 123,
+            },
+        )
+
+    def test_generation_failure_returns_to_idle_and_next_turn_succeeds(self) -> None:
+        provider = FailOnceProvider()
+        session = TestSession()
+        pipeline, _ = self.make_pipeline(provider, session=session)
+        transcriptions = iter(("失敗するターン", "成功するターン"))
+        pipeline.streaming_tts = False
+        pipeline.vad = SimpleNamespace(sample_rate=10)
+        pipeline._listen_for_speech = lambda: np.ones(4, dtype=np.float32)
+        pipeline.stt = SimpleNamespace(transcribe=lambda audio: next(transcriptions))
+        pipeline.idle_manager = IdleManagerStub()
+        pipeline._try_register_event = lambda text: None
+
+        with redirect_stdout(io.StringIO()):
+            first_response = pipeline.process_voice_turn()
+            second_response = pipeline.process_voice_turn()
+
+        self.assertIsNone(first_response)
+        self.assertEqual(second_response, "次ターン")
+        self.assertEqual(pipeline.state, pipeline.STATE_IDLE)
+        self.assertEqual(
+            session._messages,
+            [
+                {"role": "user", "content": "成功するターン"},
+                {"role": "assistant", "content": "次ターン"},
+            ],
+        )
+        self.assertEqual(pipeline.idle_manager.started, 2)
+        self.assertEqual(pipeline.idle_manager.ended, 2)
+
+    def test_provider_registry_close_is_safe_when_repeated_or_missing(self) -> None:
+        provider = CountingCloseProvider()
+        pipeline, _ = self.make_pipeline(provider)
+
+        pipeline._close_provider_registry()
+        pipeline._close_provider_registry()
+
+        self.assertEqual(provider.close_count, 1)
+        self.assertIsNone(pipeline._provider_registry)
+
+
+if __name__ == "__main__":
+    unittest.main()
