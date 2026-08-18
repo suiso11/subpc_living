@@ -29,7 +29,10 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, FileResponse
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.chat.client import OllamaClient
+from src.assistant.contracts import AssistantRequest
+from src.assistant.factory import build_local_service
+from src.assistant.service import AssistantService
+from src.assistant.stream_queue import stream_to_queue
 from src.chat.session import ChatSession
 from src.chat.config import ChatConfig
 from src.chat.emotion import EmotionTagStreamFilter, emotion_to_sbv2_style
@@ -52,6 +55,8 @@ from src.tasks.store import TaskStore
 from src.tasks.chat_editor import TaskChatEditor
 from src.tasks import extractor as task_extractor
 from src.growth.tracker import GrowthTracker
+from src.llm.provider import LLMProvider
+from src.llm.registry import ProviderRegistry
 from src.service.log_setup import setup_logging, DEFAULT_LOG_DIR
 from src.chat import history_admin
 
@@ -60,7 +65,9 @@ logger = setup_logging("subpc-web")
 
 # --- グローバル状態 ---
 config: ChatConfig = None
-llm: OllamaClient = None
+llm: LLMProvider = None
+assistant_service: AssistantService = None
+provider_registry: ProviderRegistry = None
 tts = None
 stt: WhisperSTT = None
 rag: RAGRetriever = None
@@ -138,7 +145,7 @@ def get_secure_web_url() -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """サーバー起動/終了時の処理"""
-    global config, llm, tts, stt, rag, vision, screen, monitor, profile, summarizer, preloader, web_search, idle_manager, task_store, growth_tracker, tasks_timezone, task_calendar_sync, calendar_client, tasks_calendar_id
+    global config, llm, assistant_service, provider_registry, tts, stt, rag, vision, screen, monitor, profile, summarizer, preloader, web_search, idle_manager, task_store, growth_tracker, tasks_timezone, task_calendar_sync, calendar_client, tasks_calendar_id
 
     logger.info("Web UI サーバー起動中...")
 
@@ -215,7 +222,8 @@ async def lifespan(app: FastAPI):
 
     # LLM 初期化
     logger.info("[1/6] Ollama 接続確認...")
-    llm = OllamaClient(base_url=config.ollama_base_url, model=config.model)
+    assistant_service, provider_registry = build_local_service(config)
+    llm = provider_registry.get("ollama").provider
     if not llm.is_available():
         logger.warning("Ollamaに接続できません。チャット機能は使用不可です。")
     else:
@@ -414,7 +422,8 @@ async def lifespan(app: FastAPI):
         task_calendar_sync.stop()
     if task_store is not None:
         task_store.close()
-    llm.close()
+    if provider_registry is not None:
+        provider_registry.close()
     logger.info("サーバーを終了しました。")
 
 
@@ -517,7 +526,11 @@ async def health():
 
     # モジュール稼働状況を追加
     result["modules"] = {
-        "ollama": llm is not None and llm.is_available() if llm else False,
+        "ollama": (
+            provider_registry.get("ollama").provider.is_available()
+            if provider_registry is not None
+            else False
+        ),
         "tts": tts is not None and tts.is_loaded(),
         "stt": stt is not None and stt.is_loaded(),
         "rag": rag is not None,
@@ -777,8 +790,16 @@ async def game_claim(request: Request):
 async def status():
     """システム状態"""
     return {
-        "ollama": llm.is_available() if llm else False,
-        "model": config.model if config else None,
+        "ollama": (
+            provider_registry.get("ollama").provider.is_available()
+            if provider_registry is not None
+            else False
+        ),
+        "model": (
+            provider_registry.get("ollama").provider.model
+            if provider_registry is not None
+            else config.model if config else None
+        ),
         "tts": tts is not None and tts.is_loaded(),
         "tts_backend": backend_name(tts),
         "tts_voice": tts.voice if tts else None,
@@ -1958,7 +1979,7 @@ def _extraction_timeout_seconds() -> float:
 
 
 def _extract_task_candidates(user_text: str) -> list[dict]:
-    """人格会話とは分離した低温度JSON抽出。失敗時は空配列。"""
+    """人格会話とは分離した低温度JSON抽出。生成設定を保つためServiceを通さない。"""
     if not _extraction_enabled() or task_store is None or llm is None or config is None:
         return []
     # 秘密らしい文字列をモデルへ渡さない。抽出後タイトルもvalidatorで再検査する。
@@ -2157,6 +2178,12 @@ def _effective_system_prompt(cfg) -> str:
     return cfg.system_prompt
 
 
+def _start_assistant_stream(request, messages):
+    """経路選択からQueue worker開始までを同期的に行う。"""
+    stream = assistant_service.generate_stream(request, messages)
+    return stream_to_queue(stream)
+
+
 def _new_chat_session() -> ChatSession:
     """現在の依存コンポーネントを注入した ChatSession を新規作成する。"""
     return ChatSession(
@@ -2287,6 +2314,7 @@ async def websocket_chat(websocket: WebSocket):
 
     try:
         while True:
+            queue_stream = None
             raw = await websocket.receive_text()
             data = json.loads(raw)
             inference_started = False
@@ -2432,15 +2460,18 @@ async def websocket_chat(websocket: WebSocket):
 
             try:
                 # queue ベースのリアルタイムストリーミング
-                token_queue = llm.generate_stream_queue(
-                    messages,
-                    temperature=config.temperature,
-                    top_p=config.top_p,
-                    top_k=config.top_k,
-                    repeat_penalty=config.repeat_penalty,
-                    num_ctx=config.num_ctx,
-                    num_predict=config.num_predict,
+                # _start_assistant_stream内でassistant_service.generate_stream(
+                # request, messages)とQueue worker開始を同じthread上で行う。
+                request = AssistantRequest(
+                    text=user_text,
+                    conversation_id=session_id,
+                    channel="web",
+                    privacy="local_only",
                 )
+                queue_stream = await asyncio.to_thread(
+                    _start_assistant_stream, request, messages
+                )
+                token_queue = queue_stream.queue
 
                 while True:
                     try:
@@ -2515,6 +2546,8 @@ async def websocket_chat(websocket: WebSocket):
                 if session._messages and session._messages[-1]["role"] == "user":
                     session._messages.pop()
             finally:
+                if queue_stream is not None:
+                    queue_stream.cancel()
                 if idle_manager is not None and inference_started:
                     idle_manager.notify_inference_end()
                     inference_started = False
