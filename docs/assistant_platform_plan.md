@@ -17,7 +17,10 @@
 - [x] `AssistantService`
 - [x] CLI Adapter移行
 - [x] 内部バッチ処理をProvider型へ寄せる
-- [ ] Web、Discord、Voice移行（次アクション）
+- [x] Web移行
+- [x] Voice移行 (`src/audio/pipeline.py`)
+- [ ] Discord移行（次アクション）
+- [ ] Voice CLIエントリポイント (`src/audio/main.py`)
 - [ ] `ContextBlock`と`ContextPolicy`
 
 ## 1. ゴール

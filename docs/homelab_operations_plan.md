@@ -205,6 +205,45 @@ nodes:
 
 最初はREADMEとShell / PowerShell Scriptで十分。Ansible等は3台目を追加するか、再構築作業が繰り返し発生してから判断する。
 
+#### 決定: ノードごとに何を入れるか
+
+同一リポジトリを使うが、**インストールする依存と動かすプロセスはノードごとに違う**。
+「2台に同じものを入れて両方動かす」構成にはしない。
+
+| | サブPC (Ubuntu) | メインPC (Windows) |
+| --- | --- | --- |
+| 依存 | `requirements.txt` | `requirements-desktop.txt` |
+| 動かすもの | Ollama、Web、Discord、音声、RAG (systemd user service) | `src/desktop` のネイティブクライアント |
+| 接続 | — | `SUBPC_DESKTOP_SERVER_URL` でサブPCのWeb APIへ |
+
+メインPCはCIが `subpc-desktop.spec` からビルドする実行ファイルを置くだけでよく、
+リポジトリのチェックアウトは開発時にしか必要ない。「更新とRollback」の
+「メインPC更新」は、バックエンドではなくデスクトップクライアントとOllamaの更新を指す。
+
+#### 決定: メインPCをProviderノードにする場合
+
+メインPCが担う低レイテンシの軽量モデル (`local-fast`) には、アプリケーションコードを置かない。
+メインPCでOllamaをLANに向けてlistenさせ、サブPC側の`ProviderRegistry`へIDで登録する。
+
+```python
+registry.register("local-fast",   OllamaProvider(base_url="http://main-pc:11434", ...), local=True)
+registry.register("local-strong", OllamaProvider(base_url="http://localhost:11434", ...), local=True)
+```
+
+これによりノード追加はRegistry登録とInventory更新だけになり、
+アプリケーションの二重配置と更新順序の複雑化を避けられる。
+
+#### 決定: `local` フラグの意味
+
+`ProviderEntry.local` は **「信頼するLAN内にある」** の意味で使う。
+「同一ホストで動いている」の意味ではない。したがってLAN越しのメインPCのOllamaは
+`local=True` で登録する。この定義は次を意味する。
+
+- `local=False` はクラウドなど外部サービスだけに使う。構築済みmessages経路では実行しない
+- LANの境界そのものは`local`フラグではなく、Firewallとlisten Interfaceで守る (「P0: ネットワーク境界」)
+- Phase K (Cloudと承認) を始める前に、この定義を`docs/assistant_platform_plan.md`側の
+  Privacy設計と突き合わせる
+
 ### P1: 更新とRollback
 
 不足:
