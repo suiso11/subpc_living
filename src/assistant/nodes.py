@@ -9,6 +9,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from src.assistant.factory import _resolve_run_logger, _UNSET
 from src.assistant.service import AssistantService
 from src.llm.contracts import GenerationOptions
 from src.llm.provider import LLMProvider
@@ -256,6 +257,7 @@ def build_node_service(
     *,
     options: GenerationOptions | None = None,
     provider_factory: Callable[[ProviderSpec], LLMProvider] | None = None,
+    run_logger: Any | None = _UNSET,
 ) -> tuple[AssistantService, ProviderRegistry]:
     """Providerを定義順に登録し、profile routeを持つServiceを返す。
 
@@ -282,4 +284,12 @@ def build_node_service(
         profile_routes=profile_routes,
         fallback_provider_ids=inventory.fallback_provider_ids,
     )
-    return AssistantService(registry, router, options=options), registry
+    return (
+        AssistantService(
+            registry,
+            router,
+            options=options,
+            run_logger=_resolve_run_logger(run_logger),
+        ),
+        registry,
+    )

@@ -71,6 +71,30 @@ class ClosingFailingStreamProvider(FakeProvider):
         return self.iterator
 
 
+class RecordingLogger:
+    def __init__(self) -> None:
+        self.routes: list[tuple] = []
+        self.runs: list[tuple] = []
+
+    def record_route(self, request_id, *, channel, profile, decision) -> None:
+        self.routes.append((request_id, channel, profile, decision))
+
+    def record_run(
+        self, request_id, *, channel, profile, route, latency_ms, success, error
+    ) -> None:
+        self.runs.append(
+            (request_id, channel, profile, route, latency_ms, success, error)
+        )
+
+
+class FailingLogger:
+    def record_route(self, *args, **kwargs) -> None:
+        raise RuntimeError("logger boom")
+
+    def record_run(self, *args, **kwargs) -> None:
+        raise RuntimeError("logger boom")
+
+
 class AssistantServiceTest(unittest.TestCase):
     def setUp(self) -> None:
         self.registry = ProviderRegistry()
@@ -404,6 +428,210 @@ class AssistantServiceTest(unittest.TestCase):
 
         self.assertEqual(list(result), ["done"])
         self.assertEqual(result.response.latency_ms, 250)
+
+    def test_sync_success_records_route_and_run(self) -> None:
+        logger = RecordingLogger()
+        response = self.service(run_logger=logger).generate(
+            self.request, self.messages
+        )
+        self.assertEqual(response.text, "hello")
+
+        self.assertEqual(len(logger.routes), 1)
+        self.assertEqual(len(logger.runs), 1)
+        route_id, channel, profile, decision = logger.routes[0]
+        self.assertEqual(channel, "web")
+        self.assertEqual(profile, "chat_auto")
+        self.assertEqual(decision.provider_id, "primary")
+        self.assertNotIn("hello", logger.runs[0])
+
+        run_id, run_channel, run_profile, route, latency_ms, success, error = (
+            logger.runs[0]
+        )
+        self.assertEqual(run_channel, "web")
+        self.assertEqual(run_profile, "chat_auto")
+        self.assertEqual(route.provider_id, "primary")
+        self.assertGreaterEqual(latency_ms, 0)
+        self.assertTrue(success)
+        self.assertIsNone(error)
+        self.assertEqual(run_id, route_id)
+
+    def test_stream_success_records_route_and_run(self) -> None:
+        logger = RecordingLogger()
+        provider = FakeProvider(stream_chunks=("hel", "lo"), model="stream-model")
+        registry = ProviderRegistry()
+        registry.register("primary", provider, local=True)
+        result = AssistantService(
+            registry, FixedRouter(self.decision()), run_logger=logger
+        ).generate_stream(self.request, self.messages)
+
+        self.assertEqual(list(result), ["hel", "lo"])
+
+        self.assertEqual(len(logger.routes), 1)
+        self.assertEqual(logger.routes[0][1:3], ("web", "chat_auto"))
+        self.assertEqual(len(logger.runs), 1)
+        _, _, _, route, latency_ms, success, error = logger.runs[0]
+        self.assertEqual(route.provider_id, "primary")
+        self.assertEqual(route.model, "stream-model")
+        self.assertGreaterEqual(latency_ms, 0)
+        self.assertTrue(success)
+        self.assertIsNone(error)
+
+    def test_sync_all_candidates_fail_records_failed_run(self) -> None:
+        primary = FailingProvider(model="failed-primary")
+        fallback = FailingProvider(model="failed-fallback")
+        registry = ProviderRegistry()
+        registry.register("primary", primary, local=True)
+        registry.register("fallback", fallback, local=True)
+        logger = RecordingLogger()
+        service = AssistantService(
+            registry, FixedRouter(self.decision("fallback")), run_logger=logger
+        )
+
+        with self.assertRaises(AssistantGenerationError):
+            service.generate(self.request, self.messages)
+
+        self.assertEqual(len(logger.runs), 1)
+        _, _, _, route, _, success, error = logger.runs[0]
+        self.assertIsNone(route)
+        self.assertFalse(success)
+        self.assertEqual(error, "AssistantGenerationError")
+
+    def test_stream_all_candidates_fail_records_failed_run(self) -> None:
+        primary = FailingStreamProvider(fail_after_token=False)
+        fallback = FailingStreamProvider(fail_after_token=False)
+        registry = ProviderRegistry()
+        registry.register("primary", primary, local=True)
+        registry.register("fallback", fallback, local=True)
+        logger = RecordingLogger()
+        service = AssistantService(
+            registry, FixedRouter(self.decision("fallback")), run_logger=logger
+        )
+
+        with self.assertRaises(AssistantGenerationError):
+            list(service.generate_stream(self.request, self.messages))
+
+        self.assertEqual(len(logger.runs), 1)
+        _, _, _, route, _, success, error = logger.runs[0]
+        self.assertIsNone(route)
+        self.assertFalse(success)
+        self.assertEqual(error, "AssistantGenerationError")
+
+    def test_stream_failure_after_token_records_failed_run(self) -> None:
+        primary = FailingStreamProvider(fail_after_token=True)
+        fallback = FakeProvider(stream_chunks=("unused",))
+        registry = ProviderRegistry()
+        registry.register("primary", primary, local=True)
+        registry.register("fallback", fallback, local=True)
+        logger = RecordingLogger()
+        result = AssistantService(
+            registry, FixedRouter(self.decision("fallback")), run_logger=logger
+        ).generate_stream(self.request, self.messages)
+
+        iterator = iter(result)
+        self.assertEqual(next(iterator), "partial")
+        with self.assertRaises(ProviderRequestError):
+            next(iterator)
+
+        self.assertEqual(len(logger.runs), 1)
+        _, _, _, route, _, success, error = logger.runs[0]
+        self.assertIsNone(route)
+        self.assertFalse(success)
+        self.assertEqual(error, "ProviderRequestError")
+        self.assertEqual(fallback.calls, [])
+
+    def test_stream_close_records_cancelled_run(self) -> None:
+        provider = FakeProvider(stream_chunks=("a", "b", "c"), model="stream-model")
+        registry = ProviderRegistry()
+        registry.register("primary", provider, local=True)
+        logger = RecordingLogger()
+        result = AssistantService(
+            registry, FixedRouter(self.decision()), run_logger=logger
+        ).generate_stream(self.request, self.messages)
+
+        iterator = iter(result)
+        self.assertEqual(next(iterator), "a")
+        result.close()
+
+        self.assertEqual(len(logger.runs), 1)
+        _, _, _, route, _, success, error = logger.runs[0]
+        self.assertIsNone(route)
+        self.assertFalse(success)
+        self.assertIn("cancelled", error)
+
+    def test_stream_close_after_token_failure_records_single_run(self) -> None:
+        primary = FailingStreamProvider(fail_after_token=True)
+        fallback = FakeProvider(stream_chunks=("unused",))
+        registry = ProviderRegistry()
+        registry.register("primary", primary, local=True)
+        registry.register("fallback", fallback, local=True)
+        logger = RecordingLogger()
+        result = AssistantService(
+            registry, FixedRouter(self.decision("fallback")), run_logger=logger
+        ).generate_stream(self.request, self.messages)
+
+        iterator = iter(result)
+        self.assertEqual(next(iterator), "partial")
+        with self.assertRaises(ProviderRequestError):
+            next(iterator)
+        result.close()
+
+        self.assertEqual(len(logger.runs), 1)
+        _, _, _, route, _, success, error = logger.runs[0]
+        self.assertIsNone(route)
+        self.assertFalse(success)
+        self.assertEqual(error, "ProviderRequestError")
+
+    def test_no_route_records_failed_run_and_keeps_exception(self) -> None:
+        logger = RecordingLogger()
+        service = AssistantService(self.registry, FixedRouter(), run_logger=logger)
+
+        with self.assertRaises(NoRouteError):
+            service.generate(self.request, self.messages)
+        with self.assertRaises(NoRouteError):
+            service.generate_stream(self.request, self.messages)
+
+        self.assertEqual(logger.routes, [])
+        self.assertEqual(len(logger.runs), 2)
+        for _, _, _, route, latency_ms, success, error in logger.runs:
+            self.assertIsNone(route)
+            self.assertEqual(latency_ms, 0)
+            self.assertFalse(success)
+            self.assertEqual(error, "NoRouteError")
+
+    def test_logger_failure_does_not_affect_response(self) -> None:
+        service = self.service(run_logger=FailingLogger())
+
+        response = service.generate(self.request, self.messages)
+        self.assertEqual(response.text, "hello")
+
+        result = service.generate_stream(self.request, self.messages)
+        self.assertEqual(list(result), ["hello"])
+        self.assertEqual(result.response.text, "hello")
+
+    def test_request_id_generated_when_not_specified(self) -> None:
+        logger = RecordingLogger()
+        service = self.service(
+            run_logger=logger, request_id_factory=lambda: "generated-id"
+        )
+
+        service.generate(self.request, self.messages)
+
+        self.assertEqual(logger.routes[0][0], "generated-id")
+        self.assertEqual(logger.runs[0][0], "generated-id")
+
+    def test_explicit_request_id_is_preserved(self) -> None:
+        logger = RecordingLogger()
+        request = AssistantRequest(
+            text="hello",
+            conversation_id="conversation",
+            channel="web",
+            request_id="explicit-id",
+        )
+
+        self.service(run_logger=logger).generate(request, self.messages)
+
+        self.assertEqual(logger.routes[0][0], "explicit-id")
+        self.assertEqual(logger.runs[0][0], "explicit-id")
 
 
 if __name__ == "__main__":

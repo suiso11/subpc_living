@@ -1,5 +1,10 @@
+from contextlib import closing
+import os
 from pathlib import Path
+import sqlite3
+import tempfile
 import unittest
+from unittest.mock import patch
 
 from src.assistant.contracts import AssistantRequest
 from src.assistant.nodes import (
@@ -7,6 +12,7 @@ from src.assistant.nodes import (
     NodeInventory,
     build_node_service,
 )
+from src.assistant.run_logger import SQLiteRunLogger
 from src.llm.providers.fake import FakeProvider
 
 
@@ -201,6 +207,100 @@ class NodeInventoryTest(unittest.TestCase):
         )
 
         self.assertEqual(response.route.provider_id, "local-strong")
+
+    def test_omitted_run_logger_uses_env_db_path(self) -> None:
+        inventory = NodeInventory.from_mapping(self.mapping())
+        factory = lambda spec: FakeProvider(spec.provider_id, model=spec.model)
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "nested" / "runs.db"
+            with patch.dict(os.environ, {"ASSISTANT_RUN_LOG_DB": str(db_path)}):
+                service, _ = build_node_service(
+                    inventory, provider_factory=factory
+                )
+                response = service.generate(
+                    self.request(), [{"role": "user", "content": "hello"}]
+                )
+
+            self.assertEqual(response.text, "local-strong")
+            with closing(sqlite3.connect(db_path)) as connection:
+                run = connection.execute(
+                    "SELECT success, provider_id FROM model_runs"
+                ).fetchone()
+                route = connection.execute(
+                    "SELECT provider_id FROM route_decisions"
+                ).fetchone()
+        self.assertEqual(run, (1, "local-strong"))
+        self.assertEqual(route, ("local-strong",))
+
+    def test_explicit_none_run_logger_creates_no_db(self) -> None:
+        inventory = NodeInventory.from_mapping(self.mapping())
+        factory = lambda spec: FakeProvider(spec.provider_id, model=spec.model)
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "unused.db"
+            with patch.dict(os.environ, {"ASSISTANT_RUN_LOG_DB": str(db_path)}):
+                service, _ = build_node_service(
+                    inventory, run_logger=None, provider_factory=factory
+                )
+                service.generate(
+                    self.request(), [{"role": "user", "content": "hello"}]
+                )
+
+            self.assertIsNone(service._run_logger)
+            self.assertFalse(db_path.exists())
+
+    def test_explicit_run_logger_is_used_as_is(self) -> None:
+        inventory = NodeInventory.from_mapping(self.mapping())
+        factory = lambda spec: FakeProvider(spec.provider_id, model=spec.model)
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "runs.db"
+            logger = SQLiteRunLogger(db_path)
+            service, _ = build_node_service(
+                inventory, run_logger=logger, provider_factory=factory
+            )
+            service.generate(
+                self.request(), [{"role": "user", "content": "hello"}]
+            )
+
+            with closing(sqlite3.connect(db_path)) as connection:
+                run = connection.execute(
+                    "SELECT success FROM model_runs"
+                ).fetchone()
+        self.assertEqual(run, (1,))
+
+    def test_default_run_logger_init_failure_falls_back_to_none(self) -> None:
+        inventory = NodeInventory.from_mapping(self.mapping())
+        factory = lambda spec: FakeProvider(spec.provider_id, model=spec.model)
+        for exc in (
+            OSError("disk full"),
+            sqlite3.OperationalError("disk I/O error"),
+        ):
+            with self.subTest(exc=exc):
+                with tempfile.TemporaryDirectory() as tmp:
+                    db_path = Path(tmp) / "nested" / "runs.db"
+                    with patch.dict(
+                        os.environ, {"ASSISTANT_RUN_LOG_DB": str(db_path)}
+                    ):
+                        with patch(
+                            "src.assistant.factory.SQLiteRunLogger",
+                            side_effect=exc,
+                        ):
+                            with self.assertLogs(
+                                "src.assistant.factory", level="WARNING"
+                            ) as logs:
+                                service, _ = build_node_service(
+                                    inventory, provider_factory=factory
+                                )
+                                response = service.generate(
+                                    self.request(),
+                                    [{"role": "user", "content": "hello"}],
+                                )
+
+                self.assertEqual(response.text, "local-strong")
+                self.assertIsNone(service._run_logger)
+                self.assertFalse(db_path.exists())
+                self.assertTrue(
+                    any("run logger" in message for message in logs.output)
+                )
 
     def test_example_json_loads_as_two_nodes_and_two_providers(self) -> None:
         path = Path(__file__).resolve().parents[2] / "config" / "nodes.example.json"

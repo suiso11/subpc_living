@@ -146,67 +146,76 @@ Contextをすべて構築してから送信先を決めてはいけない。先�
 
 ## 8. 実装ロードマップ
 
-### Phase 1: LLM境界
+進捗は対応する節の完了条件に基づき、完了 / 一部完了 / 未着手で示す。
+
+### Phase 1: LLM境界（完了）
 
 - `LLMProvider`共通契約
 - `FakeProvider`とContract Test
 - 既存`OllamaClient`の挙動を変えず、後続Adapterの土台を作る
 
-### Phase 2: AssistantService
+### Phase 2: AssistantService（完了）
 
 - `AssistantRequest` / `AssistantResponse`
 - CLIを最初のAdapterとして接続
 - Web、Discord、音声を一つずつ移行
 
-### Phase 3: ContextとRouter
+### Phase 3: ContextとRouter（一部完了）
 
-- `ContextBlock`と`ContextPolicy`
-- ローカルモデルRegistry
-- 手動ルーティングと経路ログ
-- タスク、予定、画面などをContext Providerへ段階分離
+- `ContextBlock`と`ContextPolicy`（未着手・次フェーズ）
+- ローカルモデルRegistry（完了）
+- 手動ルーティングと経路ログ（完了）
+- タスク、予定、画面などをContext Providerへ段階分離（未着手）
 
-### Phase 4: 知覚イベントと状態
+### Phase 4: 知覚イベントと状態（未着手）
 
 - 使用アプリと活動時間を意味イベント化
 - `focused` / `idle` / `away`の3状態
 - `CompanionState`とState Aggregator
 - 生データを保存していないことのテスト
 
-### Phase 5: Proactive Policy
+### Phase 5: Proactive Policy（未着手）
 
 - 予定接近、長時間作業、離席復帰のルール
 - 黙る条件、再通知間隔、拒否フィードバック
 - 提案と実行を分け、変更操作は承認必須
 
-### Phase 6: 3DデスクトップShell
+### Phase 6: 3DデスクトップShell（未着手）
 
 - 仮VRMによる透明ウィンドウ
 - 待機、視線、表情、リップシンク
 - クイック会話HUDとセンサー確認パネル
 - ユーザー所有VRMの読み込みを優先し、第三者モデルを製品へ無断同梱しない
 
-### Phase 7: 任意の高度機能
+### Phase 7: 任意の高度機能（未着手）
 
 - 明示承認付きクラウド推論
 - LangGraphによる承認・中断・再開が必要な処理だけをWorkflow化
 - コーディングJob Adapter
 - カメラによる在席検知は安全UI完成後に追加
 
-## 9. 今回の最初の実装単位
+## 9. 現在の実装進行単位
 
-今回着手するのはPhase 1のうち、既存挙動へ影響しない部分だけとする。
+Phase 1〜2とRegistry/Router、CLI・Web・Discord・Voice移行、実行ログの実装とruntime wiringは完了し、現在はPhase 3の`ContextBlock` / `ContextPolicy`へ進んでいる。
 
-- `src/llm/contracts.py`
-- `src/llm/provider.py`
-- `src/llm/providers/fake.py`
-- Provider Contract Test
+### 完了: 実行ログ
 
-受け入れ条件:
+- `src/assistant/run_logger.py`（`RunLogger` / `SQLiteRunLogger`）
+- `tests/assistant/test_run_logger.py`
+- runtime wiring済み（Service側へ組み込み済み）
+- SQLiteへ保存するのはchannel、profile、provider、model、local、latency、success、error等の経路決定と実行結果のみ
+- 会話本文、個人Context、APIキーなどの秘密情報、画面・カメラ・タスク・予定の本文は保存しない
 
-- 既存のWeb、Discord、音声、CLIの呼び出し経路を変更しない
-- Ollamaや実GPUを必要とせずFakeだけでテストできる
-- 非ストリーム、ストリーム、統計、終了処理を共通契約で表現できる
-- 既存テストが回帰しない
+受け入れ条件（達成済み）:
+
+- ログ失敗で会話を失敗させない
+- first-write-winsで同一request IDの重複を抑える
+- 経路と統計だけで再現テストできる
+
+### 実施中: ContextBlock / ContextPolicy
+
+- `ContextBlock`と`ContextPolicy`を追加し、`ChatSession.build_messages()`の責務を段階分離する
+- 履歴、RAG、予定、画面などをContext Providerへ分離し、Tasksは最終権威ブロックとして最後に移行する
 
 ## 10. 現時点の非目標
 

@@ -3,8 +3,9 @@
 from collections.abc import Callable, Iterable, Iterator, Sequence
 import threading
 import time
-from typing import NoReturn
+from uuid import uuid4
 
+from src.assistant.run_logger import RunLogger
 from src.assistant.contracts import (
     AssistantError,
     AssistantGenerationError,
@@ -50,13 +51,13 @@ def _actual_route(
     )
 
 
-def _raise_generation_error(
+def _generation_error(
     attempts: list[tuple[str, str]], last_error: Exception | None
-) -> NoReturn:
+) -> AssistantGenerationError:
     error = AssistantGenerationError(tuple(attempts))
-    if last_error is None:
-        raise error
-    raise error from last_error
+    if last_error is not None:
+        error.__cause__ = last_error
+    return error
 
 
 class AssistantService:
@@ -73,20 +74,73 @@ class AssistantService:
         *,
         options: GenerationOptions | None = None,
         clock: Callable[[], float] = time.monotonic,
+        run_logger: RunLogger | None = None,
+        request_id_factory: Callable[[], str] = lambda: str(uuid4()),
     ) -> None:
         self._registry = registry
         self._router = router
         self._options = options or GenerationOptions()
         self._clock = clock
+        self._run_logger = run_logger
+        self._request_id_factory = request_id_factory
+
+    def _request_id(self, request: AssistantRequest) -> str:
+        return request.request_id or self._request_id_factory()
+
+    def _record_route(
+        self, request_id: str, request: AssistantRequest, decision: RouteDecision
+    ) -> None:
+        if self._run_logger is None:
+            return
+        try:
+            self._run_logger.record_route(
+                request_id,
+                channel=request.channel,
+                profile=request.profile,
+                decision=decision,
+            )
+        except Exception:
+            pass
+
+    def _record_run(
+        self,
+        request_id: str,
+        request: AssistantRequest,
+        route: RouteDecision | None,
+        latency_ms: int,
+        success: bool,
+        error: str | None,
+    ) -> None:
+        if self._run_logger is None:
+            return
+        try:
+            self._run_logger.record_run(
+                request_id,
+                channel=request.channel,
+                profile=request.profile,
+                route=route,
+                latency_ms=latency_ms,
+                success=success,
+                error=error,
+            )
+        except Exception:
+            pass
 
     def generate(
         self, request: AssistantRequest, messages: Sequence[ChatMessage]
     ) -> AssistantResponse:
         """経路順にProviderを試し、最初に成功した同期応答を返す。"""
-        decision = self._router.route(request)
+        request_id = self._request_id(request)
+        try:
+            decision = self._router.route(request)
+        except Exception as exc:
+            self._record_run(request_id, request, None, 0, False, type(exc).__name__)
+            raise
+        self._record_route(request_id, request, decision)
         candidates = _candidate_ids(decision)
         attempts: list[tuple[str, str]] = []
         last_error: Exception | None = None
+        started_at: float | None = None
 
         for provider_id in candidates:
             try:
@@ -117,14 +171,23 @@ class AssistantService:
                 continue
 
             latency_ms = int(max(0.0, self._clock() - started_at) * 1000)
+            route = _actual_route(decision, entry, candidates, attempts)
+            self._record_run(request_id, request, route, latency_ms, True, None)
             return AssistantResponse(
                 text=text,
-                route=_actual_route(decision, entry, candidates, attempts),
+                route=route,
                 latency_ms=latency_ms,
                 stats=dict(entry.provider.last_stats),
             )
 
-        _raise_generation_error(attempts, last_error)
+        error = _generation_error(attempts, last_error)
+        latency_ms = (
+            int(max(0.0, self._clock() - started_at) * 1000)
+            if started_at is not None
+            else 0
+        )
+        self._record_run(request_id, request, None, latency_ms, False, type(error).__name__)
+        raise error
 
     def generate_stream(
         self, request: AssistantRequest, messages: Sequence[ChatMessage]
@@ -134,13 +197,23 @@ class AssistantService:
         最初のtokenを返す前の ``LLMProviderError`` だけfallbackする。tokenを1件以上
         返した後の同例外は、部分出力の重複を避けるためそのまま呼び出し元へ伝播する。
         """
-        decision = self._router.route(request)
+        request_id = self._request_id(request)
+        try:
+            decision = self._router.route(request)
+        except Exception as exc:
+            self._record_run(request_id, request, None, 0, False, type(exc).__name__)
+            raise
+        self._record_route(request_id, request, decision)
         return StreamResult(
             registry=self._registry,
             decision=decision,
             messages=[dict(message) for message in messages],
             options=self._options,
             clock=self._clock,
+            run_logger=self._run_logger,
+            request_id=request_id,
+            channel=request.channel,
+            profile=request.profile,
         )
 
 
@@ -155,18 +228,54 @@ class StreamResult(Iterable[str]):
         messages: Sequence[ChatMessage],
         options: GenerationOptions,
         clock: Callable[[], float],
+        run_logger: RunLogger | None = None,
+        request_id: str = "",
+        channel: str = "",
+        profile: str = "",
     ) -> None:
         self._registry = registry
         self._decision = decision
         self._messages = [dict(message) for message in messages]
         self._options = options
         self._clock = clock
+        self._run_logger = run_logger
+        self._request_id = request_id
+        self._channel = channel
+        self._profile = profile
         self._started = False
         self._closed = False
         self._state_lock = threading.Lock()
+        self._run_recorded = False
         self._iterator: Iterator[str] | None = None
         self._response: AssistantResponse | None = None
         self._parts: list[str] = []
+        self._started_at: float | None = None
+
+    def _record_run(
+        self,
+        route: RouteDecision | None,
+        latency_ms: int,
+        success: bool,
+        error: str | None,
+    ) -> None:
+        if self._run_logger is None:
+            return
+        with self._state_lock:
+            if self._run_recorded:
+                return
+            self._run_recorded = True
+        try:
+            self._run_logger.record_run(
+                self._request_id,
+                channel=self._channel,
+                profile=self._profile,
+                route=route,
+                latency_ms=latency_ms,
+                success=success,
+                error=error,
+            )
+        except Exception:
+            pass
 
     def __iter__(self) -> Iterator[str]:
         """候補Providerからtokenを順に返し、正常終了時に応答を確定する。"""
@@ -183,7 +292,11 @@ class StreamResult(Iterable[str]):
         candidates = _candidate_ids(self._decision)
         attempts: list[tuple[str, str]] = []
         last_error: Exception | None = None
-        started_at: float | None = None
+
+        def latency_ms() -> int:
+            if self._started_at is None:
+                return 0
+            return int(max(0.0, self._clock() - self._started_at) * 1000)
 
         for provider_id in candidates:
             try:
@@ -202,8 +315,8 @@ class StreamResult(Iterable[str]):
                 attempts.append((provider_id, "unavailable"))
                 continue
 
-            if started_at is None:
-                started_at = self._clock()
+            if self._started_at is None:
+                self._started_at = self._clock()
             emitted = False
             chunks: Iterable[str] | None = None
             try:
@@ -220,6 +333,12 @@ class StreamResult(Iterable[str]):
                     yield chunk
             except LLMProviderError as exc:
                 if emitted:
+                    self._record_run(
+                        None,
+                        latency_ms(),
+                        False,
+                        type(exc).__name__,
+                    )
                     raise
                 attempts.append((provider_id, f"{type(exc).__name__}: {exc}"))
                 last_error = exc
@@ -229,19 +348,24 @@ class StreamResult(Iterable[str]):
                 if callable(close):
                     close()
 
-            latency_ms = int(max(0.0, self._clock() - started_at) * 1000)
+            latency = latency_ms()
             with self._state_lock:
                 if self._closed:
                     return
                 self._response = AssistantResponse(
                     text="".join(self._parts),
-                    route=_actual_route(self._decision, entry, candidates, attempts),
-                    latency_ms=latency_ms,
+                    route=_actual_route(
+                        self._decision, entry, candidates, attempts
+                    ),
+                    latency_ms=latency,
                     stats=dict(entry.provider.last_stats),
                 )
+            self._record_run(self._response.route, latency, True, None)
             return
 
-        _raise_generation_error(attempts, last_error)
+        error = _generation_error(attempts, last_error)
+        self._record_run(None, latency_ms(), False, type(error).__name__)
+        raise error
 
     def close(self) -> None:
         """内部generatorを閉じ、以後の反復を停止する。"""
@@ -258,6 +382,12 @@ class StreamResult(Iterable[str]):
             except ValueError:
                 # 別threadで実行中のgeneratorは閉じられないため停止フラグに委ねる。
                 pass
+
+        if self._response is None:
+            latency_ms = 0
+            if self._started_at is not None:
+                latency_ms = int(max(0.0, self._clock() - self._started_at) * 1000)
+            self._record_run(None, latency_ms, False, "cancelled")
 
     @property
     def response(self) -> AssistantResponse:

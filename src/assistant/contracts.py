@@ -34,6 +34,7 @@ class AssistantRequest:
     requested_provider: str | None = None
     requested_model: str | None = None
     allow_cloud: bool = False
+    request_id: str | None = None
 
 
 @dataclass(frozen=True)

@@ -21,8 +21,8 @@
 - [x] Voice移行 (`src/audio/pipeline.py`)
 - [x] Discord移行
 - [x] Voice CLIエントリポイント (`src/audio/main.py`)
-- [ ] 実行ログ（次アクション）
-- [ ] `ContextBlock`と`ContextPolicy`
+- [x] 実行ログ (`src/assistant/run_logger.py`、runtime wiring済み)
+- [ ] `ContextBlock`と`ContextPolicy`（次アクション）
 
 ## 1. ゴール
 
@@ -54,13 +54,15 @@ flowchart TD
 
 ### 現在の主な呼び出し経路
 
-- `src/chat/main.py`: `OllamaClient`を直接生成し、同期・ストリーム生成
-- `src/web/server.py`: グローバル`OllamaClient`と`generate_stream_queue()`を使用
-- `src/discord_bot/bot.py`: チャンネル別`DiscordLLMProfile`から複数Clientを生成
-- `src/audio/main.py`: `OllamaClient.generate_stream()`を直接使用
-- `src/audio/pipeline.py`: 音声ストリームとTTSを直接接続
-- `src/diary/**`, `src/persona/**`: 内部バッチ処理としてClientを直接使用
-- `src/chat/session.py`: 履歴、RAG、検索、画面、カメラ、予定、タスクを一つのプロンプトへ構築
+移行完了後、各入口は`AssistantService`へ集約された。
+
+- `src/chat/main.py`: `AssistantService`経由でProviderを呼ぶCLI Adapter
+- `src/web/server.py`: `AssistantService` + Stream Queue Adapterを利用
+- `src/discord_bot/bot.py`: チャンネル別Profileを`AssistantRequest` / `GenerationOptions`へ変換して`AssistantService`へ渡す
+- `src/audio/main.py`: `AssistantService.generate_stream()`を使用
+- `src/audio/pipeline.py`: `AssistantService.generate_stream()`とTTSを直接接続
+- `src/diary/**`, `src/persona/**`: 内部バッチ処理として`LLMProvider`を直接利用（`AssistantService`は通さない）
+- `src/chat/session.py`: 履歴、RAG、検索、画面、カメラ、予定、タスクを一つのプロンプトへ構築（`ContextBlock`へ分離するのはPhase J）
 
 ### 守る制約
 
@@ -385,9 +387,15 @@ Webは高リスクなのでCLI後に行う。
 - `voice_fast`がローカルProviderだけを選ぶ
 - Provider失敗時のFallbackが音声Pipelineを停止させない
 
-### Phase I: 実行ログ
+### Phase I: 実行ログ（完了）
 
-Routerを高度化する前にSQLiteへ事実を記録する。
+Routerを高度化する前にSQLiteへ事実を記録する。実装とruntime wiringは完了済み。
+
+実装済み:
+
+- `src/assistant/run_logger.py`（`RunLogger` / `SQLiteRunLogger`）
+- `tests/assistant/test_run_logger.py`
+- Service側へ組み込み済み
 
 最初のテーブル:
 
@@ -397,14 +405,15 @@ Routerを高度化する前にSQLiteへ事実を記録する。
 保存しないもの:
 
 - 生の会話本文
-- APIキー
+- 個人Context
+- APIキーなど秘密情報
 - 画面、カメラ、タスク、予定の本文
 - system prompt全文
 
-受け入れ条件:
+受け入れ条件（達成済み）:
 
 - ログ失敗で会話を失敗させない
-- 同一request IDの重複方針が決まっている
+- first-write-winsで同一request IDの重複を抑える
 - ルーティング分析に必要な値だけで再現テストできる
 
 ### Phase J: ContextBlockとPolicy
