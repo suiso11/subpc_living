@@ -186,11 +186,30 @@ Contextをすべて構築してから送信先を決めてはいけない。先�
 
 次アクション: UI消費と非Web入口（Discord / Voice / Desktop）へのruntime wiring。カメラ・画面・常時生データ収集は実装しない。
 
-### Phase 5: Proactive Policy（未着手）
+### Phase 5: Proactive Policy（一部完了）
 
 - 予定接近、長時間作業、離席復帰のルール
 - 黙る条件、再通知間隔、拒否フィードバック
 - 提案と実行を分け、変更操作は承認必須
+
+#### 完了: 決定的 Policy エンジン基盤
+
+- `PolicyDecision` / `PolicyContext` 契約と `DeterministicProactivePolicy`（`src/companion/policy.py`）。
+  CompanionState + 現在時刻 + 予定接近情報を入力とし、LLM に判断させず閾値ベースで
+  介入可否・内容・種別を決定する
+- ルール: focused 中は黙る（interruptible な予定接近を除く）、長時間作業で `break_suggest`、
+  予定接近で `schedule_remind`、離席復帰で `away_return`、cooldown 中は silent
+- 提案と実行の分離: 変更操作は行わず `requires_approval` は現状常に False（将来の拡張用）
+- privacy: `message_hint` は個人情報・生データ・エラー本文を含まない定数ヒントのみ
+- テスト 14件追加 (focused silent, break_suggest, schedule_remind, away_return, cooldown,
+  interruptible, 純粋関数性)。companion 全体 56テスト OK
+
+#### 未完: Policy の接続層
+
+- `DeterministicProactivePolicy` と既存 `ProactiveEngine` (`src/persona/proactive.py`) の統合
+- CalendarSource 接続 (`UserProfile.get_upcoming_schedule` から `next_event_at` へ)
+- 拒否フィードバックの永続化 (`cooldown_key` への反映・再通知間隔の調整)
+- Discord / 音声 / Desktop 各入口から Policy を参照する wiring
 
 ### Phase 6: 3DデスクトップShell（未着手）
 
@@ -208,7 +227,7 @@ Contextをすべて構築してから送信先を決めてはいけない。先�
 
 ## 9. 現在の実装進行単位
 
-Phase 1〜2とRegistry/Router、CLI・Web・Discord・Voice移行、実行ログの実装とruntime wiringは完了し、Phase 3の`ContextBlock` / `ContextPolicy`基盤、History・Preload・RAG・Web search・Monitor・Vision・Screen・Calendar・Tasksの各Context Provider移行も完了した。Phase J全体は完了し、Phase 4の基盤実装（`PerceptionEvent` / `CompanionState` / `StateAggregator` / `ActivityEventCollector`）とプラットフォーム別ActivitySource adapter、Web runtime wiring・`/api/companion/state`も完了した。UI消費と非Web入口（Discord / Voice / Desktop）へのruntime wiringは未完で、次アクションとしてUI消費と非Web wiringへ進む。
+Phase 1〜2とRegistry/Router、CLI・Web・Discord・Voice移行、実行ログの実装とruntime wiringは完了し、Phase 3の`ContextBlock` / `ContextPolicy`基盤、History・Preload・RAG・Web search・Monitor・Vision・Screen・Calendar・Tasksの各Context Provider移行も完了した。Phase J全体は完了し、Phase 4の基盤実装（`PerceptionEvent` / `CompanionState` / `StateAggregator` / `ActivityEventCollector`）とプラットフォーム別ActivitySource adapter、Web runtime wiring・`/api/companion/state`、およびDiscord / 音声 / Desktop / Web UI へのruntime wiringが完了した。Phase 5の決定的Policyエンジン基盤（`DeterministicProactivePolicy`）も完了し、次アクションはPolicyの接続層（既存`ProactiveEngine`・CalendarSource・各入口との統合）へ進む。
 
 ### 完了: 実行ログ
 
@@ -301,9 +320,18 @@ Phase 1〜2とRegistry/Router、CLI・Web・Discord・Voice移行、実行ログ
 - 生データ非保持（`raw_data_retained=False`固定）とprivacy違反拒否のテスト済み。`src.perception` / `src.companion`から公開し、root公開APIテスト済み
 - プラットフォーム別ActivitySource adapter（`WindowsActivitySource` / `LinuxActivitySource`）は完了。Linux/X11では`xprintidle`（idle取得）と`xdotool`（アクティブウィンドウPID取得）が必要で、施設が無ければ`ActivitySourceUnavailableError`で明確に失敗する
 - Web runtime wiringは完了: `COMPANION_ACTIVITY_ENABLED=true` のオプトイン時だけActivityRuntimeを起動し、`GET /api/companion/state`（読み取り専用・privacy-safe）でActivityRuntimeStatusの集計カウンタと`CompanionState`フィールドのみ公開。起動失敗は例外型名だけログしてcompanion機能のみ無効化し、Web起動は続行する。プロセス名・PID・アプリ分類・window title・エラー本文・生サンプル/イベントは公開しない
-- `StateAggregator`からDiscord / 音声 / Desktopへのruntime wiringとUI消費は未実装
+- `StateAggregator`からDiscord / 音声 / Desktopへのruntime wiringとUI消費は完了:
+  - Discord (`src/discord_bot/bot.py`): 起動・停止で ActivityRuntime を生成・破棄
+  - 音声 (`src/audio/main.py` + `src/audio/pipeline.py`): パイプライン起動に runtime を組込み
+  - Desktop (`src/desktop/bridge.py` + `api.py` + `qml/Main.qml`): bridge が runtime 管理、
+    API は読取専用 payload、QML は控えめな最小表示
+  - Web UI (`src/web/static/{index.html,app.js,style.css}`): `/api/companion/state` を
+    ポーリング取得し既存デザイントークンに合わせた最小表示
+  - いずれも `COMPANION_ACTIVITY_ENABLED=true` オプトイン時のみ起動し、
+    privacy-safe な `companion_state_payload` のみ公開。プロセス名・PID・アプリ分類・
+    window title・エラー本文・生サンプルは出さない
 
-次の実装単位: UI消費と非Web入口（Discord / Voice / Desktop）へのruntime wiring。Phase 5以降は未着手、Cloud（Phase K）も未着手のまま。
+次の実装単位: Phase 5 の接続層（Policy と既存 `ProactiveEngine`・各入口の統合）。
 
 ## 10. 現時点の非目標
 
