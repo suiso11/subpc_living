@@ -26,7 +26,8 @@
 - [x] History Context Provider / Builder移行とChatSessionへの適用（wiring完了）
 - [x] Preload移行（完了・SessionPreloader由来のprofile/schedule/summaryを一括で包む）
 - [x] RAG移行（完了・prompt injectionのみ）
-- [ ] Web search移行（次アクション）
+- [x] Web search移行（完了・Context Provider化のみ、検索ロジックは未変更）
+- [ ] Monitor移行（次アクション）
 
 ## 1. ゴール
 
@@ -66,7 +67,7 @@ flowchart TD
 - `src/audio/main.py`: `AssistantService.generate_stream()`を使用
 - `src/audio/pipeline.py`: `AssistantService.generate_stream()`とTTSを直接接続
 - `src/diary/**`, `src/persona/**`: 内部バッチ処理として`LLMProvider`を直接利用（`AssistantService`は通さない）
-- `src/chat/session.py`: 履歴は`HistoryContextProvider`、Preloadは`PreloadContextProvider` / `ContextBuilder`経由で`ContextBlock`化して構築済み。PreloadはSessionPreloaderがprofile・schedule・summary・時刻を一つのstrへまとめた結果を包む移行であり、独立Profile Providerではない。RAGは`RAGContextProvider` / `ContextBuilder`経由で`ContextBlock`化して構築済み（prompt injectionのみ）。Web search、画面、カメラ、予定、タスクは引き続き一つのプロンプトへ構築し、Phase Jで順次Provider分離する
+- `src/chat/session.py`: 履歴は`HistoryContextProvider`、Preloadは`PreloadContextProvider` / `ContextBuilder`経由で`ContextBlock`化して構築済み。PreloadはSessionPreloaderがprofile・schedule・summary・時刻を一つのstrへまとめた結果を包む移行であり、独立Profile Providerではない。RAGは`RAGContextProvider` / `ContextBuilder`経由で`ContextBlock`化して構築済み（prompt injectionのみ）。Web searchは`WebSearchContextProvider` / `ContextBuilder`経由で`ContextBlock`化して構築済み（Context Provider化のみ・検索ロジックは未変更）。画面、カメラ、予定、タスクは引き続き一つのプロンプトへ構築し、Phase Jで順次Provider分離する（Monitorは次）
 
 ### 守る制約
 
@@ -430,16 +431,17 @@ Routerを高度化する前にSQLiteへ事実を記録する。実装とruntime 
 - History移行は完了: `HistoryContextProvider`と`ContextBuilder`を実装し、`ChatSession.build_messages()`へ組み込み済み（wiring完了）
 - Preload移行は完了: `PreloadContextProvider`（source=preload / sensitivity=personal / local_only=True）を実装し、`ContextBuilder.build_system_content()`と`ChatSession.build_messages()`へ組み込み済み。SessionPreloaderがprofile・schedule・summary・時刻を一つのstrへまとめた結果を包むPreloadであり、独立したProfile Providerは未実装。収集失敗時は本文をログせず型名だけwarningし、会話は継続する。`PreloadContextProvider`と`StructuredBlockNotAllowedError`は`src.context`から公開し、root公開APIテスト済み
 - RAG移行は完了: `RAGContextProvider`（source=rag / sensitivity=personal / local_only=True）を実装し、`ChatSession.build_messages()`へ組み込み済み。`build_context_prompt(query)`の結果を包むだけで、retriever側のstore_turn / store_knowledge / retrieveは変更・呼び出しせず`RAGRetriever`本体も変更しない（prompt injectionのみ）。空・空白のみ・非strの結果、例外時はNoneを返し、失敗は型名だけwarningしてquery・本文・例外本文をログせず会話を継続する。`RAGContextProvider`と`RAGSource`は`src.context`から公開し、root公開APIテスト済み
-- Phase J全体は未完了。Web search / Monitor / Vision / Screen / Calendar / Tasksは未着手、Cloud経路（Phase K）も未着手のまま
-- 次の実装単位: Web search移行（下記移行順の4番目）
+- Web search移行は完了: `WebSearchContextProvider`（source=web_search / sensitivity=personal / local_only=True）を実装し、`ChatSession.build_messages()`へ組み込み済み。`build_context_prompt(query)`の結果を包むだけで、web_search側のsearch / should_search / cache / 判定ロジック自体は変更・呼び出しせず`WebSearchContext`本体も変更しない（Context Provider化のみ）。queryを含み得るためlocal_only。空・空白のみ・非strの結果、例外時はNoneを返し、失敗は型名だけwarningしてquery・本文・例外本文をログせず会話を継続する。`WebSearchContextProvider`と`WebSearchSource`は`src.context`から公開し、root公開APIテスト済み
+- Phase J全体は未完了。Monitor / Vision / Screen / Calendar / Tasksは未着手、Cloud経路（Phase K）も未着手のまま
+- 次の実装単位: Monitor移行（下記移行順の5番目）
 
 移行順:
 
 1. History（完了）
 2. Preload（完了・SessionPreloader由来のprofile/schedule/summaryを一括で包む）
 3. RAG（完了・prompt injectionのみ）
-4. Web search（次の実装単位）
-5. Monitor
+4. Web search（完了・Context Provider化のみ、検索ロジックは未変更）
+5. Monitor（次の実装単位）
 6. Vision / Screen
 7. Calendar
 8. Tasks

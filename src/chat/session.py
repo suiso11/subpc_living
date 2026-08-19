@@ -159,15 +159,26 @@ class ChatSession:
                 )
 
         if self.web_search is not None and self._messages:
+            # 最新のユーザーメッセージで検索
             last_user = None
             for msg in reversed(self._messages):
                 if msg["role"] == "user":
                     last_user = msg["content"]
                     break
+            # Phase J: WebSearchContextProvider + ContextBuilder 経由で描画する。
+            # RAG 直後・Vision 前の現行位置を維持し、local_only / local target
+            # で ContextPolicy に通した str block だけを base system へ連結する。
             if last_user:
-                web_context = self.web_search.build_context_prompt(last_user)
-                if web_context:
-                    system_content = system_content + web_context
+                from src.context.builder import ContextBuilder
+                from src.context.providers.web_search import WebSearchContextProvider
+
+                web_block = WebSearchContextProvider.collect(self.web_search, last_user)
+                builder = ContextBuilder(system_content)
+                system_content = builder.build_system_content(
+                    [web_block] if web_block is not None else [],
+                    privacy="local_only",
+                    target_local=True,
+                )
 
         # Vision: カメラ映像の現在の状態を注入
         if self.vision_context is not None:

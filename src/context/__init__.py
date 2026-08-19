@@ -14,6 +14,8 @@ from .providers import (
     PreloadContextProvider,
     RAGContextProvider,
     RAGSource,
+    WebSearchContextProvider,
+    WebSearchSource,
 )
 
 __all__ = [
@@ -31,4 +33,6 @@ __all__ = [
     "RAGSource",
     "Sensitivity",
     "StructuredBlockNotAllowedError",
+    "WebSearchContextProvider",
+    "WebSearchSource",
 ]
