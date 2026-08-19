@@ -32,6 +32,7 @@
 - [x] Calendar移行（完了）
 - [x] Tasks移行（完了・最終権威ブロックとして末尾）
 - [ ] Cloud経路（Phase K、未着手・明示判断待ち）
+- [x] Companion Phase 4基盤（`PerceptionEvent` / `CompanionState` / `StateAggregator` / `ActivityEventCollector`）とプラットフォーム別ActivitySource adapter、Web runtime wiring・`/api/companion/state`（オプトイン）。UI消費と非Web wiring（Discord / Voice / Desktop）は未完。詳細は`docs/companion_roadmap.md`）
 
 ## 1. ゴール
 
@@ -441,7 +442,7 @@ Routerを高度化する前にSQLiteへ事実を記録する。実装とruntime 
 - Calendar移行は完了: `CalendarContextProvider`（source=calendar / sensitivity=personal / local_only=True）を実装し、`ChatSession.build_messages()`へ組み込み済み。`CalendarContext`の結果（ファイル読取のみ）を包むだけで、本体は変更しない。収集失敗は型名だけwarningして本文をログせず、会話を継続する。`CalendarContextProvider`と`CalendarSource`は`src.context`から公開し、root公開APIテスト済み
 - Tasks移行は完了: `TasksContextProvider`（source=TASKS_SOURCE / sensitivity=personal / local_only=True）を実装し、最終権威ブロックとして`ChatSession.build_messages()`のsystem本文末尾へ組み込み済み。0件でも必ず注入する。Historyのrole messagesはその後ろに`ContextBuilder`経由で描画する。収集失敗は型名だけwarningして本文をログせず、会話を継続する。`TasksContextProvider`は`src.context`から公開し、root公開APIテスト済み
 - Phase J全体は完了。Cloud経路（Phase K）は未着手のまま無効で、明示判断待ち
-- 次の実装単位: Phase 4の意味イベント化 / State Aggregator（companion側）
+- Companion Phase 4基盤（`PerceptionEvent` / `CompanionState` / `StateAggregator` / `ActivityEventCollector`）とプラットフォーム別ActivitySource adapter（Windows / Linux(X11)、`xprintidle` / `xdotool` 必須）は完了。Web runtime wiringと読み取り専用API（`/api/companion/state`、`COMPANION_ACTIVITY_ENABLED=true` のオプトイン、起動失敗時はcompanion機能のみ無効化してWeb起動は続行）も完了。UI消費と非Web入口（Discord / Voice / Desktop）へのruntime wiringは未完で、次アクション（詳細は`docs/companion_roadmap.md`）
 
 移行順:
 

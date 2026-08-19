@@ -174,12 +174,17 @@ Contextをすべて構築してから送信先を決めてはいけない。先�
 - ローカルモデルRegistry（完了）
 - 手動ルーティングと経路ログ（完了）
 
-### Phase 4: 知覚イベントと状態（未着手）
+### Phase 4: 知覚イベントと状態（一部完了）
 
-- 使用アプリと活動時間を意味イベント化
-- `focused` / `idle` / `away`の3状態
-- `CompanionState`とState Aggregator
-- 生データを保存していないことのテスト
+- 分類済みapp_categoryとidle_secondsから意味イベント生成（完了・`ActivityEventCollector`）
+- `focused` / `idle` / `away`の3状態（完了）
+- `CompanionState`と決定的`StateAggregator`（完了）
+- 生データを保存していないことのテスト（完了）
+- プラットフォーム別ActivitySource adapter（完了・Windows / Linux(X11)）
+- Web runtime wiringと読み取り専用状態API（完了・`/api/companion/state`、オプトイン）
+- UI消費とWeb以外（Discord / Voice / Desktop）へのruntime wiring（未完）
+
+次アクション: UI消費と非Web入口（Discord / Voice / Desktop）へのruntime wiring。カメラ・画面・常時生データ収集は実装しない。
 
 ### Phase 5: Proactive Policy（未着手）
 
@@ -203,7 +208,7 @@ Contextをすべて構築してから送信先を決めてはいけない。先�
 
 ## 9. 現在の実装進行単位
 
-Phase 1〜2とRegistry/Router、CLI・Web・Discord・Voice移行、実行ログの実装とruntime wiringは完了し、Phase 3の`ContextBlock` / `ContextPolicy`基盤、History・Preload・RAG・Web search・Monitor・Vision・Screen・Calendar・Tasksの各Context Provider移行も完了した。Phase J全体は完了し、現在は次の実装単位であるPhase 4の意味イベント化とState Aggregatorへ進んでいる。
+Phase 1〜2とRegistry/Router、CLI・Web・Discord・Voice移行、実行ログの実装とruntime wiringは完了し、Phase 3の`ContextBlock` / `ContextPolicy`基盤、History・Preload・RAG・Web search・Monitor・Vision・Screen・Calendar・Tasksの各Context Provider移行も完了した。Phase J全体は完了し、Phase 4の基盤実装（`PerceptionEvent` / `CompanionState` / `StateAggregator` / `ActivityEventCollector`）とプラットフォーム別ActivitySource adapter、Web runtime wiring・`/api/companion/state`も完了した。UI消費と非Web入口（Discord / Voice / Desktop）へのruntime wiringは未完で、次アクションとしてUI消費と非Web wiringへ進む。
 
 ### 完了: 実行ログ
 
@@ -287,6 +292,18 @@ Phase 1〜2とRegistry/Router、CLI・Web・Discord・Voice移行、実行ログ
 - `ChatSession.build_messages()`はTasksを`ContextBuilder` / `ContextPolicy`経由で描画し、Historyのrole messagesより後に最終文字列blockとして置く
 - 収集失敗は型名だけwarningし、本文をログせず会話を継続する
 - `TasksContextProvider`は`src.context`から公開し、root公開APIテスト済み
+
+### 一部完了: Phase 4 知覚イベントと状態の基盤
+
+- `PerceptionEvent` / `CompanionState`契約（`src/companion/contracts.py`）。raw payload・本文・metadataを持たず、状態遷移に必要な最小フィールドのみ
+- 決定的`StateAggregator`（`src/companion/state.py`）。min_confidence未満とout-of-orderは状態を変えず、`raw_data_retained=True`は`PrivacyViolationError`で拒否。時刻はイベント注入値のみで決定
+- `ActivityEventCollector` / `ActivitySample`（`src/perception/activity.py`）。入力は分類済みapp_category（work / communication / media / system / unknown）とidle_secondsのみで、rawなアプリ名・window title・text・path・pid・raw inputは扱わない
+- 生データ非保持（`raw_data_retained=False`固定）とprivacy違反拒否のテスト済み。`src.perception` / `src.companion`から公開し、root公開APIテスト済み
+- プラットフォーム別ActivitySource adapter（`WindowsActivitySource` / `LinuxActivitySource`）は完了。Linux/X11では`xprintidle`（idle取得）と`xdotool`（アクティブウィンドウPID取得）が必要で、施設が無ければ`ActivitySourceUnavailableError`で明確に失敗する
+- Web runtime wiringは完了: `COMPANION_ACTIVITY_ENABLED=true` のオプトイン時だけActivityRuntimeを起動し、`GET /api/companion/state`（読み取り専用・privacy-safe）でActivityRuntimeStatusの集計カウンタと`CompanionState`フィールドのみ公開。起動失敗は例外型名だけログしてcompanion機能のみ無効化し、Web起動は続行する。プロセス名・PID・アプリ分類・window title・エラー本文・生サンプル/イベントは公開しない
+- `StateAggregator`からDiscord / 音声 / Desktopへのruntime wiringとUI消費は未実装
+
+次の実装単位: UI消費と非Web入口（Discord / Voice / Desktop）へのruntime wiring。Phase 5以降は未着手、Cloud（Phase K）も未着手のまま。
 
 ## 10. 現時点の非目標
 

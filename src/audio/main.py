@@ -4,10 +4,35 @@ STT + LLM + TTS のパイプラインを統合した音声対話
 """
 import sys
 import argparse
+import logging
+import os
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+
+logger = logging.getLogger("audio.main")
+_activity_runtime = None
+
+
+def _start_companion_activity_runtime(env=None):
+    """COMPANION_ACTIVITY_ENABLED=true のときだけ活動収集ランタイムを起動して保持する。"""
+    from src.perception import create_activity_runtime_from_env
+
+    global _activity_runtime
+    _activity_runtime = create_activity_runtime_from_env(
+        os.environ if env is None else env, logger=logger
+    )
+    return _activity_runtime
+
+
+def _stop_companion_activity_runtime():
+    """保持中の活動収集ランタイムを停止し、参照を破棄する。"""
+    global _activity_runtime
+    runtime = _activity_runtime
+    _activity_runtime = None
+    if runtime is not None:
+        runtime.stop()
 
 
 # --- ANSI カラーコード ---
@@ -56,12 +81,16 @@ def main():
 ╚══════════════════════════════════════════╝{Color.RESET}
 """)
 
-    if args.text_mode:
-        # テキスト入力 → TTS再生モード（マイクなしでTTSをテスト可能）
-        run_text_to_speech_mode(args)
-    else:
-        # フル音声対話モード
-        run_voice_mode(args)
+    _start_companion_activity_runtime()
+    try:
+        if args.text_mode:
+            # テキスト入力 → TTS再生モード（マイクなしでTTSをテスト可能）
+            run_text_to_speech_mode(args)
+        else:
+            # フル音声対話モード
+            run_voice_mode(args)
+    finally:
+        _stop_companion_activity_runtime()
 
 
 def run_voice_mode(args):
@@ -89,6 +118,7 @@ def run_voice_mode(args):
         enable_wakeword=args.wakeword,
         wakeword_models=wakeword_models,
         wakeword_threshold=args.wakeword_threshold,
+        activity_runtime=_activity_runtime,
     )
 
     if not pipeline.initialize():

@@ -49,6 +49,12 @@ const GAME_PANEL_KEY = 'subpc_game_panel_open';
 let lastClaimableMissions = null;
 let settingsRestoreFocus = null;
 const runtimeStatus = { ollama: null, stt: null, tts: null, rag: null, websocket: 'connecting' };
+const companionPanel = $('#companion-panel');
+const companionMark = $('#companion-mark');
+const companionStatus = $('#companion-status');
+const companionMeta = $('#companion-meta');
+const COMPANION_POLL_MS = 15000;
+let companionPollTimer = null;
 const pwaInstallButton = $('#pwa-install-btn');
 const pwaInstallStatus = $('#pwa-install-status');
 let deferredInstallPrompt = null;
@@ -414,6 +420,56 @@ async function loadGame({ animate = false } = {}) {
   } catch (e) {
     gameHub.classList.add('game-unavailable');
     console.warn('[Game] Fetch failed:', e);
+  }
+}
+
+const COMPANION_MODE_LABELS = {
+  focused: '集中',
+  idle: 'アイドル',
+  away: '離席',
+};
+
+async function loadCompanionState() {
+  if (!companionPanel) return;
+  try {
+    const resp = await fetch('/api/companion/state', { cache: 'no-store' });
+    if (!resp.ok) throw new Error(`companion ${resp.status}`);
+    const data = await resp.json();
+    if (!data.enabled) {
+      companionPanel.hidden = true;
+      return;
+    }
+    companionPanel.hidden = false;
+    const running = Boolean(data.running);
+    companionMark.classList.toggle('active', running);
+    companionStatus.textContent = running ? '活動中' : '停止中';
+    companionStatus.dataset.state = running ? 'running' : 'stopped';
+    const state = data.state || {};
+    const modeLabel = COMPANION_MODE_LABELS[state.activity_mode] || state.activity_mode || '';
+    const parts = [];
+    if (modeLabel) parts.push(modeLabel);
+    if (Number(data.consecutive_failures) > 0) {
+      parts.push(`失敗 ${data.consecutive_failures}回`);
+    } else if (Number(data.failure_count) > 0) {
+      parts.push(`失敗 ${data.failure_count}回`);
+    }
+    companionMeta.textContent = parts.join(' · ');
+    companionMeta.hidden = parts.length === 0;
+  } catch (e) {
+    companionPanel.hidden = true;
+    console.warn('[Companion] Fetch failed:', e);
+  }
+}
+
+function startCompanionPolling() {
+  loadCompanionState();
+  companionPollTimer = setInterval(loadCompanionState, COMPANION_POLL_MS);
+}
+
+function stopCompanionPolling() {
+  if (companionPollTimer) {
+    clearInterval(companionPollTimer);
+    companionPollTimer = null;
   }
 }
 
@@ -1292,6 +1348,9 @@ function newSession() {
 
 async function init() {
   await Promise.all([loadGrowth(), loadGame()]);
+  startCompanionPolling();
+  window.addEventListener('pagehide', stopCompanionPolling);
+  window.addEventListener('beforeunload', stopCompanionPolling);
 
   // 状態取得
   try {

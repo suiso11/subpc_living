@@ -29,6 +29,16 @@ ApplicationWindow {
         else if (currentPage === 2) logsPage.activate()
         else bridge.loadGame()
     }
+    function companionText() {
+        var cs = bridge.companionState
+        if (!cs.enabled) return ""
+        var s = cs.state
+        if (!s) return "相棒: 起動中"
+        if (s.activity_mode === "focused") return "相棒: 集中"
+        if (s.activity_mode === "idle") return "相棒: 待機"
+        if (s.activity_mode === "away" || !s.present) return "相棒: 離席"
+        return "相棒: 観察中"
+    }
     onCurrentPageChanged: {
         if (currentPage === 0) { bridge.loadGame(); bridge.loadGrowth() }
         else if (currentPage === 1) bridge.loadTasks()
@@ -197,6 +207,28 @@ ApplicationWindow {
                 color: bridge.connected ? Theme.green : Theme.warning
                 font.family: Theme.monoFont; font.pixelSize: 10
                 elide: Text.ElideRight
+            }
+            Rectangle {
+                id: companionPill
+                objectName: "companionPill"
+                visible: bridge.companionState.enabled
+                implicitWidth: companionRow.implicitWidth + 16
+                implicitHeight: 26
+                radius: Theme.radiusSmall
+                color: Theme.backgroundRaised
+                border.color: Theme.lineSoft
+                RowLayout {
+                    id: companionRow
+                    anchors.centerIn: parent
+                    spacing: 6
+                    Rectangle { implicitWidth: 6; implicitHeight: 6; radius: 3; color: bridge.companionState.running ? Theme.green : Theme.warning }
+                    Label {
+                        text: companionText()
+                        color: Theme.textMuted
+                        font.family: Theme.monoFont
+                        font.pixelSize: 10
+                    }
+                }
             }
             BusyIndicator { running: bridge.loading; visible: running; implicitWidth: 28; implicitHeight: 28 }
             Button {

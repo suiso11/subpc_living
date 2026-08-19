@@ -7,6 +7,8 @@ from urllib.parse import quote
 
 import httpx
 
+from src.perception import companion_state_payload
+
 
 class DesktopApiError(RuntimeError):
     """A backend request failed with a user-displayable message."""
@@ -227,3 +229,7 @@ class DesktopApi:
             f"/api/logs/files/{quote(name, safe='')}",
             params={"lines": max(10, min(int(lines), 2000))},
         )
+
+    def companion_state(self, runtime: Any = None) -> dict[str, Any]:
+        """ローカル companion activity runtime の読み取り専用・privacy-safe な状態。"""
+        return companion_state_payload(runtime)

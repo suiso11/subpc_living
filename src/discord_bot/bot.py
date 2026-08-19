@@ -68,6 +68,11 @@ from src.diary.collector import DiaryCollector
 from src.diary.service import DailyDiaryResult, DailyDiaryService
 from src.integrations.google_calendar import GoogleCalendarMCPClient
 from src.persona.daily_personalizer import DailyPersonalizer, PersonalizationResult
+from src.perception import (
+    ActivityRuntime,
+    companion_state_payload,
+    create_activity_runtime_from_env,
+)
 from src.service.healthcheck import HealthChecker
 from src.tasks.reminder import TaskReminderEngine, parse_quiet_hours
 from src.tasks.prioritizer import PriorityController, format_focus_decision
@@ -88,6 +93,46 @@ VOICE_TRANSCRIPT_RE = re.compile(
     r"^\[\d{2}:\d{2}:\d{2}\]\s+(?P<speaker>.+?):\s*(?P<text>.+)$", re.DOTALL
 )
 MAX_DISCORD_MESSAGE = 1900
+
+# Companion activity (オプトイン)。Web と同じ create_activity_runtime_from_env を
+# 使い、起動済みの runtime をモジュール変数で保持して終了時に stop する。
+activity_runtime: ActivityRuntime | None = None
+
+
+def start_companion_activity_runtime() -> None:
+    """COMPANION_ACTIVITY_ENABLED=true のときだけ companion activity を起動する。
+
+    create_activity_runtime_from_env へ委譲し、結果をモジュール変数に保持する。
+    false / 設定不正 / 起動失敗なら None のまま (companion 機能のみ無効)。
+    """
+    global activity_runtime
+    if activity_runtime is not None:
+        return
+    activity_runtime = create_activity_runtime_from_env(os.environ, logger=logger)
+    if activity_runtime is not None:
+        logger.info("[Discord] companion activity started")
+    else:
+        logger.info(
+            "[Discord] companion activity disabled "
+            "(COMPANION_ACTIVITY_ENABLED=true で有効化)"
+        )
+
+
+def stop_companion_activity_runtime() -> None:
+    """起動済みの companion activity runtime を停止する (未起動なら何もしない)。"""
+    global activity_runtime
+    if activity_runtime is not None:
+        activity_runtime.stop()
+        activity_runtime = None
+
+
+def companion_status_line(runtime: ActivityRuntime | None) -> str:
+    """privacy-safe な companion 状態を status_text 用の1行にする。
+
+    プロセス名・PID・アプリ分類・window title・エラー本文・生サンプル/イベントは
+    companion_state_payload が既に除外する。
+    """
+    return f"companion: {companion_state_payload(runtime)}\n"
 
 
 def load_env_file(path: Path) -> None:
@@ -1207,6 +1252,7 @@ class DiscordConsoleState:
             f"proactive_conversation: "
             f"{self.proactive_bridge.conversation_status() if self.proactive_bridge else 'disabled'}\n"
             f"service_control: {self.allow_service_control}\n"
+            f"{companion_status_line(activity_runtime)}"
             f"{self.training_log.summary_text() if self.training_log else 'training_log: unavailable'}\n"
             f"checks: {health['checks']}"
         )
@@ -1518,6 +1564,7 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
 
     @bot.event
     async def setup_hook() -> None:
+        start_companion_activity_runtime()
         if board_manager.enabled:
             # 再起動後もボードのボタン/Selectを生かすため、永続Viewを登録する。
             bot.add_view(TaskBoardView(board_manager))
@@ -2703,6 +2750,7 @@ def main() -> None:
     try:
         bot.run(token)
     finally:
+        stop_companion_activity_runtime()
         state.close()
 
 

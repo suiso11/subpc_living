@@ -12,10 +12,13 @@ import threading
 import queue
 import numpy as np
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+
+if TYPE_CHECKING:
+    from src.perception import ActivityRuntime
 
 from src.audio.stt import WhisperSTT
 from src.audio.tts_factory import backend_name, create_tts_backend
@@ -73,9 +76,13 @@ class VoicePipeline:
         enable_wakeword: bool = False,
         wakeword_models: Optional[list[str]] = None,
         wakeword_threshold: float = 0.5,
+        activity_runtime: Optional["ActivityRuntime"] = None,
     ):
         # チャット設定
         self.config = chat_config or ChatConfig.load(PROJECT_ROOT / "config" / "chat_config.json")
+
+        # Companion 活動収集ランタイム (オプトイン、main 側で起動・停止を管理)
+        self.activity_runtime = activity_runtime
 
         # STT (faster-whisper) — Phase 9: device="auto" でGPU自動検出
         self.stt = WhisperSTT(

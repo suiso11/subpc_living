@@ -44,6 +44,12 @@ from src.memory.rag import RAGRetriever
 from src.vision.context import VisionContext
 from src.screen.context import ScreenContext
 from src.screen import create_screen_context
+from src.perception import (
+    ActivityRuntime,
+    create_activity_source,
+    create_activity_runtime_from_env,
+    companion_state_payload,
+)
 from src.monitor.context import MonitorContext
 from src.persona.profile import UserProfile
 from src.persona.summarizer import ConversationSummarizer
@@ -80,6 +86,7 @@ preloader: SessionPreloader = None
 web_search: Optional[WebSearchContext] = None
 sessions: dict[str, ChatSession] = {}
 idle_manager: Optional[IdleManager] = None
+activity_runtime: Optional[ActivityRuntime] = None
 task_store: Optional[TaskStore] = None
 task_chat_editor = TaskChatEditor()
 growth_tracker: Optional[GrowthTracker] = None
@@ -142,10 +149,22 @@ def get_secure_web_url() -> str:
     return ""
 
 
+def _start_companion_activity_runtime() -> Optional[ActivityRuntime]:
+    """オプトインの活動収集ランタイムを起動する。
+
+    env 読取と ActivityRuntime 生成は src.perception.bootstrap の
+    create_activity_runtime_from_env へ委譲する。数値設定不正や起動失敗は
+    companion 機能だけを無効化し、Web 起動は続行する。
+    """
+    global activity_runtime
+    activity_runtime = create_activity_runtime_from_env(os.environ, logger=logger)
+    return activity_runtime
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """サーバー起動/終了時の処理"""
-    global config, llm, assistant_service, provider_registry, tts, stt, rag, vision, screen, monitor, profile, summarizer, preloader, web_search, idle_manager, task_store, growth_tracker, tasks_timezone, task_calendar_sync, calendar_client, tasks_calendar_id
+    global config, llm, assistant_service, provider_registry, tts, stt, rag, vision, screen, monitor, profile, summarizer, preloader, web_search, idle_manager, task_store, growth_tracker, tasks_timezone, task_calendar_sync, calendar_client, tasks_calendar_id, activity_runtime
 
     logger.info("Web UI サーバー起動中...")
 
@@ -372,6 +391,14 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("✅ IdleManager OK (GPU電力制御は無効: %s)", idle_manager.gpu_power_control_reason)
 
+    # Companion 活動収集 (オプトイン)。false または設定不正・起動失敗なら
+    # companion 機能だけ無効化して Web 起動は続行する。
+    activity_runtime = _start_companion_activity_runtime()
+    if activity_runtime is not None:
+        logger.info("✅ Companion activity OK (companion state API有効)")
+    else:
+        logger.info("Companion activity 無効 (COMPANION_ACTIVITY_ENABLED=true で有効化)")
+
     local_ip = get_local_ip()
     logger.info("✅ サーバー起動完了! PC: http://localhost:8000 / スマホ: http://%s:8000", local_ip)
 
@@ -394,6 +421,10 @@ async def lifespan(app: FastAPI):
     pending_candidates = list(_candidate_offer_tasks)
     if pending_candidates:
         await asyncio.gather(*pending_candidates, return_exceptions=True)
+
+    # Companion 活動ランタイムを共有リソースを閉じる前に停止する。
+    if activity_runtime is not None:
+        activity_runtime.stop()
 
     # 終了処理
     # IdleManager 停止
@@ -539,6 +570,7 @@ async def health():
         "persona": profile is not None,
         "growth": growth_tracker is not None,
         "idle_manager": idle_manager is not None and idle_manager.is_running,
+        "companion": activity_runtime is not None and activity_runtime.is_running,
     }
 
     status_code = 200 if result["status"] == "ok" else 503
@@ -817,6 +849,7 @@ async def status():
         "persona_status": preloader.get_status() if preloader else None,
         "growth": growth_tracker is not None,
         "idle_manager": idle_manager.get_status() if idle_manager else None,
+        "companion": activity_runtime is not None,
         "tasks": task_store is not None,
         "tasks_timezone": tasks_timezone,
     }
@@ -1820,6 +1853,22 @@ async def idle_status():
     if idle_manager is None:
         return {"enabled": False}
     return {"enabled": True, **idle_manager.get_status()}
+
+
+# --- Companion API ---
+
+def _companion_state_payload() -> dict:
+    """GET /api/companion/state のレスポンス (読み取り専用・privacy-safe)。
+
+    src.perception.bootstrap の共通 helper へ委譲する。
+    """
+    return companion_state_payload(activity_runtime)
+
+
+@app.get("/api/companion/state")
+async def companion_state():
+    """コンパニオン活動状態 (読み取り専用)。未オプトイン時は enabled=false。"""
+    return _companion_state_payload()
 
 
 # --- ログ管理 API ---

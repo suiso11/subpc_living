@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
+import os
 import tempfile
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -15,10 +17,14 @@ from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtNetwork import QAbstractSocket
 from PySide6.QtWebSockets import QWebSocket
 
+from src.perception import create_activity_runtime_from_env
+
 from .api import DesktopApi
 from .audio import NativeAudioRecorder
 from .config import DesktopSettings
 from .windows import is_autostart_enabled, set_autostart
+
+logger = logging.getLogger(__name__)
 
 
 class _WorkerSignals(QObject):
@@ -61,6 +67,7 @@ class DesktopBridge(QObject):
     autostartChanged = Signal()
     ttsEnabledChanged = Signal()
     ttsVoicesChanged = Signal()
+    companionStateChanged = Signal()
     toast = Signal(str, str)
     nativeNotification = Signal(str, str)
 
@@ -110,9 +117,17 @@ class DesktopBridge(QObject):
         self._notified_due: set[str] = set()
         self.recorder = NativeAudioRecorder()
 
+        self._activity_runtime = create_activity_runtime_from_env(os.environ, logger=logger)
+
         self.reminder_timer = QTimer(self)
         self.reminder_timer.setInterval(60_000)
         self.reminder_timer.timeout.connect(self.loadTasks)
+
+        self.companion_timer = QTimer(self)
+        self.companion_timer.setInterval(5_000)
+        self.companion_timer.timeout.connect(self.companionStateChanged)
+        if self._activity_runtime is not None:
+            self.companion_timer.start()
 
         self.socket = QWebSocket("SUBPC BUDDY")
         self.socket.connected.connect(self._socket_connected)
@@ -209,6 +224,10 @@ class DesktopBridge(QObject):
     @Property("QVariantList", notify=ttsVoicesChanged)
     def ttsVoices(self) -> list[dict[str, str]]:
         return self._tts_voices
+
+    @Property("QVariantMap", notify=companionStateChanged)
+    def companionState(self) -> dict[str, Any]:
+        return self.api.companion_state(self._activity_runtime)
 
     @Slot()
     def initialize(self) -> None:
@@ -784,9 +803,12 @@ class DesktopBridge(QObject):
     def shutdown(self) -> None:
         self._shutting_down = True
         self.reminder_timer.stop()
+        self.companion_timer.stop()
         self.reconnect_timer.stop()
         if self.recorder.recording:
             self.recorder.stop()
         self.socket.close()
         self.api.close()
+        if self._activity_runtime is not None:
+            self._activity_runtime.stop()
         self._remove_audio_temp()
