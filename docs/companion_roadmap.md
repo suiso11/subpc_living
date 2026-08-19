@@ -165,7 +165,7 @@ Contextをすべて構築してから送信先を決めてはいけない。先�
 - `ContextBlock`契約とmetadataベース`ContextPolicy`（基盤完了）
 - History Context Provider / Builder移行とChatSessionへの適用（完了）
 - Preload Context Provider移行（完了・SessionPreloader由来のprofile/schedule/summaryを一括で包む）
-- RAG、予定、画面などのContext Providerへの段階分離（未着手・Tasksは最後）
+- Web search、予定、画面などのContext Providerへの段階分離（未着手・Tasksは最後）
 - ローカルモデルRegistry（完了）
 - 手動ルーティングと経路ログ（完了）
 
@@ -198,7 +198,7 @@ Contextをすべて構築してから送信先を決めてはいけない。先�
 
 ## 9. 現在の実装進行単位
 
-Phase 1〜2とRegistry/Router、CLI・Web・Discord・Voice移行、実行ログの実装とruntime wiringは完了し、Phase 3の`ContextBlock` / `ContextPolicy`基盤、History Context Provider / Builder移行、Preload Context Provider移行（SessionPreloader由来のprofile/schedule/summaryを一括で包む）も完了した。現在はPhase Jの次の実装単位であるRAG Context Provider移行へ進んでいる。
+Phase 1〜2とRegistry/Router、CLI・Web・Discord・Voice移行、実行ログの実装とruntime wiringは完了し、Phase 3の`ContextBlock` / `ContextPolicy`基盤、History Context Provider / Builder移行、Preload Context Provider移行（SessionPreloader由来のprofile/schedule/summaryを一括で包む）、RAG Context Provider移行（prompt injectionのみ）も完了した。現在はPhase Jの次の実装単位であるWeb search Context Provider移行へ進んでいる。
 
 ### 完了: 実行ログ
 
@@ -223,7 +223,7 @@ Phase 1〜2とRegistry/Router、CLI・Web・Discord・Voice移行、実行ログ
 
 - `HistoryContextProvider`が現在の履歴を不変な`ContextMessage`列へコピーし、`ContextBlock`（source=history / sensitivity=personal / local_only=True）として返す
 - `ContextBuilder`がPolicy通過済みブロックを既存互換のrole/content dict列へ描画し、`ChatSession.build_messages()`へ組み込み済み
-- 次はPreloadをContext Provider化し、続いてRAG、予定、画面などを順次分離する（Tasksは最後）
+- 次はPreloadをContext Provider化し、続いてRAG、Web search、予定、画面などを順次分離する（Tasksは最後）
 
 ### 完了: Preload Context Provider移行（profile/schedule/summaryを一括で包む）
 
@@ -233,7 +233,17 @@ Phase 1〜2とRegistry/Router、CLI・Web・Discord・Voice移行、実行ログ
 - `ContextBuilder.build_system_content()`がstr blockだけをbase systemへ連結し、構造化blockは`StructuredBlockNotAllowedError`で明示拒否する
 - `ChatSession.build_messages()`はPreloadを`ContextPolicy`経由（local_only / local target）で描画し、既存のsystem_prompt直後・RAG前の位置を維持
 - `PreloadContextProvider`と`StructuredBlockNotAllowedError`は`src.context`から公開し、root公開APIテスト済み
-- 次はRAG Context Provider移行（Tasksは最後）
+- 次はWeb search Context Provider移行（Tasksは最後）
+
+### 完了: RAG Context Provider移行（prompt injectionのみ）
+
+- `RAGContextProvider.collect(retriever, query)`が`build_context_prompt(query)`の結果をsource=rag / sensitivity=personal / local_only=Trueのstr ContextBlockとして返す
+- `RAGSource` Protocolで型契約だけを定義し、`RAGRetriever`本体は変更しない。store_turn / store_knowledge / retrieveの実装自体は変更・呼び出しせず、RAGはプロンプトへの注入のみを行う
+- 空・空白のみ・非strの結果、およびretrieverの例外時はNoneを返す。例外は型名だけlogging.warningに残し、query・本文・例外本文はログしない。収集失敗で会話は止まらず継続する
+- `ChatSession.build_messages()`はRAGを`ContextBuilder` / `ContextPolicy`経由（local_only / local target）で描画し、Preload直後・Web search前の既存位置を維持する
+- `store_turn`による会話記録は従来どおり呼び出される
+- `RAGContextProvider`と`RAGSource`は`src.context`から公開し、root公開APIテスト済み
+- 次はWeb search Context Provider移行（Tasksは最後）
 
 ## 10. 現時点の非目標
 

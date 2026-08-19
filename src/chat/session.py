@@ -143,10 +143,20 @@ class ChatSession:
                 if msg["role"] == "user":
                     last_user = msg["content"]
                     break
+            # Phase J: RAGContextProvider + ContextBuilder 経由で描画する。
+            # Preload 直後・Web search 前の現行位置を維持し、local_only / local target
+            # で ContextPolicy に通した str block だけを base system へ連結する。
             if last_user:
-                rag_context = self.rag.build_context_prompt(last_user)
-                if rag_context:
-                    system_content = system_content + rag_context
+                from src.context.builder import ContextBuilder
+                from src.context.providers.rag import RAGContextProvider
+
+                rag_block = RAGContextProvider.collect(self.rag, last_user)
+                builder = ContextBuilder(system_content)
+                system_content = builder.build_system_content(
+                    [rag_block] if rag_block is not None else [],
+                    privacy="local_only",
+                    target_local=True,
+                )
 
         if self.web_search is not None and self._messages:
             last_user = None

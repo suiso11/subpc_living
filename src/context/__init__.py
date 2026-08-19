@@ -9,7 +9,12 @@ from .contracts import (
     Sensitivity,
 )
 from .policy import ContextPolicy, ContextPolicyError
-from .providers import HistoryContextProvider, PreloadContextProvider
+from .providers import (
+    HistoryContextProvider,
+    PreloadContextProvider,
+    RAGContextProvider,
+    RAGSource,
+)
 
 __all__ = [
     "TASKS_SOURCE",
@@ -22,6 +27,8 @@ __all__ = [
     "ContextPolicyError",
     "HistoryContextProvider",
     "PreloadContextProvider",
+    "RAGContextProvider",
+    "RAGSource",
     "Sensitivity",
     "StructuredBlockNotAllowedError",
 ]
