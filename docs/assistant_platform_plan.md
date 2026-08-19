@@ -27,7 +27,11 @@
 - [x] Preload移行（完了・SessionPreloader由来のprofile/schedule/summaryを一括で包む）
 - [x] RAG移行（完了・prompt injectionのみ）
 - [x] Web search移行（完了・Context Provider化のみ、検索ロジックは未変更）
-- [ ] Monitor移行（次アクション）
+- [x] Monitor移行（完了）
+- [x] Vision / Screen移行（完了・secret / local_only）
+- [x] Calendar移行（完了）
+- [x] Tasks移行（完了・最終権威ブロックとして末尾）
+- [ ] Cloud経路（Phase K、未着手・明示判断待ち）
 
 ## 1. ゴール
 
@@ -67,7 +71,7 @@ flowchart TD
 - `src/audio/main.py`: `AssistantService.generate_stream()`を使用
 - `src/audio/pipeline.py`: `AssistantService.generate_stream()`とTTSを直接接続
 - `src/diary/**`, `src/persona/**`: 内部バッチ処理として`LLMProvider`を直接利用（`AssistantService`は通さない）
-- `src/chat/session.py`: 履歴は`HistoryContextProvider`、Preloadは`PreloadContextProvider` / `ContextBuilder`経由で`ContextBlock`化して構築済み。PreloadはSessionPreloaderがprofile・schedule・summary・時刻を一つのstrへまとめた結果を包む移行であり、独立Profile Providerではない。RAGは`RAGContextProvider` / `ContextBuilder`経由で`ContextBlock`化して構築済み（prompt injectionのみ）。Web searchは`WebSearchContextProvider` / `ContextBuilder`経由で`ContextBlock`化して構築済み（Context Provider化のみ・検索ロジックは未変更）。画面、カメラ、予定、タスクは引き続き一つのプロンプトへ構築し、Phase Jで順次Provider分離する（Monitorは次）
+- `src/chat/session.py`: 履歴は`HistoryContextProvider`、Preloadは`PreloadContextProvider` / `ContextBuilder`経由で`ContextBlock`化して構築済み。PreloadはSessionPreloaderがprofile・schedule・summary・時刻を一つのstrへまとめた結果を包む移行であり、独立Profile Providerではない。RAGは`RAGContextProvider` / `ContextBuilder`経由で`ContextBlock`化して構築済み（prompt injectionのみ）。Web searchは`WebSearchContextProvider` / `ContextBuilder`経由で`ContextBlock`化して構築済み（Context Provider化のみ・検索ロジックは未変更）。Vision / Screen（secret / local_only）、Monitor / Calendar（personal / local_only）も各Context Provider経由で`ContextBlock`化して構築済み。Tasksは最終権威ブロックとしてsystem本文の末尾に置き、Historyのrole messagesは最後に`ContextBuilder`経由で描画する。Phase Jは完了し、Cloud経路（Phase K）のみ未着手のまま
 
 ### 守る制約
 
@@ -432,8 +436,12 @@ Routerを高度化する前にSQLiteへ事実を記録する。実装とruntime 
 - Preload移行は完了: `PreloadContextProvider`（source=preload / sensitivity=personal / local_only=True）を実装し、`ContextBuilder.build_system_content()`と`ChatSession.build_messages()`へ組み込み済み。SessionPreloaderがprofile・schedule・summary・時刻を一つのstrへまとめた結果を包むPreloadであり、独立したProfile Providerは未実装。収集失敗時は本文をログせず型名だけwarningし、会話は継続する。`PreloadContextProvider`と`StructuredBlockNotAllowedError`は`src.context`から公開し、root公開APIテスト済み
 - RAG移行は完了: `RAGContextProvider`（source=rag / sensitivity=personal / local_only=True）を実装し、`ChatSession.build_messages()`へ組み込み済み。`build_context_prompt(query)`の結果を包むだけで、retriever側のstore_turn / store_knowledge / retrieveは変更・呼び出しせず`RAGRetriever`本体も変更しない（prompt injectionのみ）。空・空白のみ・非strの結果、例外時はNoneを返し、失敗は型名だけwarningしてquery・本文・例外本文をログせず会話を継続する。`RAGContextProvider`と`RAGSource`は`src.context`から公開し、root公開APIテスト済み
 - Web search移行は完了: `WebSearchContextProvider`（source=web_search / sensitivity=personal / local_only=True）を実装し、`ChatSession.build_messages()`へ組み込み済み。`build_context_prompt(query)`の結果を包むだけで、web_search側のsearch / should_search / cache / 判定ロジック自体は変更・呼び出しせず`WebSearchContext`本体も変更しない（Context Provider化のみ）。queryを含み得るためlocal_only。空・空白のみ・非strの結果、例外時はNoneを返し、失敗は型名だけwarningしてquery・本文・例外本文をログせず会話を継続する。`WebSearchContextProvider`と`WebSearchSource`は`src.context`から公開し、root公開APIテスト済み
-- Phase J全体は未完了。Monitor / Vision / Screen / Calendar / Tasksは未着手、Cloud経路（Phase K）も未着手のまま
-- 次の実装単位: Monitor移行（下記移行順の5番目）
+- Monitor移行は完了: `MonitorContextProvider`（source=monitor / sensitivity=personal / local_only=True）を実装し、`ChatSession.build_messages()`へ組み込み済み。`MonitorContext`の結果を包むだけで、本体は変更しない。収集失敗は型名だけwarningして本文をログせず、会話を継続する。`MonitorContextProvider`と`MonitorSource`は`src.context`から公開し、root公開APIテスト済み
+- Vision / Screen移行は完了: `VisionContextProvider`（source=vision / sensitivity=secret / local_only=True）と`ScreenContextProvider`（source=screen / sensitivity=secret / local_only=True）を実装し、`ChatSession.build_messages()`へ組み込み済み。どちらもsecret / local_onlyのため非Local経路へ渡らない。各収集失敗は型名だけwarningして本文をログせず、会話を継続する。各Providerは`src.context`から公開し、root公開APIテスト済み
+- Calendar移行は完了: `CalendarContextProvider`（source=calendar / sensitivity=personal / local_only=True）を実装し、`ChatSession.build_messages()`へ組み込み済み。`CalendarContext`の結果（ファイル読取のみ）を包むだけで、本体は変更しない。収集失敗は型名だけwarningして本文をログせず、会話を継続する。`CalendarContextProvider`と`CalendarSource`は`src.context`から公開し、root公開APIテスト済み
+- Tasks移行は完了: `TasksContextProvider`（source=TASKS_SOURCE / sensitivity=personal / local_only=True）を実装し、最終権威ブロックとして`ChatSession.build_messages()`のsystem本文末尾へ組み込み済み。0件でも必ず注入する。Historyのrole messagesはその後ろに`ContextBuilder`経由で描画する。収集失敗は型名だけwarningして本文をログせず、会話を継続する。`TasksContextProvider`は`src.context`から公開し、root公開APIテスト済み
+- Phase J全体は完了。Cloud経路（Phase K）は未着手のまま無効で、明示判断待ち
+- 次の実装単位: Phase 4の意味イベント化 / State Aggregator（companion側）
 
 移行順:
 
@@ -441,10 +449,10 @@ Routerを高度化する前にSQLiteへ事実を記録する。実装とruntime 
 2. Preload（完了・SessionPreloader由来のprofile/schedule/summaryを一括で包む）
 3. RAG（完了・prompt injectionのみ）
 4. Web search（完了・Context Provider化のみ、検索ロジックは未変更）
-5. Monitor（次の実装単位）
-6. Vision / Screen
-7. Calendar
-8. Tasks
+5. Monitor（完了）
+6. Vision / Screen（完了）
+7. Calendar（完了）
+8. Tasks（完了）
 
 Tasksは最終権威ブロックのため最後に移行する。
 
@@ -474,9 +482,9 @@ src/context/
 - 収集失敗した任意Contextで会話全体を止めない
 - Policyの単体テストで実際の送信Payloadを検査できる
 
-### Phase K: Cloudと承認
+### Phase K: Cloudと承認（未着手・明示判断待ち）
 
-Phase J完了前は着手しない。
+Phase Jは完了したが、Cloud経路は自動着手せず無効のまま。開始するかどうかはユーザー・オーケストレーターの明示判断待ち。
 
 必要条件:
 

@@ -160,13 +160,17 @@ Contextをすべて構築してから送信先を決めてはいけない。先�
 - CLIを最初のAdapterとして接続
 - Web、Discord、音声を一つずつ移行
 
-### Phase 3: ContextとRouter（一部完了）
+### Phase 3: ContextとRouter（完了）
 
-- `ContextBlock`契約とmetadataベース`ContextPolicy`（基盤完了）
+- `ContextBlock`契約とmetadataベース`ContextPolicy`（完了）
 - History Context Provider / Builder移行とChatSessionへの適用（完了）
 - Preload Context Provider移行（完了・SessionPreloader由来のprofile/schedule/summaryを一括で包む）
+- RAG Context Provider移行（完了・prompt injectionのみ）
 - Web search Context Provider移行（完了・Context Provider化のみ、検索ロジックは未変更）
-- 予定、画面などのContext Providerへの段階分離（未着手・Monitorは次、Tasksは最後）
+- Monitor Context Provider移行（完了）
+- Vision / Screen Context Provider移行（完了・secret / local_only）
+- Calendar Context Provider移行（完了）
+- Tasks Context Provider移行（完了・最終権威ブロックとして末尾）
 - ローカルモデルRegistry（完了）
 - 手動ルーティングと経路ログ（完了）
 
@@ -199,7 +203,7 @@ Contextをすべて構築してから送信先を決めてはいけない。先�
 
 ## 9. 現在の実装進行単位
 
-Phase 1〜2とRegistry/Router、CLI・Web・Discord・Voice移行、実行ログの実装とruntime wiringは完了し、Phase 3の`ContextBlock` / `ContextPolicy`基盤、History Context Provider / Builder移行、Preload Context Provider移行（SessionPreloader由来のprofile/schedule/summaryを一括で包む）、RAG Context Provider移行（prompt injectionのみ）、Web search Context Provider移行（Context Provider化のみ・検索ロジックは未変更）も完了した。Phase J全体は未完のまま、現在は次の実装単位であるMonitor Context Provider移行へ進んでいる。
+Phase 1〜2とRegistry/Router、CLI・Web・Discord・Voice移行、実行ログの実装とruntime wiringは完了し、Phase 3の`ContextBlock` / `ContextPolicy`基盤、History・Preload・RAG・Web search・Monitor・Vision・Screen・Calendar・Tasksの各Context Provider移行も完了した。Phase J全体は完了し、現在は次の実装単位であるPhase 4の意味イベント化とState Aggregatorへ進んでいる。
 
 ### 完了: 実行ログ
 
@@ -224,7 +228,7 @@ Phase 1〜2とRegistry/Router、CLI・Web・Discord・Voice移行、実行ログ
 
 - `HistoryContextProvider`が現在の履歴を不変な`ContextMessage`列へコピーし、`ContextBlock`（source=history / sensitivity=personal / local_only=True）として返す
 - `ContextBuilder`がPolicy通過済みブロックを既存互換のrole/content dict列へ描画し、`ChatSession.build_messages()`へ組み込み済み
-- 次はPreloadをContext Provider化し、続いてRAG、Web search、予定、画面などを順次分離する（Tasksは最後）
+- 次はPreloadをContext Provider化し、続いてRAG、Web search、予定、画面などを順次分離する（Tasksは最後）。（以降の分離はすべて完了済み）
 
 ### 完了: Preload Context Provider移行（profile/schedule/summaryを一括で包む）
 
@@ -234,7 +238,7 @@ Phase 1〜2とRegistry/Router、CLI・Web・Discord・Voice移行、実行ログ
 - `ContextBuilder.build_system_content()`がstr blockだけをbase systemへ連結し、構造化blockは`StructuredBlockNotAllowedError`で明示拒否する
 - `ChatSession.build_messages()`はPreloadを`ContextPolicy`経由（local_only / local target）で描画し、既存のsystem_prompt直後・RAG前の位置を維持
 - `PreloadContextProvider`と`StructuredBlockNotAllowedError`は`src.context`から公開し、root公開APIテスト済み
-- 次はMonitor Context Provider移行（Tasksは最後）
+- 次はMonitor Context Provider移行（Tasksは最後）（以降の分離はすべて完了済み）
 
 ### 完了: RAG Context Provider移行（prompt injectionのみ）
 
@@ -244,7 +248,6 @@ Phase 1〜2とRegistry/Router、CLI・Web・Discord・Voice移行、実行ログ
 - `ChatSession.build_messages()`はRAGを`ContextBuilder` / `ContextPolicy`経由（local_only / local target）で描画し、Preload直後・Web search前の既存位置を維持する
 - `store_turn`による会話記録は従来どおり呼び出される
 - `RAGContextProvider`と`RAGSource`は`src.context`から公開し、root公開APIテスト済み
-- 次はMonitor Context Provider移行（Tasksは最後）
 
 ### 完了: Web search Context Provider移行（Context Provider化のみ・検索ロジックは未変更）
 
@@ -253,7 +256,37 @@ Phase 1〜2とRegistry/Router、CLI・Web・Discord・Voice移行、実行ログ
 - 空・空白のみ・非strの結果、および例外時はNoneを返す。例外は型名だけlogging.warningに残し、query・本文・例外本文はログしない。収集失敗で会話は止まらず継続する
 - `ChatSession.build_messages()`はWeb searchを`ContextBuilder` / `ContextPolicy`経由（local_only / local target）で描画し、RAG直後・Vision前の既存位置を維持する
 - `WebSearchContextProvider`と`WebSearchSource`は`src.context`から公開し、root公開APIテスト済み
-- 次はMonitor Context Provider移行（Tasksは最後）
+
+### 完了: Monitor Context Provider移行
+
+- `MonitorContextProvider.collect(monitor)`が`MonitorContext`の結果をsource=monitor / sensitivity=personal / local_only=Trueのstr ContextBlockとして返す
+- `MonitorSource` Protocolで型契約だけを定義し、`MonitorContext`本体は変更しない。収集失敗は型名だけwarningし、query・本文・例外本文はログしない。会話は止まらず継続する
+- `ChatSession.build_messages()`はMonitorを`ContextBuilder` / `ContextPolicy`経由（local_only / local target）で描画し、Vision直後・Screen前の既存位置を維持する
+- `MonitorContextProvider`と`MonitorSource`は`src.context`から公開し、root公開APIテスト済み
+
+### 完了: Vision / Screen Context Provider移行
+
+- `VisionContextProvider.collect(vision)`がsource=vision / sensitivity=secret / local_only=True、`ScreenContextProvider.collect(screen)`がsource=screen / sensitivity=secret / local_only=Trueのstr ContextBlockとして返す
+- どちらもsecret / local_onlyのため非Local経路へ渡らない
+- `ChatSession.build_messages()`はVisionをWeb search直後・Monitor前、ScreenをMonitor直後・Calendar前の既存位置に`ContextBuilder` / `ContextPolicy`経由で描画する
+- 各収集失敗は型名だけwarningし、本文をログせず会話を継続する
+- 各Providerは`src.context`から公開し、root公開APIテスト済み
+
+### 完了: Calendar Context Provider移行
+
+- `CalendarContextProvider.collect(calendar)`がsource=calendar / sensitivity=personal / local_only=Trueのstr ContextBlockとして返す
+- `CalendarSource` Protocolで型契約だけを定義し、`CalendarContext`本体は変更しない（ファイル読取のみ）
+- `ChatSession.build_messages()`はCalendarをScreen直後・Emotion前の既存位置に`ContextBuilder` / `ContextPolicy`経由で描画する
+- 収集失敗は型名だけwarningし、本文をログせず会話を継続する
+- `CalendarContextProvider`と`CalendarSource`は`src.context`から公開し、root公開APIテスト済み
+
+### 完了: Tasks Context Provider移行
+
+- `TasksContextProvider.collect(task_store)`がsource=TASKS_SOURCE / sensitivity=personal / local_only=Trueのstr ContextBlockとして返す
+- Tasksは最終権威ブロックとしてsystem本文の末尾に配置され、0件でも必ず注入される
+- `ChatSession.build_messages()`はTasksを`ContextBuilder` / `ContextPolicy`経由で描画し、Historyのrole messagesより後に最終文字列blockとして置く
+- 収集失敗は型名だけwarningし、本文をログせず会話を継続する
+- `TasksContextProvider`は`src.context`から公開し、root公開APIテスト済み
 
 ## 10. 現時点の非目標
 

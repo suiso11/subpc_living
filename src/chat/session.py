@@ -180,32 +180,69 @@ class ChatSession:
                     target_local=True,
                 )
 
-        # Vision: カメラ映像の現在の状態を注入
+        # Vision: カメラ映像の現在の状態を注入 (Phase J)
+        # Phase J: VisionContextProvider + ContextBuilder 経由で描画する。
+        # Web search 直後・Monitor 前の現行位置を維持し、local_only / local target
+        # で ContextPolicy に通した str block だけを base system へ連結する。
         if self.vision_context is not None:
-            vision_text = self.vision_context.get_context_text()
-            if vision_text:
-                system_content = system_content + vision_text
+            from src.context.builder import ContextBuilder
+            from src.context.providers.vision import VisionContextProvider
 
-        # Monitor: サブPCの状態を注入 (Phase 6)
+            vision_block = VisionContextProvider.collect(self.vision_context)
+            builder = ContextBuilder(system_content)
+            system_content = builder.build_system_content(
+                [vision_block] if vision_block is not None else [],
+                privacy="local_only",
+                target_local=True,
+            )
+
+        # Monitor: サブPCの状態を注入 (Phase J)
+        # Phase J: MonitorContextProvider + ContextBuilder 経由で描画する。
+        # Vision 直後・Screen 前の現行位置を維持し、local_only / local target
+        # で ContextPolicy に通した str block だけを base system へ連結する。
         if self.monitor_context is not None:
-            monitor_text = self.monitor_context.get_context_text()
-            if monitor_text:
-                system_content = system_content + monitor_text
+            from src.context.builder import ContextBuilder
+            from src.context.providers.monitor import MonitorContextProvider
 
-        # Screen: ユーザーの画面で何をしているかを注入 (VLM描写)
+            monitor_block = MonitorContextProvider.collect(self.monitor_context)
+            builder = ContextBuilder(system_content)
+            system_content = builder.build_system_content(
+                [monitor_block] if monitor_block is not None else [],
+                privacy="local_only",
+                target_local=True,
+            )
+
+        # Screen: ユーザーの画面で何をしているかを注入 (VLM描写) (Phase J)
+        # Phase J: ScreenContextProvider + ContextBuilder 経由で描画する。
+        # Monitor 直後・Calendar 前の現行位置を維持し、local_only / local target
+        # で ContextPolicy に通した str block だけを base system へ連結する。
         if self.screen_context is not None:
-            screen_text = self.screen_context.get_context_text()
-            if screen_text:
-                system_content = system_content + screen_text
+            from src.context.builder import ContextBuilder
+            from src.context.providers.screen import ScreenContextProvider
 
-        # Calendar: Google Calendar の今日〜明日の予定を注入 (ファイル読取のみ)
+            screen_block = ScreenContextProvider.collect(self.screen_context)
+            builder = ContextBuilder(system_content)
+            system_content = builder.build_system_content(
+                [screen_block] if screen_block is not None else [],
+                privacy="local_only",
+                target_local=True,
+            )
+
+        # Calendar: Google Calendar の今日〜明日の予定を注入 (ファイル読取のみ) (Phase J)
+        # Phase J: CalendarContextProvider + ContextBuilder 経由で描画する。
+        # Screen 直後・Emotion 前の現行位置を維持し、local_only / local target
+        # で ContextPolicy に通した str block だけを base system へ連結する。
         if self.calendar_context is not None:
-            try:
-                cal_text = self.calendar_context.get_context_text()
-                if cal_text:
-                    system_content = system_content + cal_text
-            except Exception:
-                pass
+            from src.context.builder import ContextBuilder
+            from src.context.providers.calendar import CalendarContextProvider
+
+            calendar_block = CalendarContextProvider.collect(self.calendar_context)
+            builder = ContextBuilder(system_content)
+            system_content = builder.build_system_content(
+                [calendar_block] if calendar_block is not None else [],
+                privacy="local_only",
+                target_local=True,
+            )
 
         # 感情タグの指示 (有効時のみ)。タスク状態の権威ブロックよりも前に置くことで、
         # タスク状態がシステムプロンプトの最終権威となる。
@@ -216,15 +253,18 @@ class ChatSession:
 
         # Tasks: 未完了タスク + 現在状態の権威ブロックを末尾に置く (0件でも必ず注入)。
         # 会話履歴・RAG・訓練データを上書きする最終権威なので、他の動的コンテキスト・
-        # 感情タグ指示の後に配置する。
-        if self.task_store is not None:
-            try:
-                from src.tasks.store import build_task_context
-                task_text = build_task_context(self.task_store)
-                if task_text:
-                    system_content = system_content + task_text
-            except Exception:
-                pass
+        # 感情タグ指示の後に配置する。TasksContextProvider 経由で ContextBlock 化し、
+        # History と同時に最終 ContextBuilder.build_messages へ渡す。
+        # ContextPolicy の tasks-last と Builder の system-first により、system 本文の
+        # 最終文字列 block が tasks authority になり、History の role messages は
+        # system message の後ろに配置される。
+        from src.context.providers.tasks import TasksContextProvider
+
+        tasks_block = (
+            TasksContextProvider.collect(self.task_store)
+            if self.task_store is not None
+            else None
+        )
 
         # History: 現在の履歴を ContextBlock 化し、ContextBuilder 経由で描画する。
         # build_messages() は引数なしで呼ばれるため local_only / local target を既定とし、
@@ -233,9 +273,14 @@ class ChatSession:
         from src.context.providers.history import HistoryContextProvider
 
         history_block = HistoryContextProvider.collect(self._messages)
+        blocks = [
+            block
+            for block in (tasks_block, history_block)
+            if block is not None
+        ]
         builder = ContextBuilder(system_content)
         return builder.build_messages(
-            [history_block] if history_block is not None else [],
+            blocks,
             privacy="local_only",
             target_local=True,
         )
