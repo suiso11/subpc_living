@@ -1,5 +1,5 @@
 # Phase J: ContextBlock と決定ContextPolicy
-from .builder import ContextBuilder
+from .builder import ContextBuilder, StructuredBlockNotAllowedError
 from .contracts import (
     TASKS_SOURCE,
     VALID_PRIVACY_MODES,
@@ -9,7 +9,7 @@ from .contracts import (
     Sensitivity,
 )
 from .policy import ContextPolicy, ContextPolicyError
-from .providers import HistoryContextProvider
+from .providers import HistoryContextProvider, PreloadContextProvider
 
 __all__ = [
     "TASKS_SOURCE",
@@ -21,5 +21,7 @@ __all__ = [
     "ContextPolicy",
     "ContextPolicyError",
     "HistoryContextProvider",
+    "PreloadContextProvider",
     "Sensitivity",
+    "StructuredBlockNotAllowedError",
 ]

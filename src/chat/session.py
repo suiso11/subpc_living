@@ -121,10 +121,20 @@ class ChatSession:
         system_content = self.system_prompt or ""
 
         # Preload: プロフィール・スケジュール・最近の会話要約・時刻 (Phase 7)
+        # Phase J: PreloadContextProvider + ContextBuilder 経由で描画する。
+        # system_prompt 直後・RAG 前の現行位置を維持し、local_only / local target で
+        # ContextPolicy に通した str block だけを base system へ連結する。
         if self.preloader is not None:
-            preload_text = self.preloader.build_preload_context()
-            if preload_text:
-                system_content = system_content + preload_text
+            from src.context.builder import ContextBuilder
+            from src.context.providers.preload import PreloadContextProvider
+
+            preload_block = PreloadContextProvider.collect(self.preloader)
+            builder = ContextBuilder(system_content)
+            system_content = builder.build_system_content(
+                [preload_block] if preload_block is not None else [],
+                privacy="local_only",
+                target_local=True,
+            )
 
         if self.rag is not None and self._messages:
             # 最新のユーザーメッセージで検索

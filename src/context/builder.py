@@ -13,6 +13,8 @@ side-channel は使わない。入力の blocks と base system は変更しな�
   structured message を system message より前に置いたり、異種 content 間の
   priority で message 位置を交差させたりはしない。
 - 同種 content 内の並びは Policy の選択順を保つ。
+- build_system_content は str content だけを base system へ連結し、構造化 block は
+  黙って破棄せず StructuredBlockNotAllowedError で明示的に拒否する。
 """
 
 from __future__ import annotations
@@ -22,6 +24,10 @@ from collections.abc import Iterable, Sequence
 from src.context.contracts import ContextBlock
 from src.context.policy import ContextPolicy
 from src.llm.routing.contracts import PrivacyMode
+
+
+class StructuredBlockNotAllowedError(TypeError):
+    """build_system_content に構造化 ContextBlock が渡された。"""
 
 
 class ContextBuilder:
@@ -62,3 +68,28 @@ class ContextBuilder:
             messages.append({"role": "system", "content": system_content})
         messages.extend(role_messages)
         return messages
+
+    def build_system_content(
+        self,
+        blocks: Sequence[ContextBlock] | Iterable[ContextBlock],
+        privacy: PrivacyMode = "local_only",
+        target_local: bool = True,
+    ) -> str:
+        """Policy で選択された str content の block だけを base system へ連結して返す。
+
+        - ContextPolicy.select を通した block だけを描画する
+        - str content の block を選択順に base system へ直接連結する
+        - 構造化 content (ContextMessage列) の block は黙って破棄せず、
+          StructuredBlockNotAllowedError で明示的に拒否する
+        - blocks と base system は変更しない
+        """
+        selected = ContextPolicy.select(blocks, privacy=privacy, target_local=target_local)
+        system_content = self._base_system
+        for block in selected:
+            if isinstance(block.content, str):
+                system_content = system_content + block.content
+            else:
+                raise StructuredBlockNotAllowedError(
+                    f"build_system_content only renders str content, got {block.source!r}"
+                )
+        return system_content
