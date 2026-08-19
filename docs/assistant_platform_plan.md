@@ -22,7 +22,8 @@
 - [x] Discord移行
 - [x] Voice CLIエントリポイント (`src/audio/main.py`)
 - [x] 実行ログ (`src/assistant/run_logger.py`、runtime wiring済み)
-- [ ] `ContextBlock`と`ContextPolicy`（次アクション）
+- [x] `ContextBlock`契約とmetadataベース`ContextPolicy`（基盤完了）
+- [ ] ChatSessionへの適用とHistory Context Provider / Builder移行（次アクション）
 
 ## 1. ゴール
 
@@ -420,9 +421,15 @@ Routerを高度化する前にSQLiteへ事実を記録する。実装とruntime 
 
 ここで初めて`ChatSession.build_messages()`の責務を分解する。
 
+実装状況:
+
+- 基盤は完了: `src/context/contracts.py`（`ContextBlock`）と`src/context/policy.py`（metadataベースの`ContextPolicy`）、`tests/context/test_policy.py`
+- `ChatSession.build_messages()`への適用（wiring）は未完了。Phase J全体は完了扱いにしない
+- 次の実装単位: History Context Provider / Builder移行（下記移行順の1番目）
+
 移行順:
 
-1. History
+1. History（次の実装単位）
 2. Preload / Profile
 3. RAG
 4. Web search
