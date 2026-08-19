@@ -2,7 +2,7 @@
 
 ContextBlock の機密度・local_only・送信先・優先度という metadata だけを見て
 送信可否と順序を決める。会話本文の文字列判定は行わない。
-History は ContextBlock 化の前段階にあり、このポリシーの入力対象外である。
+History は構造化 ContextBlock として移行済みであり、このポリシーの入力となる。
 
 このポリシーが検査するのはprivacy metadataのみで、allow_cloud によるcloud送信の
 最終承認は Router / AssistantService の責務である。ContextPolicy 単独を cloud

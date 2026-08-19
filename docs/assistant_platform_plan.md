@@ -23,7 +23,8 @@
 - [x] Voice CLIエントリポイント (`src/audio/main.py`)
 - [x] 実行ログ (`src/assistant/run_logger.py`、runtime wiring済み)
 - [x] `ContextBlock`契約とmetadataベース`ContextPolicy`（基盤完了）
-- [ ] ChatSessionへの適用とHistory Context Provider / Builder移行（次アクション）
+- [x] History Context Provider / Builder移行とChatSessionへの適用（wiring完了）
+- [ ] Preload / Profile移行（次アクション）
 
 ## 1. ゴール
 
@@ -63,7 +64,7 @@ flowchart TD
 - `src/audio/main.py`: `AssistantService.generate_stream()`を使用
 - `src/audio/pipeline.py`: `AssistantService.generate_stream()`とTTSを直接接続
 - `src/diary/**`, `src/persona/**`: 内部バッチ処理として`LLMProvider`を直接利用（`AssistantService`は通さない）
-- `src/chat/session.py`: 履歴、RAG、検索、画面、カメラ、予定、タスクを一つのプロンプトへ構築（`ContextBlock`へ分離するのはPhase J）
+- `src/chat/session.py`: 履歴は`HistoryContextProvider` / `ContextBuilder`経由で`ContextBlock`化して構築済み。RAG、検索、画面、カメラ、予定、タスクは引き続き一つのプロンプトへ構築し、Phase Jで順次Provider分離する
 
 ### 守る制約
 
@@ -423,14 +424,15 @@ Routerを高度化する前にSQLiteへ事実を記録する。実装とruntime 
 
 実装状況:
 
-- 基盤は完了: `src/context/contracts.py`（`ContextBlock`）と`src/context/policy.py`（metadataベースの`ContextPolicy`）、`tests/context/test_policy.py`
-- `ChatSession.build_messages()`への適用（wiring）は未完了。Phase J全体は完了扱いにしない
-- 次の実装単位: History Context Provider / Builder移行（下記移行順の1番目）
+- 基盤は完了: `src/context/contracts.py`（`ContextBlock` / `ContextMessage`）と`src/context/policy.py`（metadataベースの`ContextPolicy`）、`tests/context/test_policy.py`
+- History移行は完了: `HistoryContextProvider`と`ContextBuilder`を実装し、`ChatSession.build_messages()`へ組み込み済み（wiring完了）
+- Phase J全体は未完了。Cloud経路（Phase K）は未着手のまま
+- 次の実装単位: Preload / Profile移行（下記移行順の2番目）
 
 移行順:
 
-1. History（次の実装単位）
-2. Preload / Profile
+1. History（完了）
+2. Preload / Profile（次の実装単位）
 3. RAG
 4. Web search
 5. Monitor

@@ -162,10 +162,11 @@ Contextをすべて構築してから送信先を決めてはいけない。先�
 
 ### Phase 3: ContextとRouter（一部完了）
 
-- `ContextBlock`契約とmetadataベース`ContextPolicy`（基盤完了・ChatSession適用は未完）
+- `ContextBlock`契約とmetadataベース`ContextPolicy`（基盤完了）
+- History Context Provider / Builder移行とChatSessionへの適用（完了）
+- Preload / Profile、RAG、予定、画面などのContext Providerへの段階分離（未着手・Tasksは最後）
 - ローカルモデルRegistry（完了）
 - 手動ルーティングと経路ログ（完了）
-- タスク、予定、画面などをContext Providerへ段階分離（未着手）
 
 ### Phase 4: 知覚イベントと状態（未着手）
 
@@ -196,7 +197,7 @@ Contextをすべて構築してから送信先を決めてはいけない。先�
 
 ## 9. 現在の実装進行単位
 
-Phase 1〜2とRegistry/Router、CLI・Web・Discord・Voice移行、実行ログの実装とruntime wiringは完了し、Phase 3の`ContextBlock` / `ContextPolicy`基盤も完了した。現在はPhase Jの次の実装単位であるHistory Context Provider / Builder移行へ進んでいる。
+Phase 1〜2とRegistry/Router、CLI・Web・Discord・Voice移行、実行ログの実装とruntime wiringは完了し、Phase 3の`ContextBlock` / `ContextPolicy`基盤とHistory Context Provider / Builder移行も完了した。現在はPhase Jの次の実装単位であるPreload / Profile移行へ進んでいる。
 
 ### 完了: 実行ログ
 
@@ -215,13 +216,13 @@ Phase 1〜2とRegistry/Router、CLI・Web・Discord・Voice移行、実行ログ
 ### 完了: ContextBlock / ContextPolicy基盤
 
 - `ContextBlock`契約とmetadataベースの`ContextPolicy`（sensitivity / local_only / 送信先 / priority）を実装し、テスト済み
-- `ChatSession.build_messages()`への適用（wiring）と、履歴・RAG等のProvider分離は未完了
 - Tasksは最終権威ブロックとして最後に移行する方針を維持
 
-### 実施中: History Context Provider / Builder移行
+### 完了: History Context Provider / Builder移行
 
-- Phase J移行順の最初としてHistoryをContext Provider化し、Builder経由で`ChatSession.build_messages()`へ組み込む
-- 続いてRAG、予定、画面などをContext Providerへ順次分離し、Tasksは最後に移行する
+- `HistoryContextProvider`が現在の履歴を不変な`ContextMessage`列へコピーし、`ContextBlock`（source=history / sensitivity=personal / local_only=True）として返す
+- `ContextBuilder`がPolicy通過済みブロックを既存互換のrole/content dict列へ描画し、`ChatSession.build_messages()`へ組み込み済み
+- 次はPreload / ProfileをContext Provider化し、続いてRAG、予定、画面などを順次分離する（Tasksは最後）
 
 ## 10. 現時点の非目標
 

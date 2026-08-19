@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import unittest
 
-from src.context.contracts import TASKS_SOURCE, ContextBlock
+from src.context.contracts import TASKS_SOURCE, ContextBlock, ContextMessage
 from src.context.policy import ContextPolicy, ContextPolicyError
 
 
 def block(
     source: str,
-    content: str,
+    content: str | tuple[ContextMessage, ...],
     sensitivity: str = "public",
     local_only: bool = False,
     priority: int = 0,
@@ -59,6 +59,65 @@ class ContextBlockContractTest(unittest.TestCase):
         b = block("tasks", "x")
         with self.assertRaises(AttributeError):
             b.content = "y"
+
+    def test_accepts_structured_content_tuple(self) -> None:
+        messages = (ContextMessage(role="user", content="hello"),)
+        b = block("history", messages)
+        self.assertIs(b.content, messages)
+
+    def test_rejects_empty_content_tuple(self) -> None:
+        with self.assertRaises(ValueError):
+            ContextBlock(source="history", content=())
+
+    def test_rejects_non_context_message_tuple_item(self) -> None:
+        with self.assertRaises(TypeError):
+            ContextBlock(source="history", content=(("user", "hello"),))
+
+    def test_rejects_mixed_tuple_with_non_context_message(self) -> None:
+        messages = (ContextMessage(role="user", content="hello"), {"role": "user"})
+        with self.assertRaises(TypeError):
+            ContextBlock(source="history", content=messages)
+
+    def test_rejects_mutable_list_content(self) -> None:
+        with self.assertRaises(TypeError):
+            ContextBlock(source="history", content=[ContextMessage(role="user", content="x")])
+
+    def test_rejects_dict_content(self) -> None:
+        with self.assertRaises(TypeError):
+            ContextBlock(source="history", content={"role": "user", "content": "x"})
+
+    def test_rejects_int_content(self) -> None:
+        with self.assertRaises(TypeError):
+            ContextBlock(source="tasks", content=123)
+
+    def test_structured_content_is_frozen(self) -> None:
+        m = ContextMessage(role="user", content="x")
+        with self.assertRaises(AttributeError):
+            m.content = "y"
+        with self.assertRaises(AttributeError):
+            m.role = "assistant"
+
+    def test_context_message_rejects_unknown_role(self) -> None:
+        with self.assertRaises(ValueError):
+            ContextMessage(role="admin", content="x")
+
+    def test_context_message_accepts_empty_content(self) -> None:
+        self.assertEqual(ContextMessage(role="user", content="").content, "")
+
+    def test_context_message_accepts_whitespace_content(self) -> None:
+        self.assertEqual(ContextMessage(role="user", content="   ").content, "   ")
+
+    def test_context_message_rejects_non_str_content(self) -> None:
+        with self.assertRaises(TypeError):
+            ContextMessage(role="user", content=123)
+
+    def test_context_message_roles_constantized_from_chat_role(self) -> None:
+        from typing import get_args
+
+        from src.context.contracts import VALID_CHAT_ROLES
+        from src.llm.contracts import ChatRole
+
+        self.assertEqual(frozenset(get_args(ChatRole)), VALID_CHAT_ROLES)
 
     def test_history_is_out_of_scope(self) -> None:
         import src.context.contracts as contracts
@@ -129,6 +188,18 @@ class ContextPolicySelectTest(unittest.TestCase):
         blocks = [
             block("screen", "password=hunter2", sensitivity="public"),
             block("calendar", "何の変哲もない予定", sensitivity="personal"),
+        ]
+        result = ContextPolicy.select(blocks, privacy="cloud_allowed", target_local=False)
+        self.assertEqual([b.source for b in result], ["screen"])
+
+    def test_policy_ignores_structured_content_text(self) -> None:
+        blocks = [
+            block(
+                "history",
+                (ContextMessage(role="user", content="secret=hunter2"),),
+                local_only=True,
+            ),
+            block("screen", "password=hunter2", sensitivity="public"),
         ]
         result = ContextPolicy.select(blocks, privacy="cloud_allowed", target_local=False)
         self.assertEqual([b.source for b in result], ["screen"])

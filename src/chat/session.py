@@ -115,9 +115,8 @@ class ChatSession:
 
         RAGが有効な場合、最新のユーザーメッセージで長期記憶を検索し、
         関連する過去の文脈をシステムプロンプトに注入する。
+        History は ContextBlock 化して ContextBuilder 経由で描画する (Phase J)。
         """
-        messages = []
-
         # システムプロンプト + プリロード + RAGコンテキスト + Visionコンテキスト
         system_content = self.system_prompt or ""
 
@@ -196,11 +195,19 @@ class ChatSession:
             except Exception:
                 pass
 
-        if system_content:
-            messages.append({"role": "system", "content": system_content})
+        # History: 現在の履歴を ContextBlock 化し、ContextBuilder 経由で描画する。
+        # build_messages() は引数なしで呼ばれるため local_only / local target を既定とし、
+        # ContextPolicy で選択された block だけを描画する。
+        from src.context.builder import ContextBuilder
+        from src.context.providers.history import HistoryContextProvider
 
-        messages.extend(self._messages)
-        return messages
+        history_block = HistoryContextProvider.collect(self._messages)
+        builder = ContextBuilder(system_content)
+        return builder.build_messages(
+            [history_block] if history_block is not None else [],
+            privacy="local_only",
+            target_local=True,
+        )
 
     def _trim_history(self) -> None:
         """履歴をターン単位で max_history_turns に収める"""
