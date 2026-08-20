@@ -651,6 +651,132 @@ class CompanionGateTest(unittest.TestCase):
         self.assertEqual([t for t, _ in fired], ["break_suggest"])
 
 
+class CalendarScheduleTest(unittest.TestCase):
+    def _profile(self, schedule: list | None = None) -> SimpleNamespace:
+        return SimpleNamespace(
+            name="",
+            get_today_schedule=lambda: schedule or [],
+        )
+
+    def _calendar(self, next_event):
+        calendar = MagicMock()
+        calendar.next_event.return_value = next_event
+        return calendar
+
+    def _engine(self, calendar, *, policy=None, **kwargs) -> ProactiveEngine:
+        return ProactiveEngine(
+            profile=self._profile(),
+            calendar_source=calendar,
+            companion_policy=policy,
+            **kwargs,
+        )
+
+    def _next(self, start_at, title="会議"):
+        from src.companion.calendar import NextEvent
+
+        return NextEvent(start_at=start_at, title=title)
+
+    def test_fires_when_calendar_has_upcoming_event(self) -> None:
+        now = time.time()
+        calendar = self._calendar(self._next(now + 300))
+        engine = self._engine(calendar)
+        fired: list[tuple[str, str]] = []
+        engine._callback = lambda trigger, message: fired.append((trigger, message))
+
+        engine._check_schedule_remind()
+
+        self.assertEqual([t for t, _ in fired], ["schedule_remind"])
+        self.assertIn("会議", fired[0][1])
+        calendar.next_event.assert_called_once_with(now=now)
+
+    def test_does_not_fire_when_no_event(self) -> None:
+        calendar = self._calendar(self._next(None))
+        engine = self._engine(calendar)
+        fired: list[tuple[str, str]] = []
+        engine._callback = lambda trigger, message: fired.append((trigger, message))
+
+        engine._check_schedule_remind()
+
+        self.assertEqual(fired, [])
+
+    def test_does_not_fire_for_past_event(self) -> None:
+        calendar = self._calendar(self._next(time.time() - 60))
+        engine = self._engine(calendar)
+        fired: list[tuple[str, str]] = []
+        engine._callback = lambda trigger, message: fired.append((trigger, message))
+
+        engine._check_schedule_remind()
+
+        self.assertEqual(fired, [])
+
+    def test_does_not_fire_beyond_lead_seconds(self) -> None:
+        calendar = self._calendar(self._next(time.time() + 3600))
+        engine = self._engine(calendar)
+        fired: list[tuple[str, str]] = []
+        engine._callback = lambda trigger, message: fired.append((trigger, message))
+
+        engine._check_schedule_remind()
+
+        self.assertEqual(fired, [])
+
+    def test_uses_policy_lead_seconds(self) -> None:
+        from src.companion.policy import DeterministicProactivePolicy
+
+        now = time.time()
+        calendar = self._calendar(self._next(now + 900))
+        policy = DeterministicProactivePolicy(schedule_lead_seconds=600)
+        engine = self._engine(calendar, policy=policy)
+        fired: list[tuple[str, str]] = []
+        engine._callback = lambda trigger, message: fired.append((trigger, message))
+
+        engine._check_schedule_remind()
+
+        self.assertEqual(fired, [])
+
+    def test_away_gate_blocks_calendar_remind(self) -> None:
+        now = time.time()
+        calendar = self._calendar(self._next(now + 300))
+        away = CompanionState(
+            activity_mode="away",
+            present=False,
+            focused_since=None,
+            interruptible=False,
+            display_state="away",
+            updated_at=now,
+        )
+        engine = self._engine(calendar, companion_getter=lambda: away)
+        fired: list[tuple[str, str]] = []
+        engine._callback = lambda trigger, message: fired.append((trigger, message))
+
+        engine._check_schedule_remind()
+
+        self.assertEqual(fired, [])
+
+    def test_without_calendar_uses_profile_schedule(self) -> None:
+        t = (datetime.now() + timedelta(minutes=10)).strftime("%H:%M")
+        engine = ProactiveEngine(
+            profile=self._profile([{"time": t, "title": "打ち合わせ", "note": ""}]),
+        )
+        fired: list[tuple[str, str]] = []
+        engine._callback = lambda trigger, message: fired.append((trigger, message))
+
+        engine._check_schedule_remind()
+
+        self.assertEqual([t for t, _ in fired], ["schedule_remind"])
+        self.assertIn("打ち合わせ", fired[0][1])
+
+    def test_calendar_exception_suppressed(self) -> None:
+        calendar = MagicMock()
+        calendar.next_event.side_effect = RuntimeError("boom")
+        engine = self._engine(calendar)
+        fired: list[tuple[str, str]] = []
+        engine._callback = lambda trigger, message: fired.append((trigger, message))
+
+        engine._check_schedule_remind()
+
+        self.assertEqual(fired, [])
+
+
 class CompanionWiringTest(unittest.TestCase):
     def test_create_proactive_bridge_forwards_companion_getter(self) -> None:
         getter = lambda: None

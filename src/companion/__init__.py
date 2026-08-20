@@ -8,6 +8,7 @@ from .contracts import (
     PerceptionEvent,
 )
 from .state import PrivacyViolationError, StateAggregator, StateAggregatorError
+from .calendar import CalendarSource, NextEvent
 
 __all__ = [
     "ACTIVITY_MODES",
@@ -19,4 +20,6 @@ __all__ = [
     "PrivacyViolationError",
     "StateAggregator",
     "StateAggregatorError",
+    "CalendarSource",
+    "NextEvent",
 ]

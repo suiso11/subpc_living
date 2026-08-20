@@ -18,6 +18,7 @@ from datetime import datetime
 from typing import Optional, Callable
 
 from src.persona.profile import UserProfile
+from src.companion.calendar import CalendarSource
 from src.companion.contracts import CompanionState
 from src.companion.policy import DeterministicProactivePolicy
 
@@ -57,6 +58,7 @@ class ProactiveEngine:
         conversation_gate: Optional[Callable[[], bool]] = None,
         companion_getter: Optional[Callable[[], Optional[CompanionState]]] = None,
         companion_policy: Optional[DeterministicProactivePolicy] = None,
+        calendar_source: Optional[CalendarSource] = None,
     ):
         """
         Args:
@@ -70,6 +72,8 @@ class ProactiveEngine:
             conversation_gate: 永続状態や日次上限による追加の送信判定
             companion_getter: 現在の CompanionState を返す (None なら従来挙動)
             companion_policy: 決定的 Proactive Policy (None ならデフォルト閾値)
+            calendar_source: 次の予定を返す CalendarSource (None なら従来の
+                profile ベース判定を維持)
         """
         self.profile = profile
         self.check_interval = check_interval
@@ -84,6 +88,7 @@ class ProactiveEngine:
             if companion_policy is not None
             else DeterministicProactivePolicy()
         )
+        self.calendar_source = calendar_source
         # EventReminderEngine (src/tasks/event_reminder.py) が有効なとき True。
         # gcal: 由来の schedule エントリはそちらが通知するため、ここでは
         # スキップして二重通知を防ぐ。
@@ -217,6 +222,10 @@ class ProactiveEngine:
         if not self._can_fire("schedule_remind"):
             return
 
+        if self.calendar_source is not None:
+            self._check_schedule_remind_calendar()
+            return
+
         now = datetime.now()
         today_schedule = self.profile.get_today_schedule()
 
@@ -241,6 +250,23 @@ class ProactiveEngine:
                     return
             except (ValueError, TypeError):
                 pass
+
+    def _check_schedule_remind_calendar(self) -> None:
+        """CalendarSource ベースのスケジュールリマインド。"""
+        now = time.time()
+        try:
+            next_event = self.calendar_source.next_event(now=now)
+        except Exception:
+            return
+        if next_event.start_at is None:
+            return
+        delta = next_event.start_at - now
+        if not (0 <= delta <= self.companion_policy.schedule_lead_seconds):
+            return
+        minutes = int(round(delta / 60))
+        title = next_event.title or ""
+        msg = f"あと{minutes}分で「{title}」の時間です。準備は大丈夫ですか？"
+        self._fire("schedule_remind", msg)
 
     def _check_break_suggest(self) -> None:
         """長時間作業の休憩提案: 2時間連続で通知"""
