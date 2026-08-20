@@ -12,9 +12,12 @@ AI側から能動的に話しかけるトリガーを管理する
 - PC異常の通知（高温、メモリ逼迫）
 - プロフィール学習につながる会話のきっかけ
 """
+import json
+import os
 import time
 import threading
 from datetime import datetime
+from pathlib import Path
 from typing import Optional, Callable
 
 from src.persona.profile import UserProfile
@@ -59,6 +62,7 @@ class ProactiveEngine:
         companion_getter: Optional[Callable[[], Optional[CompanionState]]] = None,
         companion_policy: Optional[DeterministicProactivePolicy] = None,
         calendar_source: Optional[CalendarSource] = None,
+        state_path: Optional[str] = None,
     ):
         """
         Args:
@@ -74,6 +78,8 @@ class ProactiveEngine:
             companion_policy: 決定的 Proactive Policy (None ならデフォルト閾値)
             calendar_source: 次の予定を返す CalendarSource (None なら従来の
                 profile ベース判定を維持)
+            state_path: cooldown 状態 (_last_fired) を永続化する JSON パス。
+                None なら in-memory のみで保存・読み込みを行わない
         """
         self.profile = profile
         self.check_interval = check_interval
@@ -89,6 +95,7 @@ class ProactiveEngine:
             else DeterministicProactivePolicy()
         )
         self.calendar_source = calendar_source
+        self.state_path = Path(state_path) if state_path else None
         # EventReminderEngine (src/tasks/event_reminder.py) が有効なとき True。
         # gcal: 由来の schedule エントリはそちらが通知するため、ここでは
         # スキップして二重通知を防ぐ。
@@ -107,6 +114,7 @@ class ProactiveEngine:
             "pc_alert": 600,            # 10分
             "conversation_start": max(60.0, conversation_interval),
         }
+        self._load_state()
 
         # 作業開始時刻の追跡
         self._session_start_time: Optional[float] = None
@@ -187,10 +195,54 @@ class ProactiveEngine:
             return "away"
         return None
 
+    def _load_state(self) -> None:
+        """state_path が指定されていれば cooldown 状態 (_last_fired) を読み込む。
+
+        キーは str、値は数字のみ反映する。不正・欠損は握りつぶしてクラッシュしない。
+        """
+        if self.state_path is None or not self.state_path.exists():
+            return
+        try:
+            raw = json.loads(self.state_path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                return
+            for key, value in raw.items():
+                if isinstance(key, str) and isinstance(value, (int, float)):
+                    self._last_fired[key] = float(value)
+        except Exception:
+            pass
+
+    def _save_state(self) -> None:
+        """cooldown 状態 (_last_fired) を atomic に JSON へ書き込む。失敗は無視。"""
+        if self.state_path is None:
+            return
+        try:
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
+            tmp.write_text(
+                json.dumps(self._last_fired, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            os.replace(tmp, self.state_path)
+        except Exception:
+            pass
+
+    def record_rejection(self, kind: str, now: Optional[float] = None) -> None:
+        """ユーザーが自発発話を拒否したことを記録する。
+
+        指定 kind の cooldown を再スタートさせる (= 実質延長)。
+        state_path があれば永続化する。
+        """
+        self._last_fired[kind] = time.time() if now is None else float(now)
+        if self.state_path is not None:
+            self._save_state()
+
     def _fire(self, trigger_type: str, message: str) -> None:
         """トリガーを発火"""
         if self._callback and self._can_fire(trigger_type):
             self._last_fired[trigger_type] = time.time()
+            if self.state_path is not None:
+                self._save_state()
             try:
                 self._callback(trigger_type, message)
             except Exception:

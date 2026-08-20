@@ -228,17 +228,22 @@ class ProactiveBridge:
             daily_limit=config.conversation_daily_limit,
             max_backoff_sec=config.conversation_max_backoff_hours * 3600,
         )
-        self.engine = engine or ProactiveEngine(
-            profile=profile,
-            check_interval=config.check_interval,
-            monitor_context=monitor_context,
-            conversation_enabled=config.conversation_enabled,
-            conversation_interval=config.conversation_interval_hours * 3600,
-            conversation_idle=config.conversation_idle_minutes * 60,
-            quiet_hours=config.quiet_hours,
-            conversation_gate=self._can_start_conversation,
-            companion_getter=companion_getter,
-        )
+        if engine is None:
+            proactive_state_path = state_path.with_suffix(state_path.suffix + ".proactive.json")
+            self.engine = ProactiveEngine(
+                profile=profile,
+                check_interval=config.check_interval,
+                monitor_context=monitor_context,
+                conversation_enabled=config.conversation_enabled,
+                conversation_interval=config.conversation_interval_hours * 3600,
+                conversation_idle=config.conversation_idle_minutes * 60,
+                quiet_hours=config.quiet_hours,
+                conversation_gate=self._can_start_conversation,
+                companion_getter=companion_getter,
+                state_path=str(proactive_state_path),
+            )
+        else:
+            self.engine = engine
 
     # --- ライフサイクル ---
 
@@ -283,6 +288,7 @@ class ProactiveBridge:
         now = time.time()
         if normalized in _LATER_COMMANDS:
             self.conversation_store.snooze(channel_id, until=now + 3 * 3600)
+            self.engine.record_rejection("conversation_start")
             return "了解です。少なくとも3時間は、会話のきっかけを送りません。"
         if normalized in _QUIET_TODAY_COMMANDS:
             local_now = datetime.fromtimestamp(now).astimezone()
@@ -293,6 +299,7 @@ class ProactiveBridge:
                 microsecond=0,
             )
             self.conversation_store.snooze(channel_id, until=tomorrow.timestamp())
+            self.engine.record_rejection("conversation_start")
             return "了解です。今日はこのまま静かにしておきます。"
         return None
 

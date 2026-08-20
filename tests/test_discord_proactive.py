@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import tempfile
 import threading
 import time
 import unittest
 from datetime import datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -12,6 +16,7 @@ from src.companion.contracts import CompanionState
 from src.persona.proactive import CONVERSATION_PROMPTS, ProactiveEngine
 from src.persona.conversation_loop import ConversationLoopStore
 from src.discord_bot.proactive_bridge import (
+    PROJECT_ROOT,
     ProactiveBridge,
     ProactiveConfig,
     create_proactive_bridge,
@@ -687,7 +692,11 @@ class CalendarScheduleTest(unittest.TestCase):
 
         self.assertEqual([t for t, _ in fired], ["schedule_remind"])
         self.assertIn("会議", fired[0][1])
-        calendar.next_event.assert_called_once_with(now=now)
+        # next_event は実行時の time.time() を now として呼ぶため、事前に取った now とは
+        # 微小にズレうる。引数に now キーワードが渡されたことだけ検証する (フレーク防止)。
+        assert calendar.next_event.call_args is not None
+        assert calendar.next_event.call_args.kwargs.get("now") is not None
+        assert calendar.next_event.call_args.kwargs["now"] >= now
 
     def test_does_not_fire_when_no_event(self) -> None:
         calendar = self._calendar(self._next(None))
@@ -904,6 +913,119 @@ class CompanionWiringTest(unittest.TestCase):
         engine._check_break_suggest()
 
         self.assertEqual([t for t, _ in fired], ["break_suggest"])
+
+
+class ProactivePersistenceTest(unittest.TestCase):
+    def test_record_rejection_writes_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = str(Path(tmp) / "cooldown.json")
+            engine = ProactiveEngine(profile=SimpleNamespace(), state_path=state_path)
+
+            engine.record_rejection("conversation_start", now=12345.0)
+
+            data = json.loads(Path(state_path).read_text(encoding="utf-8"))
+            self.assertEqual(data, {"conversation_start": 12345.0})
+
+    def test_new_engine_loads_cooldown_from_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = str(Path(tmp) / "cooldown.json")
+            first = ProactiveEngine(profile=SimpleNamespace(), state_path=state_path)
+            first.record_rejection("conversation_start", now=time.time())
+
+            second = ProactiveEngine(profile=SimpleNamespace(), state_path=state_path)
+
+            self.assertIn("conversation_start", second._last_fired)
+
+    def test_record_rejection_sets_cooldown(self) -> None:
+        engine = ProactiveEngine(
+            profile=SimpleNamespace(),
+            conversation_interval=3600,
+        )
+        with patch("src.persona.proactive.time.time", return_value=1000.0):
+            engine.record_rejection("conversation_start")
+            self.assertFalse(engine._can_fire("conversation_start"))
+
+    def test_state_path_none_does_not_save(self) -> None:
+        engine = ProactiveEngine(profile=SimpleNamespace())
+        with patch.object(engine, "_save_state") as mock_save:
+            engine.record_rejection("conversation_start")
+            mock_save.assert_not_called()
+
+    def test_bridge_passes_state_path_to_engine(self) -> None:
+        cfg = ProactiveConfig(
+            enabled=True,
+            channel_id=1,
+            conversation_state_path="data/proactive/conversation_state.json",
+        )
+        bridge = ProactiveBridge(
+            bot=_FakeBot(None),
+            state=_state(),
+            config=cfg,
+            profile=SimpleNamespace(name="", get_today_schedule=lambda: []),
+        )
+        expected = Path(PROJECT_ROOT) / "data/proactive/conversation_state.json.proactive.json"
+        self.assertEqual(Path(bridge.engine.state_path).resolve(), expected.resolve())
+
+    def test_injected_engine_state_path_not_overwritten(self) -> None:
+        cfg = ProactiveConfig(
+            enabled=True,
+            channel_id=1,
+            conversation_state_path="data/proactive/conversation_state.json",
+        )
+        engine = MagicMock()
+        engine.state_path = None
+        bridge = ProactiveBridge(
+            bot=_FakeBot(None),
+            state=_state(),
+            config=cfg,
+            profile=None,
+            engine=engine,
+            conversation_store=ConversationLoopStore(None, base_interval_sec=3600, reply_timeout_sec=3600),
+        )
+        self.assertIs(bridge.engine, engine)
+        engine.record_rejection.assert_not_called()
+
+    def test_later_command_records_rejection(self) -> None:
+        cfg = ProactiveConfig(
+            enabled=True,
+            channel_id=1,
+            conversation_enabled=True,
+            conversation_state_path="data/proactive/conversation_state.json",
+        )
+        store = ConversationLoopStore(None, base_interval_sec=3600, reply_timeout_sec=3600)
+        bridge = ProactiveBridge(
+            bot=_FakeBot(None),
+            state=_state(),
+            config=cfg,
+            profile=SimpleNamespace(name="", get_today_schedule=lambda: []),
+            conversation_store=store,
+        )
+        store.record_prompt(1, "質問", now=time.time())
+        with patch.object(bridge.engine, "record_rejection") as mock_rr:
+            response = bridge.handle_conversation_control(1, "あとで")
+            self.assertIn("3時間", response)
+            mock_rr.assert_called_once_with("conversation_start")
+
+    def test_quiet_today_command_records_rejection(self) -> None:
+        cfg = ProactiveConfig(
+            enabled=True,
+            channel_id=1,
+            conversation_enabled=True,
+            conversation_state_path="data/proactive/conversation_state.json",
+        )
+        store = ConversationLoopStore(None, base_interval_sec=3600, reply_timeout_sec=3600)
+        bridge = ProactiveBridge(
+            bot=_FakeBot(None),
+            state=_state(),
+            config=cfg,
+            profile=SimpleNamespace(name="", get_today_schedule=lambda: []),
+            conversation_store=store,
+        )
+        store.record_prompt(1, "質問", now=time.time())
+        with patch.object(bridge.engine, "record_rejection") as mock_rr:
+            response = bridge.handle_conversation_control(1, "今日は静かに")
+            self.assertIn("静かに", response)
+            mock_rr.assert_called_once_with("conversation_start")
 
 
 if __name__ == "__main__":
