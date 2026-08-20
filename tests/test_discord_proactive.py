@@ -4,14 +4,17 @@ import asyncio
 import threading
 import time
 import unittest
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from src.companion.contracts import CompanionState
 from src.persona.proactive import CONVERSATION_PROMPTS, ProactiveEngine
 from src.persona.conversation_loop import ConversationLoopStore
 from src.discord_bot.proactive_bridge import (
     ProactiveBridge,
     ProactiveConfig,
+    create_proactive_bridge,
     rewrite_message,
 )
 
@@ -473,6 +476,308 @@ class NotifyActivityTest(unittest.TestCase):
         )
         bridge.notify_user_activity()
         engine.notify_user_activity.assert_called_once()
+
+
+class CompanionGateTest(unittest.TestCase):
+    def _state(
+        self,
+        activity_mode: str = "idle",
+        present: bool = True,
+        interruptible: bool = True,
+    ) -> CompanionState:
+        return CompanionState(
+            activity_mode=activity_mode,
+            present=present,
+            focused_since=None,
+            interruptible=interruptible,
+            display_state=activity_mode,
+            updated_at=time.time(),
+        )
+
+    def _profile(self, schedule: list | None = None) -> SimpleNamespace:
+        return SimpleNamespace(
+            name="",
+            get_today_schedule=lambda: schedule or [],
+        )
+
+    def _schedule_profile(self) -> SimpleNamespace:
+        t = (datetime.now() + timedelta(minutes=10)).strftime("%H:%M")
+        return self._profile([{"time": t, "title": "会議", "note": ""}])
+
+    def _engine(self, getter, *, profile=None, **kwargs) -> ProactiveEngine:
+        return ProactiveEngine(
+            profile=profile or self._profile(),
+            companion_getter=getter,
+            **kwargs,
+        )
+
+    def _break_fires(self, engine: ProactiveEngine) -> None:
+        engine._session_start_time = time.time() - 3 * 3600
+        engine._last_user_activity = time.time()
+
+    def test_companion_gate_returns_modes(self) -> None:
+        focused = self._engine(lambda: self._state("focused", interruptible=False))
+        self.assertEqual(focused._companion_gate(), "focused")
+
+        away = self._engine(lambda: self._state("away"))
+        self.assertEqual(away._companion_gate(), "away")
+
+        absent = self._engine(lambda: self._state("idle", present=False))
+        self.assertEqual(absent._companion_gate(), "away")
+
+        idle = self._engine(lambda: self._state("idle", interruptible=True))
+        self.assertIsNone(idle._companion_gate())
+
+        none = self._engine(None)
+        self.assertIsNone(none._companion_gate())
+
+    def test_focused_blocks_break_suggest(self) -> None:
+        engine = self._engine(lambda: self._state("focused", interruptible=False))
+        self._break_fires(engine)
+        fired: list[tuple[str, str]] = []
+        engine._callback = lambda trigger, message: fired.append((trigger, message))
+
+        engine._check_break_suggest()
+
+        self.assertEqual(fired, [])
+
+    def test_focused_blocks_greeting(self) -> None:
+        engine = self._engine(lambda: self._state("focused", interruptible=False))
+        engine._started_at = time.time()
+        fired: list[tuple[str, str]] = []
+        engine._callback = lambda trigger, message: fired.append((trigger, message))
+
+        with patch("src.persona.proactive.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2024, 1, 1, 7, 0, 0)
+            engine._check_greeting()
+
+        self.assertEqual(fired, [])
+
+    def test_focused_blocks_conversation_start(self) -> None:
+        engine = self._engine(
+            lambda: self._state("focused", interruptible=False),
+            conversation_enabled=True,
+            conversation_idle=0,
+            quiet_hours=(0, 0),
+        )
+        engine._last_user_activity = time.time() - 100
+        fired: list[tuple[str, str]] = []
+        engine._callback = lambda trigger, message: fired.append((trigger, message))
+
+        engine._check_conversation_start()
+
+        self.assertEqual(fired, [])
+
+    def test_focused_blocks_pc_alert(self) -> None:
+        monitor = MagicMock()
+        monitor.get_status.return_value = {"running": True, "cpu_percent": 99}
+        engine = ProactiveEngine(
+            profile=self._profile(),
+            monitor_context=monitor,
+            companion_getter=lambda: self._state("focused", interruptible=False),
+        )
+        fired: list[tuple[str, str]] = []
+        engine._callback = lambda trigger, message: fired.append((trigger, message))
+
+        engine._check_pc_alert()
+
+        self.assertEqual(fired, [])
+
+    def test_focused_allows_schedule_remind(self) -> None:
+        engine = self._engine(
+            lambda: self._state("focused", interruptible=False),
+            profile=self._schedule_profile(),
+        )
+        fired: list[tuple[str, str]] = []
+        engine._callback = lambda trigger, message: fired.append((trigger, message))
+
+        engine._check_schedule_remind()
+
+        self.assertEqual([t for t, _ in fired], ["schedule_remind"])
+
+    def test_away_blocks_schedule_remind(self) -> None:
+        engine = self._engine(
+            lambda: self._state("away"),
+            profile=self._schedule_profile(),
+        )
+        fired: list[tuple[str, str]] = []
+        engine._callback = lambda trigger, message: fired.append((trigger, message))
+
+        engine._check_schedule_remind()
+
+        self.assertEqual(fired, [])
+
+    def test_away_blocks_break_suggest(self) -> None:
+        engine = self._engine(lambda: self._state("away"))
+        self._break_fires(engine)
+        fired: list[tuple[str, str]] = []
+        engine._callback = lambda trigger, message: fired.append((trigger, message))
+
+        engine._check_break_suggest()
+
+        self.assertEqual(fired, [])
+
+    def test_idle_fires_conventionally(self) -> None:
+        engine = self._engine(lambda: self._state("idle", interruptible=True))
+        self._break_fires(engine)
+        fired: list[tuple[str, str]] = []
+        engine._callback = lambda trigger, message: fired.append((trigger, message))
+
+        engine._check_break_suggest()
+
+        self.assertEqual([t for t, _ in fired], ["break_suggest"])
+
+    def test_getter_returns_none_no_gate(self) -> None:
+        engine = self._engine(lambda: None)
+        self._break_fires(engine)
+        fired: list[tuple[str, str]] = []
+        engine._callback = lambda trigger, message: fired.append((trigger, message))
+
+        engine._check_break_suggest()
+
+        self.assertEqual([t for t, _ in fired], ["break_suggest"])
+
+    def test_getter_exception_falls_back(self) -> None:
+        def bad_getter() -> CompanionState:
+            raise RuntimeError("boom")
+
+        engine = self._engine(bad_getter)
+        self._break_fires(engine)
+        fired: list[tuple[str, str]] = []
+        engine._callback = lambda trigger, message: fired.append((trigger, message))
+
+        engine._check_break_suggest()
+
+        self.assertEqual([t for t, _ in fired], ["break_suggest"])
+
+
+class CompanionWiringTest(unittest.TestCase):
+    def test_create_proactive_bridge_forwards_companion_getter(self) -> None:
+        getter = lambda: None
+        enabled_cfg = ProactiveConfig(enabled=True, channel_id=1)
+        with (
+            patch(
+                "src.discord_bot.proactive_bridge.ProactiveConfig.from_env",
+                return_value=enabled_cfg,
+            ),
+            patch(
+                "src.discord_bot.proactive_bridge._build_monitor_context",
+                return_value=None,
+            ),
+            patch(
+                "src.discord_bot.proactive_bridge.UserProfile",
+                autospec=True,
+            ) as mock_profile,
+        ):
+            mock_profile.return_value.load.return_value = None
+            with patch(
+                "src.discord_bot.proactive_bridge.ProactiveBridge",
+                autospec=True,
+            ) as mock_bridge_cls:
+                result = create_proactive_bridge(
+                    _state(), _FakeBot(None), companion_getter=getter
+                )
+                _, kwargs = mock_bridge_cls.call_args
+                self.assertIs(kwargs["companion_getter"], getter)
+                self.assertIs(result, mock_bridge_cls.return_value)
+
+    def test_companion_getter_passed_into_proactive_engine(self) -> None:
+        getter = lambda: None
+        bridge = ProactiveBridge(
+            bot=_FakeBot(None),
+            state=_state(),
+            config=ProactiveConfig(enabled=True, channel_id=1),
+            profile=None,
+            companion_getter=getter,
+        )
+        self.assertIs(bridge.engine.companion_getter, getter)
+
+    def test_companion_getter_none_falls_back_to_default(self) -> None:
+        bridge = ProactiveBridge(
+            bot=_FakeBot(None),
+            state=_state(),
+            config=ProactiveConfig(enabled=True, channel_id=1),
+            profile=None,
+        )
+        self.assertIsNone(bridge.engine.companion_getter)
+
+    def test_bot_companion_state_returns_none_when_runtime_unset(self) -> None:
+        with patch("src.discord_bot.bot.activity_runtime", None):
+            from src.discord_bot.bot import _companion_state
+
+            self.assertIsNone(_companion_state())
+
+    def test_bot_companion_state_returns_state_when_runtime_present(self) -> None:
+        state = CompanionState(
+            activity_mode="focused",
+            present=True,
+            focused_since=None,
+            interruptible=False,
+            display_state="focused",
+            updated_at=time.time(),
+        )
+        runtime = MagicMock()
+        runtime.state = state
+        with patch("src.discord_bot.bot.activity_runtime", runtime):
+            from src.discord_bot.bot import _companion_state
+
+            self.assertIs(_companion_state(), state)
+
+    def test_bot_companion_state_returns_none_on_runtime_error(self) -> None:
+        runtime = MagicMock()
+
+        def _raise() -> CompanionState:
+            raise RuntimeError("boom")
+
+        type(runtime).state = property(_raise)
+        with patch("src.discord_bot.bot.activity_runtime", runtime):
+            from src.discord_bot.bot import _companion_state
+
+            self.assertIsNone(_companion_state())
+
+    def test_bridge_gates_proactive_when_companion_focused(self) -> None:
+        focused = CompanionState(
+            activity_mode="focused",
+            present=True,
+            focused_since=None,
+            interruptible=False,
+            display_state="focused",
+            updated_at=time.time(),
+        )
+        engine = ProactiveEngine(
+            profile=SimpleNamespace(name="", get_today_schedule=lambda: []),
+            companion_getter=lambda: focused,
+        )
+        fired: list[tuple[str, str]] = []
+        engine._callback = lambda trigger, message: fired.append((trigger, message))
+        engine._session_start_time = time.time() - 3 * 3600
+        engine._last_user_activity = time.time()
+
+        engine._check_break_suggest()
+
+        self.assertEqual(fired, [])
+
+    def test_bridge_keeps_proactive_when_companion_idle(self) -> None:
+        idle = CompanionState(
+            activity_mode="idle",
+            present=True,
+            focused_since=None,
+            interruptible=True,
+            display_state="idle",
+            updated_at=time.time(),
+        )
+        engine = ProactiveEngine(
+            profile=SimpleNamespace(name="", get_today_schedule=lambda: []),
+            companion_getter=lambda: idle,
+        )
+        fired: list[tuple[str, str]] = []
+        engine._callback = lambda trigger, message: fired.append((trigger, message))
+        engine._session_start_time = time.time() - 3 * 3600
+        engine._last_user_activity = time.time()
+
+        engine._check_break_suggest()
+
+        self.assertEqual([t for t, _ in fired], ["break_suggest"])
 
 
 if __name__ == "__main__":

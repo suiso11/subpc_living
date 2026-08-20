@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from src.chat.emotion import parse_emotion_tag
 from src.persona.conversation_loop import ConversationLoopStore
@@ -212,6 +212,7 @@ class ProactiveBridge:
         monitor_context: Any = None,
         engine: Optional[ProactiveEngine] = None,
         conversation_store: Optional[ConversationLoopStore] = None,
+        companion_getter: Optional[Callable[[], Any]] = None,
     ) -> None:
         self.bot = bot
         self.state = state
@@ -236,6 +237,7 @@ class ProactiveBridge:
             conversation_idle=config.conversation_idle_minutes * 60,
             quiet_hours=config.quiet_hours,
             conversation_gate=self._can_start_conversation,
+            companion_getter=companion_getter,
         )
 
     # --- ライフサイクル ---
@@ -442,7 +444,9 @@ def _build_monitor_context() -> Any:
         return None
 
 
-def create_proactive_bridge(state: Any, bot: Any) -> Optional[ProactiveBridge]:
+def create_proactive_bridge(
+    state: Any, bot: Any, companion_getter: Optional[Callable[[], Any]] = None
+) -> Optional[ProactiveBridge]:
     """環境変数から ProactiveBridge を構築する。無効なら None。
 
     クラッシュ禁止: 構築に失敗しても None を返して bot を継続させる。
@@ -475,4 +479,5 @@ def create_proactive_bridge(state: Any, bot: Any) -> Optional[ProactiveBridge]:
         config=config,
         profile=profile,
         monitor_context=monitor_context,
+        companion_getter=companion_getter,
     )

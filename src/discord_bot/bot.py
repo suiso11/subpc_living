@@ -47,6 +47,7 @@ from src.discord_bot.training import (
     parse_correction,
 )
 from src.discord_bot.proactive_bridge import ProactiveBridge, create_proactive_bridge, rewrite_message
+from src.companion.contracts import CompanionState
 from src.discord_bot.task_ui import (
     TASK_PREFIX_RE,
     TaskConfirmView,
@@ -133,6 +134,20 @@ def companion_status_line(runtime: ActivityRuntime | None) -> str:
     companion_state_payload が既に除外する。
     """
     return f"companion: {companion_state_payload(runtime)}\n"
+
+
+def _companion_state() -> CompanionState | None:
+    """companion activity の現在状態を返す (ゲート判定専用)。
+
+    失敗しても None を返し、companion 未オプトイン時や runtime 未起動時は None。
+    """
+    runtime = activity_runtime
+    if runtime is None:
+        return None
+    try:
+        return runtime.state
+    except Exception:
+        return None
 
 
 def load_env_file(path: Path) -> None:
@@ -1607,7 +1622,9 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
         if not proactive_started:
             proactive_started = True
             try:
-                state.proactive_bridge = create_proactive_bridge(state, bot)
+                state.proactive_bridge = create_proactive_bridge(
+                    state, bot, companion_getter=_companion_state
+                )
             except Exception as e:
                 logger.error("[Discord] proactive 初期化失敗 (proactiveなしで続行): %s", e)
                 state.proactive_bridge = None

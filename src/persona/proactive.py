@@ -18,6 +18,8 @@ from datetime import datetime
 from typing import Optional, Callable
 
 from src.persona.profile import UserProfile
+from src.companion.contracts import CompanionState
+from src.companion.policy import DeterministicProactivePolicy
 
 
 CONVERSATION_PROMPTS = (
@@ -53,6 +55,8 @@ class ProactiveEngine:
         conversation_idle: float = 3600.0,
         quiet_hours: tuple[int, int] = (1, 9),
         conversation_gate: Optional[Callable[[], bool]] = None,
+        companion_getter: Optional[Callable[[], Optional[CompanionState]]] = None,
+        companion_policy: Optional[DeterministicProactivePolicy] = None,
     ):
         """
         Args:
@@ -64,6 +68,8 @@ class ProactiveEngine:
             conversation_idle: 最後のユーザー活動から発話までの待機時間 (秒)
             quiet_hours: 会話を開始しない時間帯 (開始時, 終了時)
             conversation_gate: 永続状態や日次上限による追加の送信判定
+            companion_getter: 現在の CompanionState を返す (None なら従来挙動)
+            companion_policy: 決定的 Proactive Policy (None ならデフォルト閾値)
         """
         self.profile = profile
         self.check_interval = check_interval
@@ -72,6 +78,12 @@ class ProactiveEngine:
         self.conversation_idle = max(0.0, conversation_idle)
         self.quiet_hours = quiet_hours
         self.conversation_gate = conversation_gate
+        self.companion_getter = companion_getter
+        self.companion_policy = (
+            companion_policy
+            if companion_policy is not None
+            else DeterministicProactivePolicy()
+        )
         # EventReminderEngine (src/tasks/event_reminder.py) が有効なとき True。
         # gcal: 由来の schedule エントリはそちらが通知するため、ここでは
         # スキップして二重通知を防ぐ。
@@ -145,6 +157,31 @@ class ProactiveEngine:
         cooldown = self._cooldown.get(trigger_type, 600)
         return (time.time() - last) >= cooldown
 
+    def _companion_gate(self) -> Optional[str]:
+        """CompanionState に基づく介入ゲート。
+
+        Returns:
+            None: ゲートしない (従来挙動 or 発火許可)
+            "focused": 集中中で割り込み不可 (黙る)
+            "away": 離席中・不在 (黙る)
+
+        companion_getter が None の場合は一切ゲートしない。
+        getter が例外を投げても None を返し、従来どおり動く (best-effort)。
+        """
+        if self.companion_getter is None:
+            return None
+        try:
+            state = self.companion_getter()
+        except Exception:
+            return None
+        if state is None:
+            return None
+        if state.activity_mode == "focused" and not state.interruptible:
+            return "focused"
+        if state.activity_mode == "away" or not state.present:
+            return "away"
+        return None
+
     def _fire(self, trigger_type: str, message: str) -> None:
         """トリガーを発火"""
         if self._callback and self._can_fire(trigger_type):
@@ -175,6 +212,8 @@ class ProactiveEngine:
 
     def _check_schedule_remind(self) -> None:
         """スケジュールリマインド: 予定の15分前に通知"""
+        if self._companion_gate() == "away":
+            return
         if not self._can_fire("schedule_remind"):
             return
 
@@ -205,6 +244,8 @@ class ProactiveEngine:
 
     def _check_break_suggest(self) -> None:
         """長時間作業の休憩提案: 2時間連続で通知"""
+        if self._companion_gate() is not None:
+            return
         if not self._can_fire("break_suggest"):
             return
 
@@ -222,6 +263,8 @@ class ProactiveEngine:
 
     def _check_greeting(self) -> None:
         """時間帯の挨拶"""
+        if self._companion_gate() is not None:
+            return
         if not self._can_fire("greeting"):
             return
 
@@ -256,6 +299,8 @@ class ProactiveEngine:
 
     def _check_pc_alert(self) -> None:
         """PC異常アラート"""
+        if self._companion_gate() is not None:
+            return
         if not self._can_fire("pc_alert"):
             return
 
@@ -287,6 +332,8 @@ class ProactiveEngine:
 
     def _check_conversation_start(self) -> None:
         """会話が途切れているとき、プロフィール学習につながる質問を一つ送る。"""
+        if self._companion_gate() is not None:
+            return
         if not self.conversation_enabled or not self._can_fire("conversation_start"):
             return
         now = datetime.now()
