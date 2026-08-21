@@ -1,8 +1,11 @@
 """経路選択とProvider fallbackを統合するAssistantサービス。"""
 
+from __future__ import annotations
+
 from collections.abc import Callable, Iterable, Iterator, Sequence
 import threading
 import time
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from src.assistant.run_logger import RunLogger
@@ -12,10 +15,15 @@ from src.assistant.contracts import (
     AssistantRequest,
     AssistantResponse,
 )
+from src.context.contracts import ContextBlock
 from src.llm.contracts import ChatMessage, GenerationOptions
 from src.llm.errors import LLMProviderError
 from src.llm.registry import ProviderEntry, ProviderRegistry, UnknownProviderError
 from src.llm.routing.contracts import ModelRouter, RouteDecision
+
+if TYPE_CHECKING:
+    from src.assistant.cloud_service import CloudRouteBridge
+    from src.llm.approval import CloudPreview
 
 
 def _candidate_ids(decision: RouteDecision) -> tuple[str, ...]:
@@ -83,9 +91,47 @@ class AssistantService:
         self._clock = clock
         self._run_logger = run_logger
         self._request_id_factory = request_id_factory
+        self._cloud_bridge: CloudRouteBridge | None = None
 
     def _request_id(self, request: AssistantRequest) -> str:
         return request.request_id or self._request_id_factory()
+
+    def set_cloud_bridge(self, bridge: "CloudRouteBridge") -> None:
+        """クラウドブリッジを設定する。"""
+        self._cloud_bridge = bridge
+
+    def respond(
+        self,
+        request: AssistantRequest,
+        blocks: Sequence[ContextBlock],
+        *,
+        base_system: str = "",
+        options: GenerationOptions | None = None,
+    ) -> tuple[AssistantResponse, CloudPreview | None]:
+        """blocks からメッセージを構築して生成する。
+
+        クラウドブリッジが設定済みで privacy=cloud_allowed + allow_cloud の場合は
+        Bridge へ委譲する。それ以外はローカルで生成する。
+        """
+        if (
+            self._cloud_bridge is not None
+            and request.privacy == "cloud_allowed"
+            and request.allow_cloud
+        ):
+            preview = self._cloud_bridge.preview(request, blocks)
+            response = self._cloud_bridge.send(request, blocks, options=options)
+            return response, preview
+
+        from src.context.builder import ContextBuilder
+
+        builder = ContextBuilder(base_system)
+        messages = builder.build_messages(
+            blocks,
+            privacy=request.privacy,
+            target_local=True,
+        )
+        response = self.generate(request, messages)
+        return response, None
 
     def _record_route(
         self, request_id: str, request: AssistantRequest, decision: RouteDecision

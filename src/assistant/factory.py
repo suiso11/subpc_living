@@ -133,5 +133,7 @@ def build_assistant_service(
             cloud_config.provider_id,
             approval=approval or ApprovalGate(),
             local_service=service,
+            base_system=config.effective_system_prompt(),
         )
+        service.set_cloud_bridge(bridge)
     return service, registry, bridge

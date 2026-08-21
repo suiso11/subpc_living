@@ -36,9 +36,10 @@ class CloudPreview:
 class ApprovalGate:
     """1リクエスト単位の明示承認を管理する。"""
 
-    def __init__(self) -> None:
-        self._approved: set[str] = set()
-        self._denied: set[str] = set()
+    def __init__(self, max_entries: int = 1024) -> None:
+        self._max_entries = max_entries
+        self._approved: dict[str, None] = {}
+        self._denied: dict[str, None] = {}
 
     def preview(
         self, request_id: str, messages: Sequence[dict[str, Any]]
@@ -50,16 +51,22 @@ class ApprovalGate:
         )
 
     def approve(self, request_id: str) -> None:
-        self._denied.discard(request_id)
-        self._approved.add(request_id)
+        self._denied.pop(request_id, None)
+        if request_id not in self._approved:
+            if len(self._approved) >= self._max_entries:
+                self._approved.pop(next(iter(self._approved)))
+        self._approved[request_id] = None
 
     def deny(self, request_id: str) -> None:
-        self._approved.discard(request_id)
-        self._denied.add(request_id)
+        self._approved.pop(request_id, None)
+        if request_id not in self._denied:
+            if len(self._denied) >= self._max_entries:
+                self._denied.pop(next(iter(self._denied)))
+        self._denied[request_id] = None
 
     def revoke(self, request_id: str) -> None:
-        self._approved.discard(request_id)
-        self._denied.discard(request_id)
+        self._approved.pop(request_id, None)
+        self._denied.pop(request_id, None)
 
     def is_approved(self, request_id: str) -> bool:
         return request_id in self._approved
@@ -78,7 +85,8 @@ class CloudPayloadBuilder:
     """ContextBlock から public のみを選択してクラウド送信Payloadを構築する。
 
     ``ContextPolicy.select(..., target_local=False)`` により personal / secret /
-    local_only の block を除外する＝ローカル匿名化。history はそのまま末尾へ連結。
+    local_only の block を除外する＝ローカル匿名化。history は ContextBlock
+    として blocks に含めて渡し、Policy で選別する（target_local=False で除外）。
     """
 
     def __init__(self, base_system: str = "") -> None:
@@ -88,12 +96,9 @@ class CloudPayloadBuilder:
         self,
         blocks: Sequence[ContextBlock],
         *,
-        history: Sequence[dict[str, Any]] = (),
         privacy: PrivacyMode = "cloud_allowed",
     ) -> list[dict[str, Any]]:
         messages = self._builder.build_messages(
             blocks, privacy=privacy, target_local=False
         )
-        for item in history:
-            messages.append(dict(item))
         return messages

@@ -17,6 +17,14 @@ class _FakeConfig:
     repeat_penalty = 1.1
     num_ctx = 8192
     num_predict = None
+    system_prompt = "You are a helpful assistant."
+    model_prompt_overrides: dict = {}
+
+    def effective_system_prompt(self, model=None) -> str:
+        target = model if model is not None else self.model
+        if target and target in self.model_prompt_overrides:
+            return self.model_prompt_overrides[target]
+        return self.system_prompt
 
 
 def _request(request_id="r1"):
@@ -57,21 +65,37 @@ class FactoryCloudWiringTest(unittest.TestCase):
         service, reg, bridge = build_assistant_service(
             _FakeConfig(), cloud_config=cfg, approval=gate
         )
-        resp = bridge.send(
-            _request(),
-            _blocks(),
-            local_messages=[{"role": "user", "content": "hi"}],
-        )
+        resp = bridge.send(_request(), _blocks())
         self.assertFalse(resp.route.local)
         self.assertEqual(resp.text, "cloud response")
         sent = reg.get("cloud").provider.sent_payloads[0]
         self.assertNotIn("calendar", str(sent))
         self.assertIn("public info", str(sent))
 
+    def test_bridge_wired_to_service(self):
+        """Factory should wire bridge into service via set_cloud_bridge."""
+        gate = ApprovalGate()
+        cfg = CloudConfig(enabled=True, model="cloud-m", provider_id="cloud")
+        service, reg, bridge = build_assistant_service(
+            _FakeConfig(), cloud_config=cfg, approval=gate
+        )
+        self.assertIsNotNone(bridge)
+        self.assertIs(service._cloud_bridge, bridge)
+
     def test_enabled_without_key_is_invalid(self):
         cfg = CloudConfig(enabled=True, model="m", api_key_env="NOPE")
         with self.assertRaises(Exception):
             build_assistant_service(_FakeConfig(), cloud_config=cfg)
+
+    def test_bridge_base_system_from_config(self):
+        """Factory should wire config.effective_system_prompt() into bridge._base_system."""
+        gate = ApprovalGate()
+        cfg = CloudConfig(enabled=True, model="cloud-m", provider_id="cloud")
+        service, reg, bridge = build_assistant_service(
+            _FakeConfig(), cloud_config=cfg, approval=gate
+        )
+        self.assertIsNotNone(bridge)
+        self.assertEqual(bridge._base_system, "You are a helpful assistant.")
 
 
 if __name__ == "__main__":

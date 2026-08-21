@@ -109,6 +109,85 @@ class ChatSession:
                     # 計測失敗で会話自体を失敗させない。
                     pass
 
+    def build_blocks(self) -> tuple:
+        """build_messages が描画する ContextBlock を返す（描画前）。
+
+        プリロード・RAG・Web検索・Vision・Monitor・Screen・Calendar・Tasks・History の
+        各 ContextProvider から収集した ContextBlock を tuple で返す。
+        """
+        from src.context.contracts import ContextBlock as _CB
+        from src.context.providers.preload import PreloadContextProvider
+        from src.context.providers.rag import RAGContextProvider
+        from src.context.providers.web_search import WebSearchContextProvider
+        from src.context.providers.vision import VisionContextProvider
+        from src.context.providers.monitor import MonitorContextProvider
+        from src.context.providers.screen import ScreenContextProvider
+        from src.context.providers.calendar import CalendarContextProvider
+        from src.context.providers.tasks import TasksContextProvider
+        from src.context.providers.history import HistoryContextProvider
+
+        blocks: list[_CB] = []
+
+        if self.preloader is not None:
+            block = PreloadContextProvider.collect(self.preloader)
+            if block is not None:
+                blocks.append(block)
+
+        if self.rag is not None and self._messages:
+            last_user = None
+            for msg in reversed(self._messages):
+                if msg["role"] == "user":
+                    last_user = msg["content"]
+                    break
+            if last_user:
+                block = RAGContextProvider.collect(self.rag, last_user)
+                if block is not None:
+                    blocks.append(block)
+
+        if self.web_search is not None and self._messages:
+            last_user = None
+            for msg in reversed(self._messages):
+                if msg["role"] == "user":
+                    last_user = msg["content"]
+                    break
+            if last_user:
+                block = WebSearchContextProvider.collect(self.web_search, last_user)
+                if block is not None:
+                    blocks.append(block)
+
+        if self.vision_context is not None:
+            block = VisionContextProvider.collect(self.vision_context)
+            if block is not None:
+                blocks.append(block)
+
+        if self.monitor_context is not None:
+            block = MonitorContextProvider.collect(self.monitor_context)
+            if block is not None:
+                blocks.append(block)
+
+        if self.screen_context is not None:
+            block = ScreenContextProvider.collect(self.screen_context)
+            if block is not None:
+                blocks.append(block)
+
+        if self.calendar_context is not None:
+            block = CalendarContextProvider.collect(self.calendar_context)
+            if block is not None:
+                blocks.append(block)
+
+        tasks_block = (
+            TasksContextProvider.collect(self.task_store)
+            if self.task_store is not None
+            else None
+        )
+        history_block = HistoryContextProvider.collect(self._messages)
+
+        for block in (tasks_block, history_block):
+            if block is not None:
+                blocks.append(block)
+
+        return tuple(blocks)
+
     def build_messages(self) -> list[dict]:
         """
         Ollama APIに渡すメッセージリストを構築
