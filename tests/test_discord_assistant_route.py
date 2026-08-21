@@ -383,6 +383,30 @@ class DiscordAssistantRouteTest(unittest.TestCase):
         self.assertEqual(provider.calls[0]["options"]["num_predict"], 256)
         service.generate.assert_not_called()
 
+    def test_ask_session_calls_service_respond_with_blocks_and_base_system(self) -> None:
+        """ask_session は service.respond を build_blocks + base_system で呼ぶ。"""
+        profile = _profile("default")
+        provider = FakeProvider(response="ok")
+        state = self._state(provider)
+        session = self._session()
+
+        mock_service = MagicMock()
+        mock_service.respond.return_value = (MagicMock(text="ok"), None)
+        state.assistant_services["default"] = mock_service
+
+        state.ask_session(session, "ping", threading.Lock(), profile)
+
+        mock_service.respond.assert_called_once()
+        call_args = mock_service.respond.call_args
+        # First positional arg is the AssistantRequest
+        request = call_args.args[0]
+        self.assertEqual(request.text, "ping")
+        # Second positional arg is blocks (from session.build_blocks())
+        blocks = call_args.args[1]
+        self.assertIsInstance(blocks, tuple)
+        # Keyword arg base_system must equal session.system_prompt
+        self.assertEqual(call_args.kwargs.get("base_system", None), "system")
+
     def test_registry_closes_shared_provider_once(self) -> None:
         provider = _CountingProvider()
         registry = ProviderRegistry()

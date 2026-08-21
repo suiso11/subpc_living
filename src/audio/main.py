@@ -185,7 +185,7 @@ def run_text_to_speech_mode(args):
                 break
 
             session.add_user_message(user_input)
-            messages = session.build_messages()
+            blocks = session.build_blocks()
             request = AssistantRequest(
                 text=user_input,
                 conversation_id=session.session_id,
@@ -197,7 +197,7 @@ def run_text_to_speech_mode(args):
             # LLM応答生成
             print(f"{Color.CYAN}{Color.BOLD}AI> {Color.RESET}", end="", flush=True)
             response = ""
-            for token in service.generate_stream(request, messages):
+            for token in service.respond_stream(request, blocks, base_system=session.system_prompt):
                 print(token, end="", flush=True)
                 response += token
             print()

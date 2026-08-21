@@ -117,7 +117,7 @@ def run_chat_loop(config, session, service, *, read_input=input) -> None:
 
         # メッセージ送信
         session.add_user_message(user_input)
-        messages = session.build_messages()
+        blocks = session.build_blocks()
         request = AssistantRequest(
             text=user_input,
             conversation_id=session.session_id,
@@ -130,7 +130,7 @@ def run_chat_loop(config, session, service, *, read_input=input) -> None:
         try:
             if config.stream:
                 # ストリーミング出力
-                stream = service.generate_stream(request, messages)
+                stream = service.respond_stream(request, blocks, base_system=session.system_prompt)
                 for token in stream:
                     print(token, end="", flush=True)
                 print()  # 改行
@@ -141,7 +141,7 @@ def run_chat_loop(config, session, service, *, read_input=input) -> None:
                 session.add_assistant_message(stream.response.text)
             else:
                 # 非ストリーミング
-                response = service.generate(request, messages)
+                response, _preview = service.respond(request, blocks, base_system=session.system_prompt)
                 print(response.text)
                 session.add_assistant_message(response.text)
         except Exception as e:

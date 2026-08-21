@@ -1093,10 +1093,12 @@ class DiscordConsoleState:
                     privacy="local_only",
                     requested_provider=profile.name,
                 )
-                response = service.generate(
+                response, _preview = service.respond(
                     request,
-                    session.build_messages(),
-                ).text
+                    session.build_blocks(),
+                    base_system=session.system_prompt,
+                )
+                response = response.text
             except Exception:
                 if session._messages and session._messages[-1]["role"] == "user":
                     session._messages.pop()

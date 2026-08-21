@@ -3,12 +3,14 @@ import io
 import queue
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 import numpy as np
 
 from src.assistant.factory import build_local_service
 from src.audio.pipeline import VoicePipeline
 from src.chat.config import ChatConfig
+from src.context.contracts import ContextBlock, ContextMessage
 from src.llm.errors import ProviderRequestError
 from src.llm.providers.fake import FakeProvider
 from src.llm.routing.static import StaticRouter
@@ -35,8 +37,9 @@ class NoopPlayer:
 
 
 class TestSession:
-    def __init__(self, session_id: str = "voice-session") -> None:
+    def __init__(self, session_id: str = "voice-session", system_prompt: str = "") -> None:
         self.session_id = session_id
+        self.system_prompt = system_prompt
         self._messages = []
 
     def add_user_message(self, content: str) -> None:
@@ -47,6 +50,18 @@ class TestSession:
 
     def build_messages(self):
         return [dict(message) for message in self._messages]
+
+    def build_blocks(self):
+        if not self._messages:
+            return []
+        return [ContextBlock(
+            source="history",
+            content=tuple(
+                ContextMessage(role=m["role"], content=m["content"])
+                for m in self._messages
+            ),
+            local_only=True,
+        )]
 
 
 class IdleManagerStub:
@@ -117,10 +132,12 @@ class VoicePipelineLLMTest(unittest.TestCase):
     def test_streaming_tts_generation_preserves_provider_tokens(self) -> None:
         provider = FakeProvider(stream_chunks=("スト", "リーム", "。"))
         pipeline, router = self.make_pipeline(provider)
-        messages = [{"role": "user", "content": "話して"}]
+        pipeline.session.add_user_message("話して")
+        blocks = pipeline.session.build_blocks()
+        user_text = "話して"
 
         with redirect_stdout(io.StringIO()):
-            response = pipeline._stream_llm_with_tts(messages)
+            response = pipeline._stream_llm_with_tts(blocks, user_text)
 
         self.assertEqual(response, "ストリーム。")
         self.assertEqual(len(router.requests), 1)
@@ -138,14 +155,14 @@ class VoicePipelineLLMTest(unittest.TestCase):
         )
         provider = FakeProvider(stream_chunks=("応", "答", "です"))
         pipeline, router = self.make_pipeline(provider, config=config)
-        messages = [
-            {"role": "user", "content": "最初の質問"},
-            {"role": "assistant", "content": "最初の応答"},
-            {"role": "user", "content": "最後の質問"},
-        ]
+        pipeline.session.add_user_message("最初の質問")
+        pipeline.session.add_assistant_message("最初の応答")
+        pipeline.session.add_user_message("最後の質問")
+        blocks = pipeline.session.build_blocks()
+        user_text = "最後の質問"
 
         with redirect_stdout(io.StringIO()):
-            response = pipeline._sequential_llm_then_tts(messages)
+            response = pipeline._sequential_llm_then_tts(blocks, user_text)
 
         self.assertEqual(response, "応答です")
         self.assertEqual(len(router.requests), 1)
@@ -205,6 +222,29 @@ class VoicePipelineLLMTest(unittest.TestCase):
 
         self.assertEqual(provider.close_count, 1)
         self.assertIsNone(pipeline._provider_registry)
+
+    def test_respond_stream_called_with_blocks_and_base_system(self) -> None:
+        """respond_stream receives blocks (not messages) and base_system from session."""
+        provider = FakeProvider(stream_chunks=("応", "答"))
+        session = TestSession(system_prompt="You are helpful.")
+        pipeline, _ = self.make_pipeline(provider, session=session)
+        pipeline.streaming_tts = False
+        pipeline.session.add_user_message("テスト")
+        blocks = pipeline.session.build_blocks()
+        user_text = "テスト"
+
+        mock_service = mock.Mock()
+        mock_service.respond_stream.return_value = iter(["応", "答"])
+        pipeline._assistant_service = mock_service
+
+        with redirect_stdout(io.StringIO()):
+            pipeline._sequential_llm_then_tts(blocks, user_text)
+
+        mock_service.respond_stream.assert_called_once()
+        call_args = mock_service.respond_stream.call_args
+        # First positional arg is request, second is blocks
+        self.assertIs(call_args.args[1], blocks)
+        self.assertEqual(call_args.kwargs["base_system"], "You are helpful.")
 
 
 if __name__ == "__main__":

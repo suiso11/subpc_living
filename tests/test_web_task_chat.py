@@ -37,7 +37,7 @@ class WebTaskChatTest(unittest.TestCase):
         websocket_start = source.index("async def websocket_chat")
         task_branch = source.index("task_reply = await asyncio.to_thread", websocket_start)
         event_branch = source.index("event_reply = await asyncio.to_thread", websocket_start)
-        llm_branch = source.index("assistant_service.generate_stream(", websocket_start)
+        llm_branch = source.index("assistant_service.respond_stream(", websocket_start)
         candidate_branch = source.index("_launch_task_candidate_offer(", llm_branch)
         self.assertLess(task_branch, event_branch)
         self.assertLess(task_branch, llm_branch)

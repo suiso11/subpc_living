@@ -10,6 +10,7 @@ from unittest.mock import patch
 from src.assistant.contracts import AssistantRequest
 from src.assistant.factory import build_local_service
 from src.assistant.stream_queue import QueueStream, stream_to_queue
+from src.context.contracts import ContextBlock
 from src.llm.providers.fake import FakeProvider
 from src.llm.routing.contracts import NoRouteError
 from src.web import server
@@ -101,9 +102,17 @@ class WebAssistantStreamTest(unittest.TestCase):
         server.assistant_service, _ = build_local_service(
             _FactoryConfig(), provider=provider
         )
+        blocks = (
+            ContextBlock(
+                source="history",
+                content="user says 質問",
+                sensitivity="personal",
+                local_only=True,
+            ),
+        )
 
         queue_stream = server._start_assistant_stream(
-            self._request(), [{"role": "user", "content": "質問"}]
+            self._request(), blocks, base_system="test-system"
         )
 
         self.assertIsInstance(queue_stream, QueueStream)
@@ -116,10 +125,18 @@ class WebAssistantStreamTest(unittest.TestCase):
         server.assistant_service, _ = build_local_service(
             _FactoryConfig(), provider=provider
         )
+        blocks = (
+            ContextBlock(
+                source="history",
+                content="user says 質問",
+                sensitivity="personal",
+                local_only=True,
+            ),
+        )
 
         with self.assertRaises(NoRouteError):
             server._start_assistant_stream(
-                self._request(), [{"role": "user", "content": "質問"}]
+                self._request(), blocks, base_system="test-system"
             )
 
     def test_provider_exception_is_followed_by_sentinel(self) -> None:
@@ -177,6 +194,37 @@ class WebAssistantStreamTest(unittest.TestCase):
         self.assertEqual(initialized["model"], "registry-model")
         self.assertIsInstance(initialized["ollama"], bool)
         self.assertIsInstance(initialized["model"], str)
+
+    def test_start_assistant_stream_uses_respond_stream_with_blocks_and_base_system(
+        self,
+    ) -> None:
+        """_start_assistant_stream は assistant_service.respond_stream を
+        blocks + base_system を渡して呼ぶこと。"""
+        provider = FakeProvider(stream_chunks=("ok",))
+        service, _ = build_local_service(_FactoryConfig(), provider=provider)
+        server.assistant_service = service
+        blocks = (
+            ContextBlock(
+                source="history",
+                content="user says 質問",
+                sensitivity="personal",
+                local_only=True,
+            ),
+        )
+
+        with patch.object(service, "respond_stream", wraps=service.respond_stream) as mock_rs:
+            queue_stream = server._start_assistant_stream(
+                self._request(), blocks, base_system="my-system"
+            )
+            self._consume(queue_stream)
+
+        mock_rs.assert_called_once()
+        call_args = mock_rs.call_args
+        # positional: request, blocks
+        self.assertIsInstance(call_args.args[0], AssistantRequest)
+        self.assertEqual(call_args.args[1], blocks)
+        # keyword: base_system
+        self.assertEqual(call_args.kwargs["base_system"], "my-system")
 
     def test_task_extraction_keeps_direct_provider_options(self) -> None:
         provider = FakeProvider(response=json.dumps({"tasks": []}))

@@ -329,6 +329,41 @@ class CliLoopTest(unittest.TestCase):
         self.assertNotIn(stats_line, outputs[False])
         self.assertIn(stats_line, outputs[True])
 
+    def test_stream_uses_respond_stream_with_blocks_and_base_system(self) -> None:
+        config = ChatConfig(stream=True)
+        provider = FakeProvider(response="応答", stream_chunks=("応", "答"))
+        service, _ = build_cli_service(config, provider=provider)
+        session = self.make_session(config)
+
+        with patch.object(type(service), "respond_stream", wraps=service.respond_stream) as mock_rs:
+            output = self.run_loop(config, session, service, "質問")
+            mock_rs.assert_called_once()
+            call_args = mock_rs.call_args
+            # first positional arg is request
+            self.assertIsInstance(call_args.args[0], AssistantRequest)
+            # second positional arg is blocks (from session.build_blocks)
+            self.assertIsNotNone(call_args.args[1])
+            # keyword arg base_system
+            self.assertEqual(call_args.kwargs.get("base_system"), session.system_prompt)
+
+        self.assertIn("応答", output)
+
+    def test_non_stream_uses_respond_with_blocks_and_base_system(self) -> None:
+        config = ChatConfig(stream=False)
+        provider = FakeProvider(response="応答")
+        service, _ = build_cli_service(config, provider=provider)
+        session = self.make_session(config)
+
+        with patch.object(type(service), "respond", wraps=service.respond) as mock_r:
+            output = self.run_loop(config, session, service, "質問")
+            mock_r.assert_called_once()
+            call_args = mock_r.call_args
+            self.assertIsInstance(call_args.args[0], AssistantRequest)
+            self.assertIsNotNone(call_args.args[1])
+            self.assertEqual(call_args.kwargs.get("base_system"), session.system_prompt)
+
+        self.assertIn("応答", output)
+
     def test_startup_check_failure_closes_registry_once(self) -> None:
         for available, has_model in ((False, True), (True, False)):
             with self.subTest(available=available, has_model=has_model):

@@ -595,13 +595,13 @@ class VoicePipeline:
         # --- LLM → TTS (ストリーミング) ---
         print("\n🤖 考え中...")
         self.session.add_user_message(user_text)
-        messages = self.session.build_messages()
+        blocks = self.session.build_blocks()
 
         try:
             if self.streaming_tts:
-                response_text = self._stream_llm_with_tts(messages)
+                response_text = self._stream_llm_with_tts(blocks, user_text)
             else:
-                response_text = self._sequential_llm_then_tts(messages)
+                response_text = self._sequential_llm_then_tts(blocks, user_text)
 
             if not response_text:
                 return None
@@ -621,7 +621,7 @@ class VoicePipeline:
 
         return response_text
 
-    def _stream_llm_with_tts(self, messages: list[dict]) -> str:
+    def _stream_llm_with_tts(self, blocks, user_text: str) -> str:
         """
         LLMストリーミング応答を文単位でTTS合成・再生する
 
@@ -650,14 +650,6 @@ class VoicePipeline:
         tts_thread.start()
 
         self._state = self.STATE_PROCESSING
-        user_text = next(
-            (
-                str(message.get("content") or "")
-                for message in reversed(messages)
-                if message.get("role") == "user"
-            ),
-            "",
-        )
         request = AssistantRequest(
             text=user_text,
             conversation_id=getattr(self.session, "session_id", "voice") or "voice",
@@ -666,7 +658,7 @@ class VoicePipeline:
             privacy="local_only",
         )
         try:
-            stream = self._assistant_service.generate_stream(request, messages)
+            stream = self._assistant_service.respond_stream(request, blocks, base_system=self.session.system_prompt)
             for token in stream:
                 piece = emo_filter.feed(token) if emo_filter is not None else token
                 if not piece:
@@ -749,17 +741,9 @@ class VoicePipeline:
             except Exception as e:
                 print(f"\n⚠️  TTS再生エラー: {e}")
 
-    def _sequential_llm_then_tts(self, messages: list[dict]) -> str:
+    def _sequential_llm_then_tts(self, blocks, user_text: str) -> str:
         """従来のシーケンシャル方式: LLM全文完了後にTTS"""
         response_text = ""
-        user_text = next(
-            (
-                str(message.get("content") or "")
-                for message in reversed(messages)
-                if message.get("role") == "user"
-            ),
-            "",
-        )
         request = AssistantRequest(
             text=user_text,
             conversation_id=getattr(self.session, "session_id", "voice") or "voice",
@@ -767,7 +751,7 @@ class VoicePipeline:
             profile="voice_fast",
             privacy="local_only",
         )
-        stream = self._assistant_service.generate_stream(request, messages)
+        stream = self._assistant_service.respond_stream(request, blocks, base_system=self.session.system_prompt)
         for token in stream:
             response_text += token
             print(token, end="", flush=True)

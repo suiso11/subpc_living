@@ -2227,9 +2227,9 @@ def _effective_system_prompt(cfg) -> str:
     return cfg.system_prompt
 
 
-def _start_assistant_stream(request, messages):
+def _start_assistant_stream(request, blocks, *, base_system):
     """経路選択からQueue worker開始までを同期的に行う。"""
-    stream = assistant_service.generate_stream(request, messages)
+    stream = assistant_service.respond_stream(request, blocks, base_system=base_system)
     return stream_to_queue(stream)
 
 
@@ -2497,7 +2497,7 @@ async def websocket_chat(websocket: WebSocket):
 
             session = get_or_create_session(session_id)
             session.add_user_message(user_text)
-            messages = session.build_messages()
+            blocks = session.build_blocks()
 
             # ストリーミング応答生成
             loop = asyncio.get_event_loop()
@@ -2509,8 +2509,8 @@ async def websocket_chat(websocket: WebSocket):
 
             try:
                 # queue ベースのリアルタイムストリーミング
-                # _start_assistant_stream内でassistant_service.generate_stream(
-                # request, messages)とQueue worker開始を同じthread上で行う。
+                # _start_assistant_stream内でassistant_service.respond_stream(
+                # request, blocks)とQueue worker開始を同じthread上で行う。
                 request = AssistantRequest(
                     text=user_text,
                     conversation_id=session_id,
@@ -2518,7 +2518,8 @@ async def websocket_chat(websocket: WebSocket):
                     privacy="local_only",
                 )
                 queue_stream = await asyncio.to_thread(
-                    _start_assistant_stream, request, messages
+                    _start_assistant_stream, request, blocks,
+                    base_system=session.system_prompt,
                 )
                 token_queue = queue_stream.queue
 
