@@ -22,6 +22,7 @@ from src.perception import create_activity_runtime_from_env
 from .api import DesktopApi
 from .audio import NativeAudioRecorder
 from .config import DesktopSettings
+from .shell import decide_shell_state, overlay_visibility, sensor_provenance
 from .windows import is_autostart_enabled, set_autostart
 
 logger = logging.getLogger(__name__)
@@ -68,6 +69,8 @@ class DesktopBridge(QObject):
     ttsEnabledChanged = Signal()
     ttsVoicesChanged = Signal()
     companionStateChanged = Signal()
+    overlayShellChanged = Signal()
+    mainWindowRequested = Signal()
     toast = Signal(str, str)
     nativeNotification = Signal(str, str)
 
@@ -118,6 +121,7 @@ class DesktopBridge(QObject):
         self.recorder = NativeAudioRecorder()
 
         self._activity_runtime = create_activity_runtime_from_env(os.environ, logger=logger)
+        self._overlay_enabled = os.environ.get("DESKTOP_OVERLAY_ENABLED", "").strip().lower() == "true"
 
         self.reminder_timer = QTimer(self)
         self.reminder_timer.setInterval(60_000)
@@ -125,7 +129,7 @@ class DesktopBridge(QObject):
 
         self.companion_timer = QTimer(self)
         self.companion_timer.setInterval(5_000)
-        self.companion_timer.timeout.connect(self.companionStateChanged)
+        self.companion_timer.timeout.connect(self._companion_tick)
         if self._activity_runtime is not None:
             self.companion_timer.start()
 
@@ -228,6 +232,65 @@ class DesktopBridge(QObject):
     @Property("QVariantMap", notify=companionStateChanged)
     def companionState(self) -> dict[str, Any]:
         return self.api.companion_state(self._activity_runtime)
+
+    def _companion_tick(self) -> None:
+        self.companionStateChanged.emit()
+        self.overlayShellChanged.emit()
+
+    @Property(bool, notify=companionStateChanged)
+    def overlayEnabled(self) -> bool:
+        return self._overlay_enabled
+
+    @Property("QVariantMap", notify=overlayShellChanged)
+    def overlayShell(self) -> dict[str, Any]:
+        return self._compute_overlay_shell()
+
+    def _compute_overlay_shell(self) -> dict[str, Any]:
+        try:
+            payload = self.api.companion_state(self._activity_runtime)
+            shell_state = decide_shell_state(
+                payload.get("state"),
+                has_error=bool(
+                    payload.get("enabled")
+                    and payload.get("consecutive_failures", 0) > 0
+                ),
+            )
+            state_data = payload.get("state") or {}
+            vis = overlay_visibility(
+                shell_state,
+                interruptible=state_data.get("interruptible", True)
+                if payload.get("state")
+                else True,
+            )
+            provenance = sensor_provenance(
+                "activity", payload.get("last_update_at") or 0.0
+            )
+            return {
+                "enabled": self._overlay_enabled,
+                "shell_state": shell_state,
+                "visible": vis["visible"],
+                "shrink": vis["shrink"],
+                "provenance": provenance,
+                "companion": payload,
+            }
+        except Exception:
+            return {
+                "enabled": self._overlay_enabled,
+                "shell_state": "idle",
+                "visible": True,
+                "shrink": True,
+                "provenance": None,
+                "companion": {"enabled": False},
+            }
+
+    @Slot()
+    def openMainFromOverlay(self) -> None:
+        self.mainWindowRequested.emit()
+
+    @Slot()
+    def stopOverlayFromOverlay(self) -> None:
+        self._overlay_enabled = False
+        self.overlayShellChanged.emit()
 
     @Slot()
     def initialize(self) -> None:

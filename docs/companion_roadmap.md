@@ -213,12 +213,31 @@ Contextをすべて構築してから送信先を決めてはいけない。先�
 - 音声 wiring: `src/audio/pipeline.py` の `VoicePipeline` が `companion_getter=self._companion_state` を `ProactiveEngine` へ渡し、`ActivityRuntime.state` でゲート（None・例外時は従来挙動）
 - Desktop wiring: desktop は `ProactiveEngine` を持たず、companion state を表示のみに利用するため Policy ゲートの対象なし。入力である companion state は既に `companionState` Property で露出済み
 
-### Phase 6: 3DデスクトップShell（未着手）
+### Phase 6: 3DデスクトップShell（一部完了・6a基盤）
 
-- 仮VRMによる透明ウィンドウ
+#### 完了: Phase 6a オーバーレイShell基盤
+
+- Shell基盤は既存QML拡張と決定（Tauri/Electron不採用。全面改修しない原則）。IPCは既存QObject bridgeを流用
+- `src/desktop/shell.py`（Qt非依存の純Python・全単体テスト済み）: CompanionState payload → 有限視覚状態
+  （idle / working / conversing / away / schedule_near / error）の決定的マッピング。優先順位:
+  error > conversing > schedule_near > away > working(focused) > idle
+- `overlay_visibility()`: 集中モード（focused & 非interruptible）と離席で縮小、ロードマップ §7 の
+  「フルスクリーン・集中モードでは縮小または非表示」を実装
+- `sensor_provenance()`: HUD表示用の出所ラベル（PC活動/予定/タスク/PC状態）・取得時刻・保存有無。
+  生データ非保存のため saved は常に False
+- `src/desktop/qml/Overlay.qml`: 透明フレームレス常駐ウィンドウ（FramelessWindowHint / StaysOnTop / Tool）。
+  状態色リングの仮2Dアバター（縮小時はアニメ停止 = reduced-motion配慮）、展開HUD 1枚・ボタン3個以内・
+  出所行（出所/取得/保存なし）、停止でオーバーレイ非表示
+- Win32 クリックスルー切替 `apply_click_through()`（WS_EX_LAYERED|WS_EX_TRANSPARENT、非Windows保護）
+- `DESKTOP_OVERLAY_ENABLED=true` オプトイン + `--no-overlay` 上書き。起動失敗時はメインアプリ継続
+- privacy-safe: 表示に使うのは `companion_state_payload` 同等のフィールドのみ
+
+#### 未着手: Phase 6b VRMレンダラ以降
+
+- Qt Quick 3D による VRM 1.0 描画（ユーザー所有VRMの読み込みを優先し、第三者モデルは同梱しない）
 - 待機、視線、表情、リップシンク
-- クイック会話HUDとセンサー確認パネル
-- ユーザー所有VRMの読み込みを優先し、第三者モデルを製品へ無断同梱しない
+- クイック会話HUDのチャット実装（6aでは状態HUDまで。送信経路は既存 bridge チャット経路を再利用予定）
+- フルスクリーン/画面共有検知による自動縮小
 
 ### Phase 7: 任意の高度機能（未着手）
 
@@ -333,7 +352,7 @@ Phase 1〜2とRegistry/Router、CLI・Web・Discord・Voice移行、実行ログ
     privacy-safe な `companion_state_payload` のみ公開。プロセス名・PID・アプリ分類・
     window title・エラー本文・生サンプルは出さない
 
-次の実装単位: Phase 6（3DデスクトップShell）。Cloud経由の実送信Provider swap と LangGraph Workflow は `docs/assistant_platform_plan.md` Phase K/L の通り別判断。
+Phase 6a オーバーレイShell基盤（透明フレームレスウィンドウ・有限状態アバター・センサー出所HUD・クリックスルー・集中モード縮小）も完了。次の実装単位: Phase 6b（VRMレンダラ・リップシンク・クイック会話チャット）。Cloud実送信Provider swap は `docs/assistant_platform_plan.md` Phase K の通り `provider_kind="openai_compatible"` で完了済み。LangGraph Workflow は別判断。
 
 ## 10. 現時点の非目標
 
@@ -349,8 +368,8 @@ Phase 1〜2とRegistry/Router、CLI・Web・Discord・Voice移行、実行ログ
 
 - `AssistantRequest`の最終フィールドと同期・非同期境界
 - 複数ローカルモデルの命名・Registry形式
-- デスクトップShellを既存QML、Tauri、Electronのどれで進めるか
-- VRM RendererとPythonバックエンド間のIPC方式
+- デスクトップShellを既存QML、Tauri、Electronのどれで進めるか → **既存QML拡張で決定**（Phase 6a）
+- VRM RendererとPythonバックエンド間のIPC方式 → **QObject bridge流用で決定**（Phase 6a・VRM描画は6bで検証）
 - イベント保存期間と監査ログの粒度
 - 製品用オリジナルキャラクターと衣装規格
 

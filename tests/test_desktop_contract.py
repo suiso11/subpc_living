@@ -94,5 +94,41 @@ class DesktopContractTest(unittest.TestCase):
         self.assertIn("windows-version-info.txt", spec)
 
 
+    def test_overlay_qml_has_required_flags_and_objectnames(self) -> None:
+        source = (QML / "Overlay.qml").read_text(encoding="utf-8")
+        self.assertIn("Qt.FramelessWindowHint", source)
+        self.assertIn("Qt.WindowStaysOnTopHint", source)
+        self.assertIn("Qt.Tool", source)
+        self.assertIn('color: "transparent"', source)
+        for name in (
+            "overlayRoot",
+            "overlayAvatar",
+            "overlayHud",
+            "overlayStateLabel",
+            "overlayProvenance",
+        ):
+            self.assertIn(f'objectName: "{name}"', source)
+
+    def test_overlay_qml_provenance_labels(self) -> None:
+        source = (QML / "Overlay.qml").read_text(encoding="utf-8")
+        for label in ("出所", "取得", "保存"):
+            self.assertIn(label, source)
+
+    def test_overlay_qml_no_vrm_references(self) -> None:
+        source = (QML / "Overlay.qml").read_text(encoding="utf-8").lower()
+        self.assertNotIn("vrm", source)
+        self.assertNotIn(".vrm", source)
+
+    def test_overlay_qml_action_buttons(self) -> None:
+        source = (QML / "Overlay.qml").read_text(encoding="utf-8")
+        for label in ("閉じる", "本体を開く", "停止"):
+            self.assertIn(label, source)
+
+    def test_overlay_qml_state_labels_japanese(self) -> None:
+        source = (QML / "Overlay.qml").read_text(encoding="utf-8")
+        for label in ("待機中", "作業中", "会話中", "離席中", "予定が近づいています", "エラー"):
+            self.assertIn(label, source)
+
+
 if __name__ == "__main__":
     unittest.main()

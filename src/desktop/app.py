@@ -15,7 +15,7 @@ from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 from .bridge import DesktopBridge
 from .config import DesktopSettings
-from .windows import HOTKEY_ID, apply_windows_backdrop
+from .windows import HOTKEY_ID, apply_click_through, apply_windows_backdrop
 
 
 def resource_path(relative: str) -> Path:
@@ -117,6 +117,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--server", help="Backend URL, e.g. http://100.x.x.x:8000")
     parser.add_argument("--hidden", action="store_true", help="Start in the system tray")
     parser.add_argument("--no-tray", action="store_true", help="Disable tray integration")
+    parser.add_argument("--no-overlay", action="store_true", help="Disable overlay even if env is set")
     parser.add_argument("--smoke-test", action="store_true", help=argparse.SUPPRESS)
     return parser
 
@@ -211,6 +212,31 @@ def main(argv: list[str] | None = None) -> int:
                 "Ctrl+Alt+Spaceを別のアプリが使用している可能性があります",
             ),
         )
+
+    # --- Overlay window (Phase 6a) ---
+    overlay_engine = None
+    overlay_window = None
+    if not args.no_overlay:
+        overlay_on = os.environ.get("DESKTOP_OVERLAY_ENABLED", "").strip().lower() == "true"
+        if overlay_on:
+            try:
+                overlay_engine = QQmlApplicationEngine()
+                overlay_engine.rootContext().setContextProperty("overlayBridge", bridge)
+                overlay_qml = resource_path("src/desktop/qml/Overlay.qml")
+                overlay_engine.addImportPath(str(overlay_qml.parent))
+                overlay_engine.load(QUrl.fromLocalFile(str(overlay_qml)))
+                if overlay_engine.rootObjects():
+                    overlay_window = overlay_engine.rootObjects()[0]
+                    bridge.mainWindowRequested.connect(lambda: _show_window(window))
+                    QTimer.singleShot(
+                        250,
+                        lambda: apply_click_through(int(overlay_window.winId()), False)
+                        if overlay_window is not None
+                        else None,
+                    )
+            except Exception:
+                overlay_engine = None
+                overlay_window = None
 
     if args.hidden or settings.start_hidden:
         window.hide()
