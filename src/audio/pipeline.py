@@ -188,6 +188,7 @@ class VoicePipeline:
                     profile=self.profile,
                     check_interval=60.0,
                     monitor_context=self.monitor_context,
+                    companion_getter=self._companion_state,
                 )
             except Exception as e:
                 print(f"⚠️  Persona初期化スキップ: {e}")
@@ -283,6 +284,16 @@ class VoicePipeline:
         self._state = self.STATE_IDLE
         self._running = False
         self._audio_queue: queue.Queue = queue.Queue()
+
+    # --- companion state getter (ProactiveEngine gate) ---
+    def _companion_state(self):
+        runtime = self.activity_runtime
+        if runtime is None:
+            return None
+        try:
+            return runtime.state
+        except Exception:
+            return None
 
     # --- 文分割ユーティリティ ---
     # 日本語の文末パターン: 。！？!? + 改行
