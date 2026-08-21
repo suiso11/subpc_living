@@ -31,11 +31,10 @@ Web UI・Discord bot・音声パイプラインから使う。
 | 役 | 実体 | 権限 | 担当 |
 | --- | --- | --- | --- |
 | オペレーター | 親 | 全ツール | 計画、分解、ブリーフ作成、統合、最終判断 |
-| worker | OpenCode `opencode-go/deepseek-v4-pro` | 限定write | 実装・修正のみ。1タスク1関心事 |
-| reviewer | OpenCode `opencode-go/kimi-k3` | 読み取り専用 | 差分・要件の独立レビュー |
+| worker | OpenCode worker | 限定write | 実装・修正のみ。1タスク1関心事 |
+| reviewer | OpenCode reviewer | 読み取り専用 | 差分・要件の独立レビュー |
 
-- worker の既定は `opencode-go/deepseek-v4-pro`。軽作業は `deepseek-v4-flash`。
-  OpenCodeの `opencode_task` / `opencode_spawn` 経由で起動する
+- worker / reviewer のモデルは pi-orch の設定に従う。`opencode_task` / `opencode_spawn` 経由で起動する
 - reviewer は常に読み取り専用。write・本番データ・秘密情報・サービス操作を渡さない
 - worker / reviewer の結論は最終承認にせず、オペレーターが最終判断する
 - Pi named agents (`subpc-scout`, `subpc-tester`, `subpc-reviewer`) は探索・テスト・レビュー用。
