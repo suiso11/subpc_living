@@ -174,7 +174,7 @@ Contextをすべて構築してから送信先を決めてはいけない。先�
 - ローカルモデルRegistry（完了）
 - 手動ルーティングと経路ログ（完了）
 
-### Phase 4: 知覚イベントと状態（一部完了）
+### Phase 4: 知覚イベントと状態（完了）
 
 - 分類済みapp_categoryとidle_secondsから意味イベント生成（完了・`ActivityEventCollector`）
 - `focused` / `idle` / `away`の3状態（完了）
@@ -182,11 +182,11 @@ Contextをすべて構築してから送信先を決めてはいけない。先�
 - 生データを保存していないことのテスト（完了）
 - プラットフォーム別ActivitySource adapter（完了・Windows / Linux(X11)）
 - Web runtime wiringと読み取り専用状態API（完了・`/api/companion/state`、オプトイン）
-- UI消費とWeb以外（Discord / Voice / Desktop）へのruntime wiring（未完）
+- UI消費とWeb以外（Discord / Voice / Desktop）へのruntime wiring（完了・各入口とも `COMPANION_ACTIVITY_ENABLED=true` オプトイン時のみ起動し、privacy-safe な `companion_state_payload` のみ公開）
 
-次アクション: UI消費と非Web入口（Discord / Voice / Desktop）へのruntime wiring。カメラ・画面・常時生データ収集は実装しない。
+次アクション: Phase 5 の接続層（Policy と既存 `ProactiveEngine`・各入口の統合）。カメラ・画面・常時生データ収集は実装しない。
 
-### Phase 5: Proactive Policy（一部完了）
+### Phase 5: Proactive Policy（完了）
 
 - 予定接近、長時間作業、離席復帰のルール
 - 黙る条件、再通知間隔、拒否フィードバック
@@ -204,12 +204,14 @@ Contextをすべて構築してから送信先を決めてはいけない。先�
 - テスト 14件追加 (focused silent, break_suggest, schedule_remind, away_return, cooldown,
   interruptible, 純粋関数性)。companion 全体 56テスト OK
 
-#### 未完: Policy の接続層
+#### 完了: Policy の接続層
 
-- `DeterministicProactivePolicy` と既存 `ProactiveEngine` (`src/persona/proactive.py`) の統合
-- CalendarSource 接続 (`UserProfile.get_upcoming_schedule` から `next_event_at` へ)
-- 拒否フィードバックの永続化 (`cooldown_key` への反映・再通知間隔の調整)
-- Discord / 音声 / Desktop 各入口から Policy を参照する wiring
+- `DeterministicProactivePolicy` と既存 `ProactiveEngine` (`src/persona/proactive.py`) の統合: `ProactiveEngine` は `companion_policy` / `companion_getter` / `calendar_source` / `state_path` を受け付け、既定で `DeterministicProactivePolicy()` を使う
+- CalendarSource 接続: `src/companion/calendar.py` が `UserProfile.get_upcoming_schedule` から `next_event_at` への橋渡しを実装し、`schedule_remind` に反映
+- 拒否フィードバックの永続化: `record_rejection` が `cooldown_key` へ反映され、再通知間隔を調整（state_path へ永続化）
+- Discord wiring: `src/discord_bot/proactive_bridge.py` が `companion_getter` を `ProactiveEngine` へ渡し、活動状態でゲート
+- 音声 wiring: `src/audio/pipeline.py` の `VoicePipeline` が `companion_getter=self._companion_state` を `ProactiveEngine` へ渡し、`ActivityRuntime.state` でゲート（None・例外時は従来挙動）
+- Desktop wiring: desktop は `ProactiveEngine` を持たず、companion state を表示のみに利用するため Policy ゲートの対象なし。入力である companion state は既に `companionState` Property で露出済み
 
 ### Phase 6: 3DデスクトップShell（未着手）
 
@@ -227,7 +229,7 @@ Contextをすべて構築してから送信先を決めてはいけない。先�
 
 ## 9. 現在の実装進行単位
 
-Phase 1〜2とRegistry/Router、CLI・Web・Discord・Voice移行、実行ログの実装とruntime wiringは完了し、Phase 3の`ContextBlock` / `ContextPolicy`基盤、History・Preload・RAG・Web search・Monitor・Vision・Screen・Calendar・Tasksの各Context Provider移行も完了した。Phase J全体は完了し、Phase 4の基盤実装（`PerceptionEvent` / `CompanionState` / `StateAggregator` / `ActivityEventCollector`）とプラットフォーム別ActivitySource adapter、Web runtime wiring・`/api/companion/state`、およびDiscord / 音声 / Desktop / Web UI へのruntime wiringが完了した。Phase 5の決定的Policyエンジン基盤（`DeterministicProactivePolicy`）も完了し、次アクションはPolicyの接続層（既存`ProactiveEngine`・CalendarSource・各入口との統合）へ進む。
+Phase 1〜2とRegistry/Router、CLI・Web・Discord・Voice移行、実行ログの実装とruntime wiringは完了し、Phase 3の`ContextBlock` / `ContextPolicy`基盤、History・Preload・RAG・Web search・Monitor・Vision・Screen・Calendar・Tasksの各Context Provider移行も完了した。Phase J全体は完了し、Phase 4の基盤実装（`PerceptionEvent` / `CompanionState` / `StateAggregator` / `ActivityEventCollector`）とプラットフォーム別ActivitySource adapter、Web runtime wiring・`/api/companion/state`、およびDiscord / 音声 / Desktop / Web UI へのruntime wiringが完了した。Phase 5の決定的Policyエンジン基盤（`DeterministicProactivePolicy`）と接続層（`ProactiveEngine`・CalendarSource・拒否cooldown永続化・Discord / 音声 / Desktop 各入口のPolicy参照wiring）も完了した。次アクションは Phase 6（3DデスクトップShell）へ進むが、本計画の境界はここまでとし、3D UI は `docs/companion_roadmap.md` の Phase 6 で別途進める。
 
 ### 完了: 実行ログ
 
@@ -312,7 +314,7 @@ Phase 1〜2とRegistry/Router、CLI・Web・Discord・Voice移行、実行ログ
 - 収集失敗は型名だけwarningし、本文をログせず会話を継続する
 - `TasksContextProvider`は`src.context`から公開し、root公開APIテスト済み
 
-### 一部完了: Phase 4 知覚イベントと状態の基盤
+### 完了: Phase 4 知覚イベントと状態の基盤
 
 - `PerceptionEvent` / `CompanionState`契約（`src/companion/contracts.py`）。raw payload・本文・metadataを持たず、状態遷移に必要な最小フィールドのみ
 - 決定的`StateAggregator`（`src/companion/state.py`）。min_confidence未満とout-of-orderは状態を変えず、`raw_data_retained=True`は`PrivacyViolationError`で拒否。時刻はイベント注入値のみで決定
@@ -331,7 +333,7 @@ Phase 1〜2とRegistry/Router、CLI・Web・Discord・Voice移行、実行ログ
     privacy-safe な `companion_state_payload` のみ公開。プロセス名・PID・アプリ分類・
     window title・エラー本文・生サンプルは出さない
 
-次の実装単位: Phase 5 の接続層（Policy と既存 `ProactiveEngine`・各入口の統合）。
+次の実装単位: Phase 6（3DデスクトップShell）。Cloud経由の実送信Provider swap と LangGraph Workflow は `docs/assistant_platform_plan.md` Phase K/L の通り別判断。
 
 ## 10. 現時点の非目標
 
