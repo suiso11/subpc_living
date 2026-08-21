@@ -2,21 +2,25 @@
 
 Claude/Anthropic系に依存せず、Piを親ランタイムにする。
 `pi-subagents`のnamed agentは探索・テスト・レビューの読み取り専用経路とし、実装は
-OpenCode workerのGLM 5.2を既定バックエンド、Kimi K3を読み取り専用の別視点レビューへ使う。
-実装は `opencode_change` を既定とし、各変更はKimi K3の読み取り専用自動レビューを経てから
-最終承認をGPT-5.6 Solが行う。
+OpenCode workerへ委譲する。worker/reviewerのモデルIDは親AGENTS.mdの通り
+pi-orchの設定（`PI_OPENCODE_MODEL`、プロファイル）に従い、この文書には固定値を書かない。
+実装は `opencode_task` / `opencode_spawn` を既定とし、各変更は独立read-onlyレビューを経てから
+親が最終承認を行う。
+
+> 2026-08-22更新: 旧 `opencode_change` ツールとモデル固定記述を、pi 0.84.2 の
+> 現行ツール名とモデル非依存の設定方針へ更新した。
 
 ## Components
 
-- Pi: `@earendil-works/pi-coding-agent` 0.79以上
+- Pi: `@earendil-works/pi-coding-agent` 0.84以上
 - Subagent runtime: `git:github.com/edxeth/pi-subagents`
-- Parent model: 既定 `openai-codex/gpt-5.6-sol`
+- Parent model: pi-orch設定に従う (`PI_CODEX_MODEL`)
 - Project agents: `.pi/agents/subpc-*.md`
 - Pi-only launcher: `scripts/pi_codex_orchestrator.sh`
 - Combined Pi/OpenCode launcher: `pi-orch`
-- OpenCode default: `opencode-go/glm-5.2` (実装の既定バックエンド)
-- OpenCode independent review: `opencode-go/kimi-k3` (読み取り専用)
-- Implementation default tool: `opencode_change` (GLM生成 → Kimi K3読み取り専用自動レビュー → Sol最終承認)
+- Worker default: `PI_OPENCODE_MODEL` (pi-orch設定)
+- Independent review: read_only worker (プロファイルはpi-orch設定)
+- Implementation default tools: `opencode_task` / `opencode_spawn` (変更可能パスを明示して委譲)
 
 プロジェクトローカルのパッケージ設定は `.pi/settings.json` に保存する。キャッシュ本体は
 `.pi/git/` のignore対象で、リポジトリには設定とキャッシュ用 `.gitignore` だけを残す。
@@ -105,13 +109,14 @@ scripts/pi_codex_orchestrator.sh
 
 ## OpenCode role split
 
-- default / `glm`: `opencode-go/glm-5.2`。実装の既定バックエンド。探索、機械作業、実装、テスト追加
-- `kimi_k3`: `opencode-go/kimi-k3`。読み取り専用の広域・独立レビュー
-- 実装は `opencode_change` を既定ツールとする。GLMが変更候補を生成し、完了後にKimi K3が
-  読み取り専用で自動レビューを実施する。PiはKimiの指摘を確認のうえ、最終承認をGPT-5.6 Solへ渡す
-- Kimiは変更を書けず、本番データ・秘密情報・サービス操作にも触らない
-- Kimi/GLMの結論は最終承認にせず、`subpc-reviewer`または親のGPT-5.6 Solが最終判断する
-- OpenCode出力は最終承認に使わず、`subpc-reviewer`または親のGPT-5.6 Solで確認する
+- write worker: 実装の既定バックエンド。探索、機械作業、実装、テスト追加。
+  モデルはpi-orch設定に従う
+- reviewer: 読み取り専用の広域・独立レビュー（`tool_profile: minimal`相当）
+- 実装は `opencode_task` / `opencode_spawn` を既定とする。workerが変更を生成し、完了後に
+  独立read-onlyレビューを実施する。親は指摘を確認のうえ最終承認を行う
+- reviewerは変更を書けず、本番データ・秘密情報・サービス操作にも触らない
+- worker/reviewerの結論は最終承認にせず、`subpc-reviewer`または親が最終判断する
+- OpenCode出力はそのまま承認に使わず、独立レビューまたは親で確認する
 
 統合構成はリポジトリルートで `pi-orch` を実行する。
 
@@ -136,7 +141,7 @@ scripts/pi_codex_orchestrator.sh
   読み取り・検証・診断だけに使い、実装はnamed agentでは行わない
 - 並列writeタスクは変更可能パスが重ならないよう分割し、重なる場合は直列化する
 - 指示範囲外のファイルは変更せず、必要になったら停止して追加スコープを報告させる
-- 実装の既定はOpenCode GLM経由の `opencode_change` とし、各変更はKimi K3読み取り専用自動レビューを経てからSol最終承認へ進む
+- 実装の既定はOpenCode workerへの `opencode_task` / `opencode_spawn` 委譲とし、各変更は独立read-onlyレビューを経てから親の最終承認へ進む
 
 例:
 
