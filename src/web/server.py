@@ -31,6 +31,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.assistant.contracts import AssistantRequest
 from src.assistant.factory import build_local_service
+from src.assistant.nodes import build_node_service, NodeInventory
 from src.assistant.service import AssistantService
 from src.assistant.stream_queue import stream_to_queue
 from src.chat.session import ChatSession
@@ -241,9 +242,36 @@ async def lifespan(app: FastAPI):
 
     # LLM 初期化
     logger.info("[1/6] Ollama 接続確認...")
-    assistant_service, provider_registry = build_local_service(config)
-    llm = provider_registry.get("ollama").provider
-    if not llm.is_available():
+    # Opt-in multi-node inventory wiring
+    _subpc_inventory_path = os.environ.get("SUBPC_NODE_INVENTORY", "").strip()
+    if _subpc_inventory_path:
+        try:
+            _inventory = NodeInventory.load(_subpc_inventory_path)
+            assistant_service, provider_registry = build_node_service(_inventory)
+            logger.info("✅ Multi-node inventory loaded from %s", _subpc_inventory_path)
+        except Exception as e:
+            logger.warning(
+                "SUBPC_NODE_INVENTORY load failed, falling back to single-provider: %s", e
+            )
+            assistant_service, provider_registry = build_local_service(config)
+    else:
+        assistant_service, provider_registry = build_local_service(config)
+    def _primary_llm(reg):
+        """既定のLLMプロバイダを安全に解決する。
+
+        'ollama' が無いInventory構成 (local-strong等) では、登録済みの
+        最初のローカルProviderへフォールバックする。
+        """
+        if "ollama" in reg:
+            return reg.get("ollama").provider
+        for entry in reg.entries():
+            return entry.provider
+        return None
+
+    llm = _primary_llm(provider_registry)
+    if llm is None:
+        logger.warning("Providerが1つも登録されていません。")
+    elif not llm.is_available():
         logger.warning("Ollamaに接続できません。チャット機能は使用不可です。")
     else:
         logger.info("✅ Ollama OK (model: %s)", config.model)
@@ -558,7 +586,10 @@ async def health():
     # モジュール稼働状況を追加
     result["modules"] = {
         "ollama": (
-            provider_registry.get("ollama").provider.is_available()
+            bool(
+                "ollama" in provider_registry
+                and provider_registry.get("ollama").provider.is_available()
+            )
             if provider_registry is not None
             else False
         ),
@@ -572,6 +603,30 @@ async def health():
         "idle_manager": idle_manager is not None and idle_manager.is_running,
         "companion": activity_runtime is not None and activity_runtime.is_running,
     }
+
+    # プロバイダレベルの詳細情報 (secrets/prompt は含まない)
+    try:
+        providers_list = []
+        stats: dict = {}
+        if assistant_service is not None:
+            stats = assistant_service.provider_stats()
+        if provider_registry is not None:
+            for entry in provider_registry.entries():
+                pid = entry.provider_id
+                try:
+                    available = bool(entry.provider.is_available())
+                except Exception:
+                    available = False
+                providers_list.append({
+                    "provider_id": pid,
+                    "model": getattr(entry.provider, "model", ""),
+                    "local": entry.local,
+                    "available": available,
+                    "last_success_at": stats.get(pid, {}).get("last_success_at"),
+                })
+        result["providers"] = providers_list
+    except Exception:
+        result["providers"] = []
 
     status_code = 200 if result["status"] == "ok" else 503
     return JSONResponse(content=result, status_code=status_code)

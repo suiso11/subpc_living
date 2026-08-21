@@ -92,6 +92,8 @@ class AssistantService:
         self._run_logger = run_logger
         self._request_id_factory = request_id_factory
         self._cloud_bridge: CloudRouteBridge | None = None
+        self._last_success_by_provider: dict[str, float] = {}
+        self._provider_stats_lock = threading.Lock()
 
     def _request_id(self, request: AssistantRequest) -> str:
         return request.request_id or self._request_id_factory()
@@ -99,6 +101,20 @@ class AssistantService:
     def set_cloud_bridge(self, bridge: "CloudRouteBridge") -> None:
         """クラウドブリッジを設定する。"""
         self._cloud_bridge = bridge
+
+    def _on_stream_success(self, provider_id: str, ts: float) -> None:
+        """Stream成功時にproviderの最終成功時刻を更新する。"""
+        with self._provider_stats_lock:
+            self._last_success_by_provider[provider_id] = ts
+
+    def provider_stats(self) -> dict[str, dict]:
+        """各Providerの統計スナップショットを返す (スレッドセーフ)。"""
+        with self._provider_stats_lock:
+            snapshot = dict(self._last_success_by_provider)
+        return {
+            pid: {"last_success_at": ts}
+            for pid, ts in snapshot.items()
+        }
 
     def respond(
         self,
@@ -241,9 +257,12 @@ class AssistantService:
                 last_error = exc
                 continue
 
-            latency_ms = int(max(0.0, self._clock() - started_at) * 1000)
+            now = self._clock()
+            latency_ms = int(max(0.0, now - started_at) * 1000)
             route = _actual_route(decision, entry, candidates, attempts)
             self._record_run(request_id, request, route, latency_ms, True, None)
+            with self._provider_stats_lock:
+                self._last_success_by_provider[provider_id] = now
             return AssistantResponse(
                 text=text,
                 route=route,
@@ -285,6 +304,7 @@ class AssistantService:
             request_id=request_id,
             channel=request.channel,
             profile=request.profile,
+            on_success=self._on_stream_success,
         )
 
 
@@ -303,6 +323,7 @@ class StreamResult(Iterable[str]):
         request_id: str = "",
         channel: str = "",
         profile: str = "",
+        on_success: Callable[[str], None] | None = None,
     ) -> None:
         self._registry = registry
         self._decision = decision
@@ -313,6 +334,7 @@ class StreamResult(Iterable[str]):
         self._request_id = request_id
         self._channel = channel
         self._profile = profile
+        self._on_success = on_success
         self._started = False
         self._closed = False
         self._state_lock = threading.Lock()
@@ -419,7 +441,11 @@ class StreamResult(Iterable[str]):
                 if callable(close):
                     close()
 
-            latency = latency_ms()
+            # 終端時刻は一度だけ取得し、latency と last-success 記録で共用する
+            # (clock の二重呼び出しはテストの有限 tick を枯渇させる)。
+            ended_at = self._clock()
+            started = self._started_at if self._started_at is not None else ended_at
+            latency = int(max(0.0, ended_at - started) * 1000)
             with self._state_lock:
                 if self._closed:
                     return
@@ -432,6 +458,8 @@ class StreamResult(Iterable[str]):
                     stats=dict(entry.provider.last_stats),
                 )
             self._record_run(self._response.route, latency, True, None)
+            if self._on_success is not None:
+                self._on_success(provider_id, ended_at)
             return
 
         error = _generation_error(attempts, last_error)

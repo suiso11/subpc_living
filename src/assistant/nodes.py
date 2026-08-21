@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
+import sys
 from types import MappingProxyType
 from typing import Any
 
@@ -293,3 +294,34 @@ def build_node_service(
         ),
         registry,
     )
+
+
+def _main(argv: list[str]) -> int:
+    """設定検証コマンド: python -m src.assistant.nodes validate <inventory.json>"""
+    path_args = argv
+    # Support both `validate <path>` and bare `<path>`
+    if path_args and path_args[0] == "validate":
+        path_args = path_args[1:]
+    if not path_args:
+        print("usage: python -m src.assistant.nodes validate <inventory.json>", file=sys.stderr)
+        return 1
+    path = path_args[0]
+    try:
+        inventory = NodeInventory.load(path)
+    except InvalidNodeInventoryError as exc:
+        print(f"InvalidNodeInventoryError: {exc}", file=sys.stderr)
+        return 1
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"Error loading inventory: {exc}", file=sys.stderr)
+        return 1
+    for node in inventory.nodes:
+        provider_ids = [p.provider_id for p in node.providers]
+        print(
+            f"node {node.node_id} role={node.role} providers={provider_ids}"
+        )
+    print("OK")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main(sys.argv[1:]))
