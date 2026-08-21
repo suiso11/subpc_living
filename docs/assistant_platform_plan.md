@@ -31,7 +31,7 @@
 - [x] Vision / Screen移行（完了・secret / local_only）
 - [x] Calendar移行（完了）
 - [x] Tasks移行（完了・最終権威ブロックとして末尾）
-- [ ] Cloud経路（Phase K、未着手・明示判断待ち）
+- [x] Cloud経路（Phase K、`CloudConfig`無効既定＋`ApprovalGate`承認＋`CloudPayloadBuilder`匿名化＋`CloudRouteBridge`ローカルFallbackを完了。実送信Providerは将来のswap先；既定はローカルのみ）
 - [x] Companion Phase 4基盤（`PerceptionEvent` / `CompanionState` / `StateAggregator` / `ActivityEventCollector`）とプラットフォーム別ActivitySource adapter、Web runtime wiring・`/api/companion/state`（オプトイン）。UI消費と非Web wiring（Discord / Voice / Desktop）は未完。詳細は`docs/companion_roadmap.md`）
 
 ## 1. ゴール
@@ -72,7 +72,7 @@ flowchart TD
 - `src/audio/main.py`: `AssistantService.generate_stream()`を使用
 - `src/audio/pipeline.py`: `AssistantService.generate_stream()`とTTSを直接接続
 - `src/diary/**`, `src/persona/**`: 内部バッチ処理として`LLMProvider`を直接利用（`AssistantService`は通さない）
-- `src/chat/session.py`: 履歴は`HistoryContextProvider`、Preloadは`PreloadContextProvider` / `ContextBuilder`経由で`ContextBlock`化して構築済み。PreloadはSessionPreloaderがprofile・schedule・summary・時刻を一つのstrへまとめた結果を包む移行であり、独立Profile Providerではない。RAGは`RAGContextProvider` / `ContextBuilder`経由で`ContextBlock`化して構築済み（prompt injectionのみ）。Web searchは`WebSearchContextProvider` / `ContextBuilder`経由で`ContextBlock`化して構築済み（Context Provider化のみ・検索ロジックは未変更）。Vision / Screen（secret / local_only）、Monitor / Calendar（personal / local_only）も各Context Provider経由で`ContextBlock`化して構築済み。Tasksは最終権威ブロックとしてsystem本文の末尾に置き、Historyのrole messagesは最後に`ContextBuilder`経由で描画する。Phase Jは完了し、Cloud経路（Phase K）のみ未着手のまま
+- `src/chat/session.py`: 履歴は`HistoryContextProvider`、Preloadは`PreloadContextProvider` / `ContextBuilder`経由で`ContextBlock`化して構築済み。PreloadはSessionPreloaderがprofile・schedule・summary・時刻を一つのstrへまとめた結果を包む移行であり、独立Profile Providerではない。RAGは`RAGContextProvider` / `ContextBuilder`経由で`ContextBlock`化して構築済み（prompt injectionのみ）。Web searchは`WebSearchContextProvider` / `ContextBuilder`経由で`ContextBlock`化して構築済み（Context Provider化のみ・検索ロジックは未変更）。Vision / Screen（secret / local_only）、Monitor / Calendar（personal / local_only）も各Context Provider経由で`ContextBlock`化して構築済み。Tasksは最終権威ブロックとしてsystem本文の末尾に置き、Historyのrole messagesは最後に`ContextBuilder`経由で描画する。Phase Jは完了し、Cloud経路（Phase K）も完了（無効が既定）
 
 ### 守る制約
 
@@ -441,7 +441,7 @@ Routerを高度化する前にSQLiteへ事実を記録する。実装とruntime 
 - Vision / Screen移行は完了: `VisionContextProvider`（source=vision / sensitivity=secret / local_only=True）と`ScreenContextProvider`（source=screen / sensitivity=secret / local_only=True）を実装し、`ChatSession.build_messages()`へ組み込み済み。どちらもsecret / local_onlyのため非Local経路へ渡らない。各収集失敗は型名だけwarningして本文をログせず、会話を継続する。各Providerは`src.context`から公開し、root公開APIテスト済み
 - Calendar移行は完了: `CalendarContextProvider`（source=calendar / sensitivity=personal / local_only=True）を実装し、`ChatSession.build_messages()`へ組み込み済み。`CalendarContext`の結果（ファイル読取のみ）を包むだけで、本体は変更しない。収集失敗は型名だけwarningして本文をログせず、会話を継続する。`CalendarContextProvider`と`CalendarSource`は`src.context`から公開し、root公開APIテスト済み
 - Tasks移行は完了: `TasksContextProvider`（source=TASKS_SOURCE / sensitivity=personal / local_only=True）を実装し、最終権威ブロックとして`ChatSession.build_messages()`のsystem本文末尾へ組み込み済み。0件でも必ず注入する。Historyのrole messagesはその後ろに`ContextBuilder`経由で描画する。収集失敗は型名だけwarningして本文をログせず、会話を継続する。`TasksContextProvider`は`src.context`から公開し、root公開APIテスト済み
-- Phase J全体は完了。Cloud経路（Phase K）は未着手のまま無効で、明示判断待ち
+- Phase J全体は完了。Cloud経路（Phase K）も完了（無効が既定；実送信Providerは将来のswap先）
 - Companion Phase 4基盤（`PerceptionEvent` / `CompanionState` / `StateAggregator` / `ActivityEventCollector`）とプラットフォーム別ActivitySource adapter（Windows / Linux(X11)、`xprintidle` / `xdotool` 必須）は完了。Web runtime wiringと読み取り専用API（`/api/companion/state`、`COMPANION_ACTIVITY_ENABLED=true` のオプトイン、起動失敗時はcompanion機能のみ無効化してWeb起動は続行）も完了。UI消費と非Web入口（Discord / Voice / Desktop）へのruntime wiringは未完で、次アクション（詳細は`docs/companion_roadmap.md`）
 
 移行順:
@@ -483,9 +483,9 @@ src/context/
 - 収集失敗した任意Contextで会話全体を止めない
 - Policyの単体テストで実際の送信Payloadを検査できる
 
-### Phase K: Cloudと承認（未着手・明示判断待ち）
+### Phase K: Cloudと承認（完了・無効が既定）
 
-Phase Jは完了したが、Cloud経路は自動着手せず無効のまま。開始するかどうかはユーザー・オーケストレーターの明示判断待ち。
+Phase Jは完了した。Cloud経路はユーザー（オーケストレーター）の明示判断により着手し、「無効が既定」のまま実装を完了した。実際のHTTPクラウドProviderは実装せず、テスト双重 `FakeCloudProvider` と `CloudConfig` ゲートで承認・匿名化・Fallbackの契約だけを確立する。実送信Providerは `CloudConfig(enabled=True, ...)` を factory へ渡したときに `FakeCloudProvider` を `local=False` で登録する箇所へ swap する。
 
 必要条件:
 
@@ -495,6 +495,14 @@ Phase Jは完了したが、Cloud経路は自動着手せず無効のまま。�
 - ローカル匿名化
 - 失敗時はローカルへFallback
 - Personal / Secret Contextを送れないことのテスト
+
+上記必要条件はすべて達成済み。実装:
+- `src/llm/cloud_config.py`（`CloudConfig`/`CloudConfigError`）：既定 `enabled=False`、キーは有効時かつ `api_key_env` 指定時のみ環境変数から解決（コードに埋め込まない）。
+- `src/llm/providers/cloud.py`（`FakeCloudProvider`）：ネットワーク・実キーなしの非Local Provider テスト双重。実送信は将来の swap 先。
+- `src/llm/approval.py`（`ApprovalGate`/`CloudPreview`/`CloudPayloadBuilder`）：1リクエスト単位の `approve`/`require`（事前表示 `preview` 付き）と、`ContextPolicy.select(target_local=False)` による public のみ選択＝ローカル匿名化。
+- `src/assistant/cloud_service.py`（`CloudRouteBridge`）：`privacy=cloud_allowed` かつ `allow_cloud` のみ許可、承認必須、匿名化Payload送信、クラウド失敗時はローカル `AssistantService` へ Fallback。構築済みmessagesをそのままクラウドへ渡す経路は存在しない（既存保証維持）。
+- `src/assistant/factory.py`（`build_assistant_service`）：`cloud_config` が渡されかつ 有効時のみクラウドProviderを登録。`build_local_service` は従来通りローカルのみ。
+- テスト: `tests/llm/test_cloud_provider.py`, `tests/llm/test_approval.py`, `tests/assistant/test_cloud_service.py`, `tests/assistant/test_factory_cloud.py`（personal/secret がクラウドPayloadへ到達しないことを検証）。
 
 ### Phase L: LangGraph
 
