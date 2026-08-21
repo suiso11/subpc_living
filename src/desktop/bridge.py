@@ -22,6 +22,7 @@ from src.perception import create_activity_runtime_from_env
 from .api import DesktopApi
 from .audio import NativeAudioRecorder
 from .config import DesktopSettings
+from .avatar import resolve_avatar_model
 from .shell import decide_shell_state, overlay_visibility, sensor_provenance
 from .windows import is_autostart_enabled, set_autostart
 
@@ -122,6 +123,7 @@ class DesktopBridge(QObject):
 
         self._activity_runtime = create_activity_runtime_from_env(os.environ, logger=logger)
         self._overlay_enabled = os.environ.get("DESKTOP_OVERLAY_ENABLED", "").strip().lower() == "true"
+        self._avatar_model_cache: dict[str, Any] | None = None
 
         self.reminder_timer = QTimer(self)
         self.reminder_timer.setInterval(60_000)
@@ -244,6 +246,30 @@ class DesktopBridge(QObject):
     @Property("QVariantMap", notify=overlayShellChanged)
     def overlayShell(self) -> dict[str, Any]:
         return self._compute_overlay_shell()
+
+    @Property("QVariantMap", notify=overlayShellChanged)
+    def avatarModel(self) -> dict[str, Any]:
+        """Return resolved avatar model info: {"path": str, "exists": bool}."""
+        if self._avatar_model_cache is None:
+            self._resolve_avatar_model()
+        return self._avatar_model_cache  # type: ignore[return-value]
+
+    @Slot()
+    def refreshAvatarModel(self) -> None:
+        """Recompute the avatar model cache."""
+        self._resolve_avatar_model()
+        self.overlayShellChanged.emit()
+
+    def _resolve_avatar_model(self) -> None:
+        try:
+            project_root = Path(__file__).resolve().parents[2]
+            resolved = resolve_avatar_model(project_root)
+            if resolved is not None:
+                self._avatar_model_cache = {"path": str(resolved), "exists": resolved.is_file()}
+            else:
+                self._avatar_model_cache = {"path": "", "exists": False}
+        except Exception:
+            self._avatar_model_cache = {"path": "", "exists": False}
 
     def _compute_overlay_shell(self) -> dict[str, Any]:
         try:

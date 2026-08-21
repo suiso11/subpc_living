@@ -21,6 +21,8 @@ Window {
     property var shell: overlayBridge.overlayShell || {}
     property string shellState: shell.shell_state || "idle"
     property bool shrink: shell.shrink || false
+    property bool modelLoadFailed: false
+    property bool hasAvatar3D: overlayBridge.avatarModel.exists && !modelLoadFailed
 
     function stateColor() {
         switch (overlayRoot.shellState) {
@@ -54,6 +56,33 @@ Window {
         return h + ":" + m
     }
 
+    Loader {
+        id: avatar3DLoader
+        anchors.centerIn: parent
+        width: 56
+        height: 56
+        active: overlayRoot.hasAvatar3D
+        source: overlayRoot.hasAvatar3D ? "OverlayAvatar3D.qml" : ""
+        onStatusChanged: {
+            if (status === Loader.Error) {
+                overlayRoot.modelLoadFailed = true
+            }
+        }
+        onLoaded: {
+            // encodeURI: 非ASCII(ドキュメント等)・空白をパーセントエンコードしつつ :// は保持
+            item.modelUrl = encodeURI("file:///" + overlayBridge.avatarModel.path.replace(/\\/g, "/"))
+            item.shrink = overlayRoot.shrink
+            item.dimmed = overlayRoot.shellState === "away" || overlayRoot.shrink
+            item.spinning = overlayRoot.shellState === "idle" || overlayRoot.shellState === "working"
+            item.loadFailed.connect(function() { overlayRoot.modelLoadFailed = true })
+        }
+
+        MouseArea {
+            anchors.fill: parent
+            onClicked: overlayRoot.expanded = !overlayRoot.expanded
+        }
+    }
+
     Rectangle {
         objectName: "overlayAvatar"
         anchors.centerIn: parent
@@ -64,6 +93,7 @@ Window {
         border.color: overlayRoot.stateColor()
         border.width: 2
         opacity: overlayRoot.shellState === "away" ? 0.5 : 1.0
+        visible: !overlayRoot.hasAvatar3D
 
         Rectangle {
             anchors.centerIn: parent

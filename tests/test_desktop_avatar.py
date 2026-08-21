@@ -24,6 +24,28 @@ class DiscoverVrmModelsTest(unittest.TestCase):
             found = discover_vrm_models(d)
             self.assertEqual([p.name for p in found], ["a.vrm", "b.vrm"])
 
+    def test_sorted_includes_glb(self) -> None:
+        from src.desktop.avatar import discover_vrm_models
+
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / "c.vrm").write_bytes(b"glTF")
+            (d / "a.glb").write_bytes(b"glTF")
+            (d / "b.vrm").write_bytes(b"glTF")
+            (d / "d.txt").write_text("x")
+            found = discover_vrm_models(d)
+            self.assertEqual([p.name for p in found], ["a.glb", "b.vrm", "c.vrm"])
+
+    def test_glb_only(self) -> None:
+        from src.desktop.avatar import discover_vrm_models
+
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / "z.glb").write_bytes(b"glTF")
+            (d / "a.glb").write_bytes(b"glTF")
+            found = discover_vrm_models(d)
+            self.assertEqual([p.name for p in found], ["a.glb", "z.glb"])
+
 
 class IsProbableVrmTest(unittest.TestCase):
     def test_gltf_magic_accepted(self) -> None:
@@ -105,6 +127,21 @@ class ResolveAvatarModelTest(unittest.TestCase):
 
         self._write("b.vrm")
         expected = self._write("a.vrm")
+        resolved = resolve_avatar_model(self.root, env={})
+        self.assertEqual(resolved, expected)
+
+    def test_glb_discovered_alongside_vrm(self) -> None:
+        from src.desktop.avatar import resolve_avatar_model
+
+        self._write("b.vrm")
+        expected = self._write("a.glb")
+        resolved = resolve_avatar_model(self.root, env={})
+        self.assertEqual(resolved, expected)
+
+    def test_glb_only_still_resolves(self) -> None:
+        from src.desktop.avatar import resolve_avatar_model
+
+        expected = self._write("z.glb")
         resolved = resolve_avatar_model(self.root, env={})
         self.assertEqual(resolved, expected)
 
