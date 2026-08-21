@@ -232,9 +232,15 @@ Contextをすべて構築してから送信先を決めてはいけない。先�
 - `DESKTOP_OVERLAY_ENABLED=true` オプトイン + `--no-overlay` 上書き。起動失敗時はメインアプリ継続
 - privacy-safe: 表示に使うのは `companion_state_payload` 同等のフィールドのみ
 
-#### 未着手: Phase 6b VRMレンダラ以降
+#### 一部完了: Phase 6b 受け入れ基盤
 
-- Qt Quick 3D による VRM 1.0 描画（ユーザー所有VRMの読み込みを優先し、第三者モデルは同梱しない）
+- VRMモデル配置ディレクトリ `models/vrm/` を整備（gitignore済みで同梱構造的に不可能、README付き）
+- 発見・解決ロジック `src/desktop/avatar.py`（Qt非依存・12テスト）: 明示パス > `DESKTOP_VRM_MODEL` 環境変数 > `models/vrm/` 名前順走査。`is_probable_vrm()` の glTF マジック検査付き
+- ユーザー所有VRM読み込み優先・第三者モデル非同梱の方針のコードレベル実装済み
+
+#### 未着手: Phase 6b VRMレンダラ本体
+
+- Qt Quick 3D による VRM 1.0 描画（受け入れ先と解決ロジックは上記完了済み）
 - 待機、視線、表情、リップシンク
 - クイック会話HUDのチャット実装（6aでは状態HUDまで。送信経路は既存 bridge チャット経路を再利用予定）
 - フルスクリーン/画面共有検知による自動縮小

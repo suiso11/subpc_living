@@ -43,3 +43,8 @@ Thumbs.db
 
 # アプリログ (RotatingFileHandler 出力)
 logs/
+
+# VRM avatar models are user-owned; never commit them.
+!models/vrm/
+models/vrm/*
+!models/vrm/README.md
