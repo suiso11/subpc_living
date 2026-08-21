@@ -31,6 +31,95 @@ def _blocks():
     ]
 
 
+class AssistantServiceRespondStreamTest(unittest.TestCase):
+    """respond_stream は StreamResult を返し、反復後に .response で route/stats を取れる。"""
+
+    def test_respond_stream_returns_stream_result_with_local_provider(self):
+        from src.assistant.service import StreamResult
+
+        reg = ProviderRegistry()
+        provider = FakeProvider(response="stream reply")
+        reg.register("ollama", provider, local=True)
+        router = StaticRouter(reg, default_provider_id="ollama")
+        service = AssistantService(reg, router)
+
+        from src.context.providers.history import HistoryContextProvider
+        history_block = HistoryContextProvider.collect([
+            {"role": "user", "content": "hello"},
+        ])
+        blocks = [b for b in [_block_for_stream()] + ([history_block] if history_block else []) if b]
+
+        stream = service.respond_stream(
+            _request(privacy="local_only", allow_cloud=False),
+            blocks,
+            base_system="SYS",
+        )
+        self.assertIsInstance(stream, StreamResult)
+        tokens = list(stream)
+        self.assertEqual("".join(tokens), "stream reply")
+        # 反復後に .response で route/stats にアクセスできる
+        self.assertTrue(stream.response.route.local)
+        self.assertEqual(stream.response.text, "stream reply")
+
+    def test_respond_stream_base_system_preserved(self):
+        """respond_stream も base_system を system message へ反映する。"""
+        reg = ProviderRegistry()
+        provider = FakeProvider(response="ok")
+        reg.register("ollama", provider, local=True)
+        router = StaticRouter(reg, default_provider_id="ollama")
+        service = AssistantService(reg, router)
+
+        from src.context.providers.history import HistoryContextProvider
+        history_block = HistoryContextProvider.collect([
+            {"role": "user", "content": "hello"},
+        ])
+        blocks = [b for b in [_block_for_stream()] + ([history_block] if history_block else []) if b]
+
+        stream = service.respond_stream(
+            _request(privacy="local_only", allow_cloud=False),
+            blocks,
+            base_system="You are a helpful assistant.",
+        )
+        list(stream)
+        messages = provider.calls[0]["messages"]
+        system_msgs = [m for m in messages if m.get("role") == "system"]
+        self.assertTrue(len(system_msgs) > 0)
+        self.assertIn("You are a helpful assistant.", system_msgs[0]["content"])
+
+    def test_respond_stream_ignores_cloud_bridge(self):
+        """respond_stream は cloud_bridge があってもローカルストリームへ（cloud は非ストリーム）。"""
+        from src.assistant.cloud_service import CloudRouteBridge
+        from src.assistant.service import StreamResult
+
+        reg = ProviderRegistry()
+        provider = FakeProvider(response="local stream")
+        reg.register("ollama", provider, local=True)
+        cloud = FakeCloudProvider()
+        reg.register("cloud", cloud, local=False)
+        router = StaticRouter(reg, default_provider_id="ollama")
+        service = AssistantService(reg, router)
+
+        gate = ApprovalGate()
+        gate.approve("r1")
+        bridge = CloudRouteBridge(reg, "cloud", approval=gate, local_service=service)
+        service.set_cloud_bridge(bridge)
+
+        stream = service.respond_stream(_request(), [_block_for_stream()])
+        self.assertIsInstance(stream, StreamResult)
+        tokens = list(stream)
+        self.assertEqual("".join(tokens), "local stream")
+        # cloud provider は使われない（ストリームはローカルへ fallback）
+        self.assertEqual(len(cloud.sent_payloads), 0)
+        self.assertTrue(stream.response.route.local)
+
+
+def _block_for_stream() -> ContextBlock:
+    return ContextBlock(
+        source="public_note", content="public info",
+        sensitivity="public", local_only=False,
+    )
+
+
 class AssistantServiceRespondTest(unittest.TestCase):
     def test_respond_with_cloud_bridge(self):
         """respond with cloud_bridge + cloud_allowed + allow_cloud delegates to bridge."""

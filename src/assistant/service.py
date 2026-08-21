@@ -133,6 +133,31 @@ class AssistantService:
         response = self.generate(request, messages)
         return response, None
 
+    def respond_stream(
+        self,
+        request: AssistantRequest,
+        blocks: Sequence[ContextBlock],
+        *,
+        base_system: str = "",
+        options: GenerationOptions | None = None,
+    ) -> "StreamResult":
+        """blocks からメッセージを構築してストリーム生成する。
+
+        クラウド経路（bridge.send）は非ストリームのため、このメソッドは
+        ローカル経路のみを扱う。cloud_allowed + allow_cloud の場合でも
+        ローカルストリームへ fallback する（cloud ストリームは将来の拡張）。
+        ``StreamResult`` を返す（反復後に ``.response`` で route/stats を取得）。
+        """
+        from src.context.builder import ContextBuilder
+
+        builder = ContextBuilder(base_system)
+        messages = builder.build_messages(
+            blocks,
+            privacy=request.privacy,
+            target_local=True,
+        )
+        return self.generate_stream(request, messages)
+
     def _record_route(
         self, request_id: str, request: AssistantRequest, decision: RouteDecision
     ) -> None:
