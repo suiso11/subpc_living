@@ -23,7 +23,7 @@ from typing import Optional, Callable
 from src.persona.profile import UserProfile
 from src.companion.calendar import CalendarSource
 from src.companion.contracts import CompanionState
-from src.companion.policy import DeterministicProactivePolicy
+from src.companion.policy import DeterministicProactivePolicy, PolicyContext
 
 
 CONVERSATION_PROMPTS = (
@@ -113,6 +113,7 @@ class ProactiveEngine:
             "greeting": 43200,          # 12時間
             "pc_alert": 600,            # 10分
             "conversation_start": max(60.0, conversation_interval),
+            "away_return": 300.0,       # 5分
         }
         self._load_state()
 
@@ -195,6 +196,36 @@ class ProactiveEngine:
             return "away"
         return None
 
+    def _resolve_next_event_unix(self, now_unix: float) -> float | None:
+        """次の予定の開始時刻 (unix) を返す。見つからない場合は None。"""
+        if self.calendar_source is not None:
+            try:
+                next_event = self.calendar_source.next_event(now=now_unix)
+                return next_event.start_at
+            except Exception:
+                return None
+        # profile.get_today_schedule() ベースのフォールバック
+        try:
+            today_schedule = self.profile.get_today_schedule()
+        except Exception:
+            return None
+        now_dt = datetime.fromtimestamp(now_unix)
+        best: float | None = None
+        for item in today_schedule:
+            time_str = item.get("time", "")
+            if not time_str:
+                continue
+            try:
+                hour, minute = map(int, time_str.split(":"))
+                event_dt = now_dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                event_unix = event_dt.timestamp()
+                if event_unix >= now_unix:
+                    if best is None or event_unix < best:
+                        best = event_unix
+            except (ValueError, TypeError):
+                continue
+        return best
+
     def _load_state(self) -> None:
         """state_path が指定されていれば cooldown 状態 (_last_fired) を読み込む。
 
@@ -257,6 +288,7 @@ class ProactiveEngine:
             try:
                 self._check_schedule_remind()
                 self._check_break_suggest()
+                self._check_away_return()
                 self._check_greeting()
                 self._check_pc_alert()
                 self._check_conversation_start()
@@ -269,6 +301,70 @@ class ProactiveEngine:
 
     def _check_schedule_remind(self) -> None:
         """スケジュールリマインド: 予定の15分前に通知"""
+        # --- Policy 経路 ---
+        if self.companion_getter is not None:
+            try:
+                state = self.companion_getter()
+            except Exception:
+                state = None
+            if state is not None:
+                now_unix = time.time()
+                next_event_at = self._resolve_next_event_unix(now_unix)
+                ctx = PolicyContext(
+                    state=state,
+                    now=now_unix,
+                    next_event_at=next_event_at,
+                    last_fired=dict(self._last_fired),
+                )
+                decision = self.companion_policy.decide(ctx)
+                if not decision.should_act or decision.action_kind != "schedule_remind":
+                    return
+                # Policy が schedule_remind を指示 → メッセージ生成
+                if not self._can_fire("schedule_remind"):
+                    return
+                if self.calendar_source is not None:
+                    self._check_schedule_remind_calendar()
+                    return
+                # profile ベースのメッセージ生成
+                # Policy が should_act=True としたので、次の予定を特定して
+                # 適応的なメッセージを生成する。5-15分のフィルタは不要。
+                now = datetime.now()
+                today_schedule = self.profile.get_today_schedule()
+                # 最小の正deltaを持つイベント (次に来る予定) を探す
+                best_item = None
+                best_title = ""
+                best_diff: float | None = None
+                for item in today_schedule:
+                    time_str = item.get("time", "")
+                    title = item.get("title", "")
+                    if not time_str or not title:
+                        continue
+                    if self.skip_gcal_schedule and str(item.get("note", "")).startswith("gcal:"):
+                        continue
+                    try:
+                        hour, minute = map(int, time_str.split(":"))
+                        event_time = now.replace(hour=hour, minute=minute, second=0)
+                        diff_minutes = (event_time - now).total_seconds() / 60
+                        if diff_minutes > 0 and (best_diff is None or diff_minutes < best_diff):
+                            best_diff = diff_minutes
+                            best_title = title
+                            best_item = item
+                    except (ValueError, TypeError):
+                        pass
+                # diff_minutes が None（予定が見つからない）場合は発火しない
+                if best_diff is None or best_item is None:
+                    return
+                # 適応的なメッセージテキスト
+                if best_diff <= 1:
+                    msg = f"もうすぐ「{best_title}」の時間です。"
+                elif best_diff <= 5:
+                    msg = f"あと{int(best_diff)}分で「{best_title}」の時間です。"
+                else:
+                    msg = f"あと{int(best_diff)}分で「{best_title}」の時間です。準備は大丈夫ですか？"
+                self._fire("schedule_remind", msg)
+                return
+
+        # --- 従来経路 ---
         if self._companion_gate() == "away":
             return
         if not self._can_fire("schedule_remind"):
@@ -322,6 +418,34 @@ class ProactiveEngine:
 
     def _check_break_suggest(self) -> None:
         """長時間作業の休憩提案: 2時間連続で通知"""
+        # --- Policy 経路 ---
+        if self.companion_getter is not None:
+            try:
+                state = self.companion_getter()
+            except Exception:
+                state = None
+            if state is not None:
+                now_unix = time.time()
+                ctx = PolicyContext(
+                    state=state,
+                    now=now_unix,
+                    last_fired=dict(self._last_fired),
+                )
+                decision = self.companion_policy.decide(ctx)
+                if not decision.should_act or decision.action_kind != "break_suggest":
+                    return
+                # Policy が break_suggest を指示 → メッセージ生成
+                if not self._can_fire("break_suggest"):
+                    return
+                if self._session_start_time is None:
+                    return
+                elapsed_hours = (time.time() - self._session_start_time) / 3600
+                hours = int(elapsed_hours) if elapsed_hours >= 2.0 else 2
+                msg = f"{hours}時間くらい連続で作業していますね。少し休憩しませんか？目や体を休めることも大切ですよ。"
+                self._fire("break_suggest", msg)
+                return
+
+        # --- 従来経路 ---
         if self._companion_gate() is not None:
             return
         if not self._can_fire("break_suggest"):
@@ -338,6 +462,32 @@ class ProactiveEngine:
             hours = int(elapsed_hours)
             msg = f"{hours}時間くらい連続で作業していますね。少し休憩しませんか？目や体を休めることも大切ですよ。"
             self._fire("break_suggest", msg)
+
+    def _check_away_return(self) -> None:
+        """離席からの復帰声かけ"""
+        if self.companion_getter is None:
+            return
+        try:
+            state = self.companion_getter()
+        except Exception:
+            return
+        if state is None:
+            return
+        if not self._can_fire("away_return"):
+            return
+        now_unix = time.time()
+        ctx = PolicyContext(
+            state=state,
+            now=now_unix,
+            last_fired=dict(self._last_fired),
+        )
+        decision = self.companion_policy.decide(ctx)
+        if not decision.should_act or decision.action_kind != "away_return":
+            return
+        name = self.profile.name
+        name_part = f"、{name}さん" if name else ""
+        msg = f"おかえりなさい{name_part}。離席していたようですね。"
+        self._fire("away_return", msg)
 
     def _check_greeting(self) -> None:
         """時間帯の挨拶"""
