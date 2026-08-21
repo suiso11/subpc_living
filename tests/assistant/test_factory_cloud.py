@@ -1,3 +1,4 @@
+import os
 import unittest
 from dataclasses import replace
 
@@ -6,6 +7,8 @@ from src.assistant.contracts import AssistantRequest
 from src.context.contracts import ContextBlock
 from src.llm.approval import ApprovalGate
 from src.llm.cloud_config import CloudConfig
+from src.llm.providers.cloud import FakeCloudProvider
+from src.llm.providers.cloud_http import OpenAICompatibleProvider
 
 
 class _FakeConfig:
@@ -96,6 +99,59 @@ class FactoryCloudWiringTest(unittest.TestCase):
         )
         self.assertIsNotNone(bridge)
         self.assertEqual(bridge._base_system, "You are a helpful assistant.")
+
+    def test_fake_kind_registers_fake_cloud_provider(self):
+        """Default provider_kind='fake' should register FakeCloudProvider."""
+        gate = ApprovalGate()
+        cfg = CloudConfig(enabled=True, model="cloud-m", provider_id="cloud")
+        service, reg, bridge = build_assistant_service(
+            _FakeConfig(), cloud_config=cfg, approval=gate
+        )
+        entry = reg.get("cloud")
+        self.assertIsInstance(entry.provider, FakeCloudProvider)
+
+    def test_openai_compatible_kind_registers_http_provider(self):
+        """provider_kind='openai_compatible' with a valid key should register OpenAICompatibleProvider."""
+        os.environ["FACTORY_TEST_KEY"] = "test-api-key"
+        try:
+            gate = ApprovalGate()
+            cfg = CloudConfig(
+                enabled=True,
+                model="gpt-4",
+                provider_kind="openai_compatible",
+                api_key_env="FACTORY_TEST_KEY",
+            )
+            service, reg, bridge = build_assistant_service(
+                _FakeConfig(), cloud_config=cfg, approval=gate
+            )
+            entry = reg.get("cloud")
+            self.assertIsInstance(entry.provider, OpenAICompatibleProvider)
+            self.assertFalse(entry.local)
+        finally:
+            del os.environ["FACTORY_TEST_KEY"]
+
+    def test_cloud_provider_injection_overrides_config(self):
+        """When cloud_provider is injected, it takes precedence over cloud_config."""
+        class _CustomProvider:
+            model = "custom"
+            def is_available(self): return True
+            def generate(self, messages, **kw): return "custom response"
+            def generate_stream(self, messages, **kw):
+                yield "custom "
+                yield "response"
+            @property
+            def last_stats(self): return {}
+            def close(self): pass
+
+        gate = ApprovalGate()
+        cfg = CloudConfig(enabled=True, model="cloud-m", provider_id="cloud")
+        custom = _CustomProvider()
+        service, reg, bridge = build_assistant_service(
+            _FakeConfig(), cloud_config=cfg, cloud_provider=custom, approval=gate
+        )
+        entry = reg.get("cloud")
+        self.assertIs(entry.provider, custom)
+        self.assertFalse(entry.local)
 
 
 if __name__ == "__main__":

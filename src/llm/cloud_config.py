@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from typing import Literal
 
 
 class CloudConfigError(RuntimeError):
@@ -21,6 +22,11 @@ class CloudConfig:
     既定では ``enabled=False`` であり、どの呼び出し経路もクラウドProviderを
     登録しない。有効化は ``CloudConfig(enabled=True, ...)`` を factory へ渡す
     明示的な操作のみとする。
+
+    ``provider_kind`` で実送信先の種別を選ぶ。
+    - ``"fake"``: ネットワークを使わないテスト用FakeCloudProvider (既定)。
+    - ``"openai_compatible"``: OpenAI互換HTTP API (OpenAICompatibleProvider)。
+      この場合、APIキーが必須となる。
     """
 
     enabled: bool = False
@@ -28,6 +34,7 @@ class CloudConfig:
     model: str = ""
     api_key_env: str = ""
     base_url: str | None = None
+    provider_kind: Literal["fake", "openai_compatible"] = "fake"
 
     def resolve_api_key(self) -> str | None:
         """有効時かつ ``api_key_env`` 指定時だけ環境変数からキーを返す。
@@ -49,6 +56,10 @@ class CloudConfig:
             return
         if not self.model:
             raise CloudConfigError("cloud enabled but model is empty")
+        if self.provider_kind == "openai_compatible" and not self.resolve_api_key():
+            raise CloudConfigError(
+                "cloud provider 'openai_compatible' requires an API key in the environment"
+            )
         if self.requires_key() and not self.resolve_api_key():
             raise CloudConfigError(
                 f"cloud enabled but API key not found in {self.api_key_env!r}"

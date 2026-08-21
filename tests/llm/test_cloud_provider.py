@@ -38,6 +38,31 @@ class CloudConfigTest(unittest.TestCase):
         with self.assertRaises(CloudConfigError):
             CloudConfig(enabled=True, model="m", api_key_env="MISSING_KEY").validate()
 
+    def test_default_provider_kind_is_fake(self):
+        cfg = CloudConfig()
+        self.assertEqual(cfg.provider_kind, "fake")
+
+    def test_validate_openai_compatible_requires_key(self):
+        with self.assertRaises(CloudConfigError):
+            CloudConfig(
+                enabled=True,
+                model="gpt-4",
+                provider_kind="openai_compatible",
+            ).validate()
+
+    def test_validate_openai_compatible_passes_with_key(self):
+        os.environ["TEST_OPENAI_KEY"] = "test-key-value"
+        try:
+            cfg = CloudConfig(
+                enabled=True,
+                model="gpt-4",
+                provider_kind="openai_compatible",
+                api_key_env="TEST_OPENAI_KEY",
+            )
+            cfg.validate()  # should not raise
+        finally:
+            del os.environ["TEST_OPENAI_KEY"]
+
 
 class FakeCloudProviderTest(unittest.TestCase):
     def test_generate_records_payload(self):

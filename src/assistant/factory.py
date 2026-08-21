@@ -14,6 +14,7 @@ from src.llm.approval import ApprovalGate
 from src.llm.cloud_config import CloudConfig, CloudConfigError
 from src.llm.contracts import GenerationOptions
 from src.llm.providers.cloud import FakeCloudProvider
+from src.llm.providers.cloud_http import OpenAICompatibleProvider
 from src.llm.providers.ollama import OllamaProvider
 from src.llm.registry import ProviderRegistry
 from src.llm.routing.static import StaticRouter
@@ -98,6 +99,7 @@ def build_assistant_service(
     provider=None,
     provider_id: str = "ollama",
     cloud_config: CloudConfig | None = None,
+    cloud_provider=None,
     approval: ApprovalGate | None = None,
     run_logger: RunLogger | None = _UNSET,  # type: ignore[assignment]
 ) -> tuple[AssistantService, ProviderRegistry, CloudRouteBridge | None]:
@@ -105,6 +107,9 @@ def build_assistant_service(
 
     クラウドは ``cloud_config`` が渡され、かつ ``cloud_config.enabled`` のときだけ
     登録される。それ以外は ``build_local_service`` と同等にローカルのみ。
+
+    ``cloud_provider`` を渡した場合は cloud_config の設定にかかわらず
+    そのオブジェクトをクラウドProviderとして登録する（テスト注入用）。
     """
     if provider is None:
         provider = OllamaProvider(
@@ -126,8 +131,18 @@ def build_assistant_service(
     bridge: CloudRouteBridge | None = None
     if cloud_config is not None and cloud_config.enabled:
         cloud_config.validate()
-        cloud_provider = FakeCloudProvider(model=cloud_config.model or "cloud-model")
-        registry.register(cloud_config.provider_id, cloud_provider, local=False)
+        if cloud_provider is not None:
+            resolved = cloud_provider
+        elif cloud_config.provider_kind == "openai_compatible":
+            resolved = OpenAICompatibleProvider(
+                model=cloud_config.model,
+                api_key=cloud_config.resolve_api_key() or "",
+                base_url=cloud_config.base_url or "https://api.openai.com/v1",
+                provider_id=cloud_config.provider_id,
+            )
+        else:
+            resolved = FakeCloudProvider(model=cloud_config.model or "cloud-model")
+        registry.register(cloud_config.provider_id, resolved, local=False)
         bridge = CloudRouteBridge(
             registry,
             cloud_config.provider_id,

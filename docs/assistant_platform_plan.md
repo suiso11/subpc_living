@@ -497,11 +497,12 @@ Phase Jは完了した。Cloud経路はユーザー（オーケストレータ�
 - Personal / Secret Contextを送れないことのテスト
 
 上記必要条件はすべて達成済み。実装:
-- `src/llm/cloud_config.py`（`CloudConfig`/`CloudConfigError`）：既定 `enabled=False`、キーは有効時かつ `api_key_env` 指定時のみ環境変数から解決（コードに埋め込まない）。
-- `src/llm/providers/cloud.py`（`FakeCloudProvider`）：ネットワーク・実キーなしの非Local Provider テスト双重。実送信は将来の swap 先。
+- `src/llm/cloud_config.py`（`CloudConfig`/`CloudConfigError`）：既定 `enabled=False`、キーは有効時かつ `api_key_env` 指定時のみ環境変数から解決（コードに埋め込まない）。`provider_kind`（`"fake"` 既定 / `"openai_compatible"`）で実送信先を選ぶ。`openai_compatible` はキー必須。
+- `src/llm/providers/cloud.py`（`FakeCloudProvider`）：ネットワーク・実キーなしの非Local Provider テスト双重。
+- `src/llm/providers/cloud_http.py`（`OpenAICompatibleProvider`）：OpenAI互換 `/chat/completions` の実送信 Provider。Bearer認証・SSE逐次ストリーム・usage統計・エラー正規化（Timeout→`ProviderTimeoutError`、その他→`ProviderRequestError`）。キーは環境変数からのみ取得し例外メッセージに含まない。テストは `httpx.MockTransport` 注入のみで実ネットワーク不使用。`top_k`/`repeat_penalty`/`num_ctx` は OpenAI互換APIに対応が無いため無視。
 - `src/llm/approval.py`（`ApprovalGate`/`CloudPreview`/`CloudPayloadBuilder`）：1リクエスト単位の `approve`/`require`（事前表示 `preview` 付き）と、`ContextPolicy.select(target_local=False)` による public のみ選択＝ローカル匿名化。
 - `src/assistant/cloud_service.py`（`CloudRouteBridge`）：`privacy=cloud_allowed` かつ `allow_cloud` のみ許可、承認必須、匿名化Payload送信、クラウド失敗時はローカル `AssistantService` へ Fallback。構築済みmessagesをそのままクラウドへ渡す経路は存在しない（既存保証維持）。
-- `src/assistant/factory.py`（`build_assistant_service`）：`cloud_config` が渡されかつ 有効時のみクラウドProviderを登録。`build_local_service` は従来通りローカルのみ。
+- `src/assistant/factory.py`（`build_assistant_service`）：`cloud_config` が渡されかつ 有効時のみクラウドProviderを登録（`provider_kind` で Fake/OpenAI互換 を分岐、`cloud_provider=` での直接注入も可）。`build_local_service` は従来通りローカルのみ。
 - テスト: `tests/llm/test_cloud_provider.py`, `tests/llm/test_approval.py`, `tests/assistant/test_cloud_service.py`, `tests/assistant/test_factory_cloud.py`（personal/secret がクラウドPayloadへ到達しないことを検証）。
 
 ### Phase L: LangGraph
