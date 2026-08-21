@@ -291,59 +291,51 @@ registry.register("local-strong", OllamaProvider(base_url="http://localhost:1143
 - 2ノードを追加してもUIコードを変更しない
 - 選択理由を返せる
 
-### N3: Inventory Example
+### N3: Inventory Example（完了）
 
-Provider Registryの設定形式が確定してから追加する。
+Provider Registryの設定形式は`src/assistant/nodes.py`の`NodeInventory`として確定済み。
 
-- ノードSchema
-- Git管理可能なExample
-- 実設定の管理外Path
-- 設定検証コマンド
+- ノードSchema: `NodeInventory.from_mapping()`が全フィールドを検証（重複ID・型・fallback循環等）
+- Git管理可能なExample: `config/nodes.example.json`
+- 実設定の管理外Path: 環境変数`SUBPC_NODE_INVENTORY`で実JSONを指す（ExampleのみCommit）
+- 設定検証コマンド: `python -m src.assistant.nodes validate <inventory.json>`（終了コードで成否判定）
 
-実IP、秘密情報、実APIキーはCommitしない。
+実IP、秘密情報、実APIキーはCommitしない。Webバックエンドは`SUBPC_NODE_INVENTORY`設定時に
+Inventoryから複数Provider構成を組み立て、失敗時は従来の単一Provider構成へfallbackする。
 
-### N4: AssistantServiceとCLI移行（次アクション）
+### N4: AssistantServiceとCLI移行（完了）
 
 - Fake ProviderでServiceを検証
 - CLIを最初のEnd-to-End Adapterにする
-- Web、Discord、音声はまだ変更しない
+- Web、Discord、音声も移行完了（全入口が`respond`/`respond_stream`経由）
+- Cloud経路（Phase K）も`privacy=cloud_allowed`+承認時に自動接続
 
-### N5: Health API
+### N5: Health API（完了）
 
-最低限返す値:
+`GET /api/health`が`providers`配列を返す:
 
-- node ID
-- service status
-- Provider ID
-- model
-- local / remote
-- availability
-- 最終成功時刻
+- provider_id / model / local / available / last_success_at
+- `last_success_at`は`AssistantService`が成功ごとに記録（スレッドセーフ）
 
-秘密情報、内部Prompt、個人Contextは返さない。
+秘密情報、内部Prompt、個人Contextは返さない。既存の`modules`キーとの後方互換を維持。
 
-### N6: バックアップ設計
+### N6: バックアップ設計（完了）
 
-- 対象Path一覧
-- 世代管理
-- 復元コマンド
-- 月1回以上の復元確認
+- 対象Path一覧: `scripts/backup.sh`内のアーカイブグループ定義（tasks/conversations/rag/profile/metrics/config-systemd）
+- 世代管理: `--keep-daily N`（既定7）
+- 復元コマンド: `scripts/restore.sh <backup_dir> --target DIR`（sha256検証→展開、`--verify-only`も可）
+- 月1回以上の復元確認: `docs/runbook.md`に訓練手順を記載
 
-頻度や保存先は、現在のデータ量を測定してから決める。
+頻度や保存先はcron/systemd timerでの運用開始時にデータ量を実測して決める。
 
-### N7: 運用Runbook
+### N7: 運用Runbook（完了）
 
-最低限必要な手順:
+`docs/runbook.md`に全9シナリオを症状/切り分け/対処/復旧確認の構造で記載:
 
-- Ollamaが応答しない
-- モデルが見つからない
-- Web / Discordが起動しない
-- GPU VRAM不足
-- ディスク不足
-- DB破損
-- メインPC停止
-- サブPC停止
-- 秘密情報を誤って出力した
+- Ollamaが応答しない / モデルが見つからない / Web・Discord起動しない / GPU VRAM不足 /
+  ディスク不足 / DB破損 / メインPC停止 / サブPC停止 / 秘密情報誤出力
+
+更新とRollbackの基本順序、月1復元訓練の手順も含む。
 
 ## 4. 成熟度の目安
 
