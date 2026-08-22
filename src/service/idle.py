@@ -6,14 +6,34 @@
 - LLM 推論開始時 → GPU をアクティブモードに切替
 - 長時間アイドル → Monitor 収集間隔を延長・Vision 解析を一時停止
 """
-import time
-import threading
 import logging
+import os
+import threading
+import time
+from collections.abc import Mapping
 from typing import Optional
 
 from src.service.power import GpuPowerManager, create_all_managers
 
 logger = logging.getLogger(__name__)
+
+
+def is_idle_manager_enabled(env: Optional[Mapping[str, str]] = None) -> bool:
+    """Return whether the legacy idle controller was explicitly enabled.
+
+    The controller is disabled by default because multiple application processes
+    can otherwise race while changing the same system-wide GPU power limits.
+    """
+    values = os.environ if env is None else env
+    raw_value = values.get("IDLE_MANAGER_ENABLED", "false")
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def create_idle_manager(env: Optional[Mapping[str, str]] = None) -> Optional["IdleManager"]:
+    """Create the controller only when the legacy feature was opted into."""
+    if not is_idle_manager_enabled(env):
+        return None
+    return IdleManager()
 
 
 class IdleManager:
