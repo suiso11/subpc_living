@@ -364,12 +364,15 @@ Inventoryから複数Provider構成を組み立て、失敗時は従来の単一
 
 現時点では次を必須にしない。
 
-- Kubernetes
+- Kubernetes / Terraform / AWS EKS / Service Mesh
 - Kafka
 - Redis Cluster
-- PostgreSQLへの一括移行
-- 全サービスDocker化
 - インターネット公開
 - 高可用性Cluster
 
-2台構成では、systemd、Windows自動起動、Python、SQLite、LAN内APIで十分である。
+> 2026-08-22更新: 「PostgreSQLへの一括移行」「全サービスDocker化」の2件は
+> `docs/infrastructure_plan.md` の策定により、**段階的導入へ方針転換**した
+> （一括・全一斉は引き続き避ける）。以降のインフラ追加は同文書を正とする。
+
+2台構成の土台は、systemd、Windows自動起動、Python、SQLite、LAN内APIのまま維持し、
+その上へ段階的に Docker Compose・PostgreSQL・Prometheus/Grafana・CI/CD を載せる。
