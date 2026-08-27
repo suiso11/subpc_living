@@ -65,12 +65,13 @@ READMEに記載されている情報:
 - systemd常駐
 - Pi / OpenCode開発オーケストレーション
 
-現在進めているもの:
+運用基盤として完了したもの:
 
 - `LLMProvider`境界
 - 複数ノードを扱うProvider Registry
 - Privacyを考慮するModel Router
 - 各入口をまとめるAssistantService
+- Inventory Example、Provider Health、Backup/Restore、Runbook（N1〜N7）
 
 ## 2. ホームラボとして不足しているもの
 
@@ -133,7 +134,7 @@ nodes:
 - TimeoutとFallbackの共通ルール
 - 障害理由の記録
 
-次の実装で`ProviderRegistry`と`ModelRouter`へ組み込む。
+`ProviderRegistry` / `ModelRouter` / `GET /api/health`への組み込みはN2/N5で完了した。
 
 ### P0: バックアップと復元
 

@@ -142,7 +142,7 @@ Contextをすべて構築してから送信先を決めてはいけない。先�
 - 暗い半透明面、細い輪郭、最小限のぼかし、一本のアクセント色
 - 大量の角丸カード、紫グラデーション、英語の小見出し、計器風ダッシュボードを避ける
 - 学園アイドルマスター等からは「キャラクターが主役で、情報の優先順位が明快」という構造だけを参考にし、素材や画面を複製しない
-- 既存Hallmarkテーマの視覚表現は継承しないが、アクセシビリティ、余白、レスポンシブ、reduced-motionの規律は残す
+- 旧Webテーマの視覚表現は継承しないが、アクセシビリティ、余白、レスポンシブ、reduced-motionの規律は残す
 
 ## 8. 実装ロードマップ
 
@@ -184,7 +184,6 @@ Contextをすべて構築してから送信先を決めてはいけない。先�
 - Web runtime wiringと読み取り専用状態API（完了・`/api/companion/state`、オプトイン）
 - UI消費とWeb以外（Discord / Voice / Desktop）へのruntime wiring（完了・各入口とも `COMPANION_ACTIVITY_ENABLED=true` オプトイン時のみ起動し、privacy-safe な `companion_state_payload` のみ公開）
 
-次アクション: Phase 5 の接続層（Policy と既存 `ProactiveEngine`・各入口の統合）。カメラ・画面・常時生データ収集は実装しない。
 
 ### Phase 5: Proactive Policy（完了）
 
@@ -213,7 +212,7 @@ Contextをすべて構築してから送信先を決めてはいけない。先�
 - 音声 wiring: `src/audio/pipeline.py` の `VoicePipeline` が `companion_getter=self._companion_state` を `ProactiveEngine` へ渡し、`ActivityRuntime.state` でゲート（None・例外時は従来挙動）
 - Desktop wiring: desktop は `ProactiveEngine` を持たず、companion state を表示のみに利用するため Policy ゲートの対象なし。入力である companion state は既に `companionState` Property で露出済み
 
-### Phase 6: 3DデスクトップShell（一部完了・6a基盤）
+### Phase 6: 3DデスクトップShell（一部完了・6a＋6b静的表示）
 
 #### 完了: Phase 6a オーバーレイShell基盤
 
@@ -232,29 +231,31 @@ Contextをすべて構築してから送信先を決めてはいけない。先�
 - `DESKTOP_OVERLAY_ENABLED=true` オプトイン + `--no-overlay` 上書き。起動失敗時はメインアプリ継続
 - privacy-safe: 表示に使うのは `companion_state_payload` 同等のフィールドのみ
 
-#### 一部完了: Phase 6b 受け入れ基盤
+#### 一部完了: Phase 6b VRM/GLB静的表示
 
-- VRMモデル配置ディレクトリ `models/vrm/` を整備（gitignore済みで同梱構造的に不可能、README付き）
-- 発見・解決ロジック `src/desktop/avatar.py`（Qt非依存・12テスト）: 明示パス > `DESKTOP_VRM_MODEL` 環境変数 > `models/vrm/` 名前順走査。`is_probable_vrm()` の glTF マジック検査付き
-- ユーザー所有VRM読み込み優先・第三者モデル非同梱の方針のコードレベル実装済み
+- VRMモデル配置ディレクトリ `models/vrm/` を整備（gitignore済み、README付き、第三者モデル非同梱）
+- 発見・解決ロジック `src/desktop/avatar.py`（Qt非依存・テスト済み）: 明示パス > `DESKTOP_VRM_MODEL` 環境変数 > `models/vrm/` 名前順走査。glTFマジック検査付き
+- `DesktopBridge.avatarModel` / `refreshAvatarModel()` でQMLへ解決結果を公開し、例外・欠損時は安全な空状態へ戻す
+- `OverlayAvatar3D.qml` がQt Quick 3D `RuntimeLoader`でユーザー所有VRM/GLBを表示。読込失敗時は既存2D表示へfallback
+- 待機相当の微動・回転、縮小/離席時のdimmed・アニメ停止まで実装。モデル本体は配布物へ含めない
 
-#### 未着手: Phase 6b VRMレンダラ本体
+#### Phase 6b 残作業
 
-- Qt Quick 3D による VRM 1.0 描画（受け入れ先と解決ロジックは上記完了済み）
-- 待機、視線、表情、リップシンク
-- クイック会話HUDのチャット実装（6aでは状態HUDまで。送信経路は既存 bridge チャット経路を再利用予定）
+- VRM 1.0 humanoid・表情・視線を解釈する専用レンダリング制御（現状はglTFとしての静的ロード）
+- 待機モーションの高度化、表情、リップシンク
+- クイック会話HUDのチャット実装（既存bridgeチャット経路を再利用予定）
 - フルスクリーン/画面共有検知による自動縮小
 
-### Phase 7: 任意の高度機能（未着手）
+### Phase 7: 任意の高度機能（一部完了）
 
-- 明示承認付きクラウド推論
+- 明示承認付きクラウド推論（完了・無効が既定、詳細は`docs/assistant_platform_plan.md` Phase K）
 - LangGraphによる承認・中断・再開が必要な処理だけをWorkflow化
 - コーディングJob Adapter
 - カメラによる在席検知は安全UI完成後に追加
 
 ## 9. 現在の実装進行単位
 
-Phase 1〜2とRegistry/Router、CLI・Web・Discord・Voice移行、実行ログの実装とruntime wiringは完了し、Phase 3の`ContextBlock` / `ContextPolicy`基盤、History・Preload・RAG・Web search・Monitor・Vision・Screen・Calendar・Tasksの各Context Provider移行も完了した。Phase J全体は完了し、Phase 4の基盤実装（`PerceptionEvent` / `CompanionState` / `StateAggregator` / `ActivityEventCollector`）とプラットフォーム別ActivitySource adapter、Web runtime wiring・`/api/companion/state`、およびDiscord / 音声 / Desktop / Web UI へのruntime wiringが完了した。Phase 5の決定的Policyエンジン基盤（`DeterministicProactivePolicy`）と接続層（`ProactiveEngine`・CalendarSource・拒否cooldown永続化・Discord / 音声 / Desktop 各入口のPolicy参照wiring）も完了した。次アクションは Phase 6（3DデスクトップShell）へ進むが、本計画の境界はここまでとし、3D UI は `docs/companion_roadmap.md` の Phase 6 で別途進める。
+Phase 1〜2とRegistry/Router、CLI・Web・Discord・Voice移行、実行ログの実装とruntime wiringは完了し、Phase 3の`ContextBlock` / `ContextPolicy`基盤、History・Preload・RAG・Web search・Monitor・Vision・Screen・Calendar・Tasksの各Context Provider移行も完了した。Phase J全体は完了し、Phase 4の基盤実装（`PerceptionEvent` / `CompanionState` / `StateAggregator` / `ActivityEventCollector`）とプラットフォーム別ActivitySource adapter、Web runtime wiring・`/api/companion/state`、およびDiscord / 音声 / Desktop / Web UI へのruntime wiringが完了した。Phase 5の決定的Policyエンジン基盤（`DeterministicProactivePolicy`）と接続層（`ProactiveEngine`・CalendarSource・拒否cooldown永続化・Discord / 音声 / Desktop 各入口のPolicy参照wiring）も完了した。Phase 6aと6bの静的3D表示まで完了した。次のUI作業はPhase 6b残作業だが、現在の主線は`docs/infrastructure_plan.md`の段階的インフラ整備とする。
 
 ### 完了: 実行ログ
 

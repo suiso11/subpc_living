@@ -31,8 +31,8 @@
 - [x] Vision / Screen移行（完了・secret / local_only）
 - [x] Calendar移行（完了）
 - [x] Tasks移行（完了・最終権威ブロックとして末尾）
-- [x] Cloud経路（Phase K、`CloudConfig`無効既定＋`ApprovalGate`承認＋`CloudPayloadBuilder`匿名化＋`CloudRouteBridge`ローカルFallbackを完了。実送信Providerは将来のswap先；既定はローカルのみ）
-- [x] Companion Phase 4基盤（`PerceptionEvent` / `CompanionState` / `StateAggregator` / `ActivityEventCollector`）とプラットフォーム別ActivitySource adapter、Web runtime wiring・`/api/companion/state`（オプトイン）。UI消費と非Web wiring（Discord / Voice / Desktop）は未完。詳細は`docs/companion_roadmap.md`）
+- [x] Cloud経路（Phase K、無効既定＋明示承認＋匿名化＋ローカルFallback＋OpenAI互換実送信Providerを完了。既定はローカルのみ）
+- [x] Companion Phase 4〜5（知覚状態、全入口runtime wiring、決定的Proactive Policy接続）を完了。Phase 6aと6b静的3D表示は`docs/companion_roadmap.md`を正とする）
 
 ## 1. ゴール
 
@@ -441,8 +441,8 @@ Routerを高度化する前にSQLiteへ事実を記録する。実装とruntime 
 - Vision / Screen移行は完了: `VisionContextProvider`（source=vision / sensitivity=secret / local_only=True）と`ScreenContextProvider`（source=screen / sensitivity=secret / local_only=True）を実装し、`ChatSession.build_messages()`へ組み込み済み。どちらもsecret / local_onlyのため非Local経路へ渡らない。各収集失敗は型名だけwarningして本文をログせず、会話を継続する。各Providerは`src.context`から公開し、root公開APIテスト済み
 - Calendar移行は完了: `CalendarContextProvider`（source=calendar / sensitivity=personal / local_only=True）を実装し、`ChatSession.build_messages()`へ組み込み済み。`CalendarContext`の結果（ファイル読取のみ）を包むだけで、本体は変更しない。収集失敗は型名だけwarningして本文をログせず、会話を継続する。`CalendarContextProvider`と`CalendarSource`は`src.context`から公開し、root公開APIテスト済み
 - Tasks移行は完了: `TasksContextProvider`（source=TASKS_SOURCE / sensitivity=personal / local_only=True）を実装し、最終権威ブロックとして`ChatSession.build_messages()`のsystem本文末尾へ組み込み済み。0件でも必ず注入する。Historyのrole messagesはその後ろに`ContextBuilder`経由で描画する。収集失敗は型名だけwarningして本文をログせず、会話を継続する。`TasksContextProvider`は`src.context`から公開し、root公開APIテスト済み
-- Phase J全体は完了。Cloud経路（Phase K）も完了（無効が既定；実送信Providerは将来のswap先）
-- Companion Phase 4基盤（`PerceptionEvent` / `CompanionState` / `StateAggregator` / `ActivityEventCollector`）とプラットフォーム別ActivitySource adapter（Windows / Linux(X11)、`xprintidle` / `xdotool` 必須）は完了。Web runtime wiringと読み取り専用API（`/api/companion/state`、`COMPANION_ACTIVITY_ENABLED=true` のオプトイン、起動失敗時はcompanion機能のみ無効化してWeb起動は続行）も完了。UI消費と非Web入口（Discord / Voice / Desktop）へのruntime wiringは未完で、次アクション（詳細は`docs/companion_roadmap.md`）
+- Phase J全体は完了。Cloud経路（Phase K）も完了（無効が既定；OpenAI互換実送信Providerを実装済み）
+- Companion Phase 4基盤（`PerceptionEvent` / `CompanionState` / `StateAggregator` / `ActivityEventCollector`）とプラットフォーム別ActivitySource adapter（Windows / Linux(X11)、`xprintidle` / `xdotool` 必須）は完了。Web runtime wiringと読み取り専用API（`/api/companion/state`、`COMPANION_ACTIVITY_ENABLED=true` のオプトイン、起動失敗時はcompanion機能のみ無効化してWeb起動は続行）も完了。UI消費と非Web入口（Discord / Voice / Desktop）へのruntime wiringも完了（詳細は`docs/companion_roadmap.md`）
 
 移行順:
 
@@ -485,7 +485,7 @@ src/context/
 
 ### Phase K: Cloudと承認（完了・無効が既定）
 
-Phase Jは完了した。Cloud経路はユーザー（オーケストレーター）の明示判断により着手し、「無効が既定」のまま実装を完了した。実際のHTTPクラウドProviderは実装せず、テスト双重 `FakeCloudProvider` と `CloudConfig` ゲートで承認・匿名化・Fallbackの契約だけを確立する。実送信Providerは `CloudConfig(enabled=True, ...)` を factory へ渡したときに `FakeCloudProvider` を `local=False` で登録する箇所へ swap する。
+Phase Jは完了した。Cloud経路は「無効が既定」のまま、承認・匿名化・Fallback契約とテスト双重`FakeCloudProvider`を実装した。その後、同じ境界へ`OpenAICompatibleProvider`を追加済みで、`CloudConfig(enabled=True, provider_kind="openai_compatible", ...)`を明示した場合だけ実HTTP送信を有効化できる。
 
 必要条件:
 
@@ -513,7 +513,7 @@ Phase Jは完了した。Cloud経路はユーザー（オーケストレータ�
 - タスク候補の確認と登録
 - コーディングJobの承認と結果確認
 
-## 6. 推奨する直近4タスク
+## 6. 基盤実装履歴
 
 まず以下を順番に実行する。
 
@@ -526,7 +526,7 @@ Phase Jは完了した。Cloud経路はユーザー（オーケストレータ�
 4. **CLI移行**（完了）
    最も小さい入口でEnd-to-End経路を確認する。
 
-この4タスクが終わるまで、Web、Discord、Voice、Cloud、LangGraph、3D UIへ広げない。
+この4タスクと後続のWeb・Discord・Voice・Context・Cloud移行は完了した。現在の主線は`docs/infrastructure_plan.md`を参照する。
 
 ## 7. テスト計画
 
@@ -584,13 +584,12 @@ Linuxのプロジェクト環境で実行する。
 ## 9. 明示的に後回しにするもの
 
 - 自動難易度判定Router
-- クラウドAPI
 - LangGraph
-- PostgreSQL、Redis、Queue server
+- Redis、Queue server
 - マイクロサービス化
-- OpenAI互換API
 - コーディングJob統合
-- センサーイベント基盤
-- 3Dキャラクターと透過HUD
+
+PostgreSQLは`docs/infrastructure_plan.md`で段階導入を開始済み。Cloud/OpenAI互換Provider、
+センサーイベント基盤、3D Shell基盤は実装済みのため、この後回し一覧から除外した。
 
 これらは本計画の境界が安定してから上へ載せる。
