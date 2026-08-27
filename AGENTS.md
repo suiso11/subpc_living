@@ -30,13 +30,25 @@ Web UI・Discord bot・音声パイプラインから使う。
 
 | 役 | 実体 | 権限 | 担当 |
 | --- | --- | --- | --- |
-| オペレーター | 親 | 全ツール | 計画、分解、ブリーフ作成、統合、最終判断 |
-| worker | OpenCode worker | 限定write | 実装・修正のみ。1タスク1関心事 |
-| reviewer | OpenCode reviewer | 読み取り専用 | 差分・要件の独立レビュー |
+| コーディネーター | 親Pi | 委譲と読み取り専用の統合メタデータ確認のみ。実装・テスト・検証・サービス操作・変更系コマンドは禁止 | 要件、分解、ブリーフ作成、結果統合、調整、最終承認のみ |
+| worker | OpenCode worker | 限定write | すべての実装・修正。1タスク1関心事 |
+| tester | 読み取り専用tester | 読み取り専用 | テスト・検証コマンドの独立実行 |
+| reviewer | OpenCode reviewer / named reviewer | 読み取り専用 | 差分・要件の独立レビュー |
 
-- worker / reviewer のモデルは pi-orch の設定に従う。`opencode_task` / `opencode_spawn` 経由で起動する
-- reviewer は常に読み取り専用。write・本番データ・秘密情報・サービス操作を渡さない
-- worker / reviewer の結論は最終承認にせず、オペレーターが最終判断する
+- **親はコーディネーター専任**。親自身は一切の変更を実装せず、テスト・検証・サービス操作・
+  変更系コマンドも実行しない。親が使えるのは委譲と、統合のための読み取り専用メタデータ確認だけ。
+  親が持つのは要件、分解、スコープ付きブリーフ、結果統合、競合解消、最終承認だけ
+- **編集はすべてwrite workerへ**。1ファイルの小さな修正や文書・設定の編集でも、必ず
+  変更可能パスを列挙したスコープ付きwriteタスクとして委譲する。親が直接編集しない
+- **テスト・検証コマンドは独立read-only testerへ**。差分・要件レビューは独立read-only
+  reviewerへ。親が子の代わりに検証を兼ねない
+- 親は統合のための読み取り専用 `git status` / `git diff` メタデータ確認のみ可。それを
+  テスト代わりに使わない
+- worker / tester / reviewer のモデル・プロファイルは pi-orch の設定に従い、固定値を仮定しない。
+  実装は `opencode_task` / `opencode_spawn` 経由で起動する
+- reviewer / tester は実装workerとは別の独立した読み取り専用子。write・本番データ・秘密情報・
+  サービス操作を渡さない
+- 子の結論は最終承認にせず、オペレーターが最終判断する
 - Pi named agents (`subpc-scout`, `subpc-tester`, `subpc-reviewer`) は探索・テスト・レビュー用。
   実装は OpenCode worker へ委譲し、named agent では実装しない
 
@@ -57,12 +69,16 @@ Web UI・Discord bot・音声パイプラインから使う。
 - 独立検討では、他エージェントの結論を混ぜず、コード・ログ・要件だけを渡す
 - 出力は要点、変更ファイル、検証結果に絞らせ、長い思考過程やファイル全文を要求しない
 
-## 委譲後の確認
+## 委譲後の確認 (親はコーディネーターのみ)
 
-- `git status --short`、`git diff --stat` と関連テストで結果を検証する
+- 親は `git status --short` と `git diff --stat` の読み取りで統合状況を把握するだけ。
+  これはテスト・検証の代わりにならない
+- テスト・検証は独立read-only testerへ委譲し、差分・要件レビューは独立read-only reviewerへ
+  委譲した結果だけで判断する
 - 未コミット変更が多い場合はユーザー作業を戻さず、今回触った範囲だけ扱う
-- 実装結果をworker自身の説明だけで承認しない。reviewerに確認させ、
-  オペレーターが最終判断する
+- 実装結果をworker自身の説明だけで承認しない。独立確認を経てオペレーターが最終判断する
+
+詳細な運用契約は `docs/orchestration.md` を参照する。
 
 ## Resource Check Before LLM-Heavy Work
 

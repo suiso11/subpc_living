@@ -2,9 +2,6 @@
 name: subpc-scout
 description: Read-only repository reconnaissance for files, flows, dependencies, and existing conventions.
 enabled: true
-model: openai-codex/gpt-5.6-terra
-thinking: high
-allow-model-override: false
 mode: background
 async: true
 auto-exit: true
