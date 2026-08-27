@@ -20,6 +20,16 @@
 #   BACKUP_EXTRA_INCLUDES="path1 path2"   (space-separated, repo-root-relative)
 #   BACKUP_EXTRA_EXCLUDES="pattern1 pattern2"
 #
+# PostgreSQL (I1, docs/infrastructure_plan.md):
+#   POSTGRES_BACKUP_MODE=auto|off|required  (default: auto)
+#     auto     : pg_dump (custom format) via the compose postgres service when
+#                it is running; silently skipped otherwise (backward-compatible)
+#     off      : never touch PostgreSQL
+#     required : fail hard if the compose postgres service is not available
+#     Credentials are never read by this script: pg_dump runs INSIDE the
+#     container and uses the container's own POSTGRES_USER/POSTGRES_DB env.
+#     The dump is archived as postgres.dump and covered by the sha256 manifest.
+#
 # Excluded everywhere:
 #   *.psd, tmp audio, camera frames, screen captures,
 #   __pycache__, *.pyc, logs older than rotation,
@@ -37,6 +47,17 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 TARGET_DIR="${REPO_ROOT}/backups"
 KEEP_DAILY=7
 DRY_RUN=0
+COMPOSE_FILE="${REPO_ROOT}/compose.yaml"
+
+# ── PostgreSQL backup mode (I1) ──
+POSTGRES_BACKUP_MODE="${POSTGRES_BACKUP_MODE:-auto}"
+case "${POSTGRES_BACKUP_MODE}" in
+    off|auto|required) ;;
+    *)
+        echo "Error: POSTGRES_BACKUP_MODE must be off, auto, or required (got: ${POSTGRES_BACKUP_MODE})" >&2
+        exit 1
+        ;;
+esac
 
 # ── Parse arguments ──
 while [[ $# -gt 0 ]]; do
@@ -51,6 +72,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --dry-run          Print planned actions without writing"
             echo "  --target-dir DIR   Base directory for backups (default: <repo>/backups)"
             echo "  --keep-daily N     Retention: keep newest N timestamp dirs (default: 7)"
+            echo ""
+            echo "Environment:"
+            echo "  POSTGRES_BACKUP_MODE  off | auto (default) | required"
             exit 0
             ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
@@ -92,11 +116,19 @@ if [[ -n "${BACKUP_EXTRA_EXCLUDES:-}" ]]; then
     done
 fi
 
-# ── Tool versions for manifest ──
-BASH_VERSION_STR="${BASH_VERSION}"
-TAR_VERSION="$(tar --version 2>/dev/null | head -1 || echo 'unknown')"
-SHA256_VERSION="$(sha256sum --version 2>/dev/null | head -1 || echo 'unknown')"
-HOSTNAME="$(hostname)"
+# ── Helper: strip JSON-breaking control characters (CR/LF/tab/etc.) ──
+# Windows GNU coreutils (e.g. `sha256sum --version`) may emit CRLF; a raw
+# CR inside a manifest string value would make manifest.json invalid under
+# strict JSON parsers. Strip U+0000-U+001F from any tool/hostname string.
+sanitize_for_json() {
+    printf '%s' "$1" | tr -d '\000-\037'
+}
+
+# ── Tool versions for manifest (sanitized) ──
+BASH_VERSION_STR="$(sanitize_for_json "${BASH_VERSION}")"
+TAR_VERSION="$(sanitize_for_json "$(tar --version 2>/dev/null | head -1 || echo 'unknown')")"
+SHA256_VERSION="$(sanitize_for_json "$(sha256sum --version 2>/dev/null | head -1 || echo 'unknown')")"
+HOSTNAME="$(sanitize_for_json "$(hostname)")"
 
 # ── Helper: archive a directory group ──
 # Args: archive_name dir1 [dir2 ...]
@@ -184,6 +216,57 @@ archive_files() {
     echo "    ${name}|${name}.tar.gz|${bytes}|${file_count}" >> "${BACKUP_DIR}/.archive_list"
 }
 
+# ── Helper: PostgreSQL dump via compose service (I1) ──
+# Returns 0 when the compose postgres service is running.
+postgres_service_running() {
+    command -v docker >/dev/null 2>&1 || return 1
+    docker compose -f "$COMPOSE_FILE" ps --services --filter "status=running" 2>/dev/null \
+        | grep -qx 'postgres'
+}
+
+backup_postgres() {
+    if [[ "$POSTGRES_BACKUP_MODE" == "off" ]]; then
+        echo "  [SKIP]   postgres.dump (POSTGRES_BACKUP_MODE=off)"
+        return 0
+    fi
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        if postgres_service_running; then
+            echo "  [DRY]    postgres.dump: pg_dump --format=custom via compose postgres"
+        elif [[ "$POSTGRES_BACKUP_MODE" == "required" ]]; then
+            echo "ERROR: POSTGRES_BACKUP_MODE=required but the compose postgres service is not running" >&2
+            exit 1
+        else
+            echo "  [SKIP]   postgres.dump: compose postgres service not running"
+        fi
+        return 0
+    fi
+
+    if ! postgres_service_running; then
+        if [[ "$POSTGRES_BACKUP_MODE" == "required" ]]; then
+            echo "ERROR: POSTGRES_BACKUP_MODE=required but the compose postgres service is not running" >&2
+            exit 1
+        fi
+        echo "  [SKIP]   postgres.dump: compose postgres service not running"
+        return 0
+    fi
+
+    echo "  [DUMP]   postgres.dump (pg_dump custom format via compose postgres)"
+    # pg_dump runs inside the container using its own environment, so no
+    # credentials are passed on the command line or stored in this repo.
+    if ! docker compose -f "$COMPOSE_FILE" exec -T postgres \
+            sh -c 'exec pg_dump --format=custom -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
+            > "${BACKUP_DIR}/postgres.dump"; then
+        rm -f "${BACKUP_DIR}/postgres.dump"
+        echo "ERROR: pg_dump failed; aborting backup" >&2
+        exit 1
+    fi
+
+    local bytes
+    bytes="$(stat -c%s "${BACKUP_DIR}/postgres.dump" 2>/dev/null || stat -f%z "${BACKUP_DIR}/postgres.dump" 2>/dev/null || echo 0)"
+    echo "    postgres|postgres.dump|${bytes}|1" >> "${BACKUP_DIR}/.archive_list"
+}
+
 # ── Main ──
 echo "=== subpc_living Backup ==="
 echo "  Timestamp : ${TIMESTAMP}"
@@ -195,8 +278,12 @@ echo ""
 
 if [[ $DRY_RUN -eq 0 ]]; then
     mkdir -p "${BACKUP_DIR}"
-    echo -n "" > "${BACKUP_DIR}/.archive_list"
+else
+    # Dry-run group helpers still append skip/dry markers to .archive_list,
+    # so the directory must exist (it is removed again below).
+    mkdir -p "${BACKUP_DIR}"
 fi
+echo -n "" > "${BACKUP_DIR}/.archive_list"
 
 echo "Archive groups:"
 archive_group "tasks"                    "data/tasks"
@@ -205,6 +292,7 @@ archive_group "rag"                     "data/vectordb"
 archive_group "profile_diary"           "data/profile" "data/diary"
 archive_group "metrics_calendar_growth" "data/metrics" "data/growth" "data/calendar"
 archive_group "config_systemd"          "config" "scripts/systemd"
+backup_postgres
 
 # Extra includes
 if [[ -n "${BACKUP_EXTRA_INCLUDES:-}" ]]; then
@@ -217,6 +305,7 @@ echo ""
 if [[ $DRY_RUN -eq 1 ]]; then
     echo "=== Dry Run Complete ==="
     echo "  No archives written. Review the planned actions above."
+    rm -f "${BACKUP_DIR}/.archive_list"
     if [[ -d "${BACKUP_DIR}" ]]; then
         rmdir "${BACKUP_DIR}" 2>/dev/null || true
     fi
@@ -240,7 +329,7 @@ while IFS='|' read -r name file bytes count; do
     fi
 
     # Compute sha256
-    sha256="$(sha256sum "${BACKUP_DIR}/${file}" 2>/dev/null | awk '{print $1}')"
+    sha256="$(sha256sum "${BACKUP_DIR}/${file}" 2>/dev/null | grep -oE '[0-9a-fA-F]{64}' | head -1)"
 
     if [[ $ARCHIVE_COUNT -gt 0 ]]; then
         ARCHIVE_ENTRIES+=","
@@ -308,7 +397,7 @@ echo "  Archives    : ${ARCHIVE_COUNT}"
 echo "  Manifest    : ${MANIFEST}"
 echo ""
 echo "Archives created:"
-for f in "${BACKUP_DIR}"/*.tar.gz; do
+for f in "${BACKUP_DIR}"/*.tar.gz "${BACKUP_DIR}"/*.dump; do
     if [[ -f "$f" ]]; then
         local_size="$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo 0)"
         echo "  $(basename "$f")  $(( local_size / 1024 ))KB"
@@ -316,3 +405,4 @@ for f in "${BACKUP_DIR}"/*.tar.gz; do
 done
 echo ""
 echo "To restore: scripts/restore.sh $(basename "$BACKUP_DIR") --target <restore_root>"
+echo "PostgreSQL: scripts/restore.sh $(basename "$BACKUP_DIR") --target <restore_root> --restore-postgres"
