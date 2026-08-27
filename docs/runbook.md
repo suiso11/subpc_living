@@ -367,6 +367,24 @@ sqlite3 data/metrics/system_metrics.db "PRAGMA integrity_check;"
    sqlite3 data/tasks/tasks.db "PRAGMA wal_checkpoint(TRUNCATE);"
    ```
 
+### PostgreSQLバックアップ・復元（I1以降）
+
+通常運用ではPostgres停止を見逃さないよう`required`でバックアップする。
+
+```bash
+POSTGRES_BACKUP_MODE=required scripts/backup.sh --target-dir /path/to/backup
+scripts/restore.sh <backup_dir> --target /tmp/subpc-restore --verify-only
+```
+
+`--restore-postgres`は現在のcompose DBを`--clean --if-exists`で置換する破壊的操作。
+Web・Discord等の書き込みサービスを止め、バックアップ日付と対象DBを確認してから実行する。
+
+```bash
+systemctl --user stop subpc-web.service subpc-discord.service subpc-voice.service
+scripts/restore.sh <backup_dir> --target /tmp/subpc-restore --restore-postgres
+docker compose exec postgres sh -c 'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+```
+
 ### 復旧確認
 
 ```bash

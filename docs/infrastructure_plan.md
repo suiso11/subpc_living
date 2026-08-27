@@ -36,7 +36,7 @@
 - `GET /api/health` に modules + providers（provider_id/model/local/available/last_success_at）
 - `scripts/backup.sh` / `scripts/restore.sh`（sha256 manifest + 世代管理）
 - CI: `.github/workflows/windows-desktop.yml`（Windows runner で EXE ビルド）のみ
-- Dockerfile / compose / Prometheus / Grafana / GitHub Actions test は未導入
+- `compose.yaml` + `postgres:16`はI1で導入済み（実機確認待ち）。Dockerfile / Prometheus / Grafana / GitHub Actions test は未導入
 
 ## ゴール（完了時の姿）
 
@@ -63,7 +63,7 @@
 
 各フェーズは単独で完了・検証・rollback 可能。変更パスは最小に保つ。
 
-### I1: Docker 基盤と PostgreSQL
+### I1: Docker 基盤と PostgreSQL（リポジトリ実装完了・実機確認待ち）
 
 - サブPCに Docker Engine + Compose plugin を導入（`docs` に手順、Ansible は使わない）
 - `compose.yaml` + `.env.example`: `postgres:16`（healthcheck付き、`POSTGRES_*` は .env から）
@@ -71,6 +71,16 @@
 - `scripts/backup.sh` へ `pg_dump` を追加、`restore.sh` へ `pg_restore` を追加
 
 受け入れ条件: 再起動後も postgres が自動起動し、`pg_dump` が定期バックアップへ載る
+
+リポジトリ側の完了内容:
+
+- `compose.yaml`: `postgres:16`、healthcheck、`restart: unless-stopped`、`infra/pgdata`永続化、loopback bind既定
+- `.env.example`: 秘密値を含まない設定テンプレート（実`.env`はgitignore）
+- `docs/docker_setup.md`: Ubuntu 24.04導入・起動・確認・更新・rollback手順
+- `scripts/backup.sh` / `scripts/restore.sh`: custom形式`pg_dump`と明示opt-inの破壊的`pg_restore`
+- fake dockerを使う分離テスト。実DB・実コンテナはテストから操作しない
+
+残る完了条件はサブPC実機でのDocker導入、再起動後の自動復旧、実dump/restore訓練。
 
 ### I2: 実行ログを PostgreSQL へ（最初のストア移行）
 
@@ -135,12 +145,12 @@
 
 ## 直近の次アクション
 
-1. **I1**: `compose.yaml` + `.env.example` + 導入 README（Docker 導入自体はサブPCでの作業）
-2. **I2**: `PostgresRunLogger` + Alembic migration + 切替テスト（リポジトリ内で完結）
+1. **I1実機確認**: サブPCへDockerを導入し、`docs/docker_setup.md`に従ってhealth・再起動・実`pg_dump`・検証・復元訓練を完了する
+2. **I2**: `PostgresRunLogger` + Alembic migration + SQLite/PG切替テスト（リポジトリ内で完結）
 3. **I3**: `/metrics` エンドポイント + 計装 + Grafana dashboard JSON + alerts
 
-I1 の Docker 導入と実ノードへの反映はサブPC実機（または SSH）が必要。
-I2/I3 はこのリポジトリだけで実装・テストできる。
+I1のリポジトリ実装は完了したが、受け入れ条件の最終判定にはサブPC実機（またはSSH）が必要。
+実機確認と並行してI2の実装は開始できる。
 
 ## 関連文書
 

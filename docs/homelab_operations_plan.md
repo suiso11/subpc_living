@@ -327,6 +327,8 @@ Inventoryから複数Provider構成を組み立て、失敗時は従来の単一
 - 月1回以上の復元確認: `docs/runbook.md`に訓練手順を記載
 
 頻度や保存先はcron/systemd timerでの運用開始時にデータ量を実測して決める。
+I1以降はcompose PostgreSQLも対象となり、`POSTGRES_BACKUP_MODE=required`でcustom形式の
+`postgres.dump`をmanifestへ含める。復元は`--restore-postgres`を明示した場合だけ実行する。
 
 ### N7: 運用Runbook（完了）
 

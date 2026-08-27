@@ -17,6 +17,10 @@ data/
 config/discord.env
 config/web.env
 
+# Docker (I1): Postgres ランタイムデータとバックアップは管理外
+infra/pgdata/
+backups/
+
 # モデル・バイナリ（サイズが大きいためgit管理外）
 # models/* (not models/) so the tracked Modelfile template below can be
 # re-included; git cannot re-include files under a fully excluded directory.
