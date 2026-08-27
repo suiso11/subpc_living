@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import unittest
 from pathlib import Path
 
@@ -9,8 +8,8 @@ ROOT = Path(__file__).resolve().parents[1]
 STATIC = ROOT / "src" / "web" / "static"
 
 
-class HallmarkWebThemeTest(unittest.TestCase):
-    def test_all_pages_load_hallmark_runtime_and_routes(self) -> None:
+class WebThemeTest(unittest.TestCase):
+    def test_all_pages_load_runtime_theme_and_routes(self) -> None:
         expected_active = {
             "index.html": "話す",
             "tasks.html": "やること",
@@ -20,7 +19,7 @@ class HallmarkWebThemeTest(unittest.TestCase):
         for filename, label in expected_active.items():
             html = (STATIC / filename).read_text(encoding="utf-8")
             self.assertIn('/static/tokens.css', html)
-            self.assertIn('/static/hallmark-theme.css', html)
+            self.assertIn('/static/theme.css', html)
             self.assertNotIn('/static/pop-theme.css', html)
             self.assertNotIn('/static/shell-theme.css', html)
             self.assertIn(f'class="top-nav-link active" href=', html)
@@ -35,19 +34,10 @@ class HallmarkWebThemeTest(unittest.TestCase):
             self.assertNotIn('maximum-scale', html)
             self.assertNotIn('user-scalable', html)
 
-    def test_hallmark_stamp_tokens_and_instrument(self) -> None:
-        css = (STATIC / "hallmark-theme.css").read_text(encoding="utf-8")
-        self.assertTrue(css.startswith('/* Hallmark · genre: atmospheric · macrostructure: Stat-Led · theme: Midnight · enrichment: Tier-A expanded growth instrument · nav: N13 · footer: Ft2 */'))
-        for token in (
-            'genre: atmospheric',
-            'macrostructure: Stat-Led',
-            'theme: Midnight',
-            'enrichment: Tier-A expanded growth instrument',
-            'nav: N13',
-            'footer: Ft2',
-            '.shell-command-dialog',
-            'command-crossfade',
-        ):
+    def test_theme_tokens_and_instrument(self) -> None:
+        css = (STATIC / "theme.css").read_text(encoding="utf-8")
+        self.assertTrue(css.startswith('/* subpc_living web theme:'))
+        for token in ('.shell-command-dialog', 'command-crossfade'):
             self.assertIn(token, css)
         tokens = (STATIC / "tokens.css").read_text(encoding="utf-8")
         portable = (ROOT / "tokens.css").read_text(encoding="utf-8")
@@ -58,12 +48,9 @@ class HallmarkWebThemeTest(unittest.TestCase):
         self.assertIn('50)', tokens)
         self.assertIn('18)', tokens)
         self.assertIn('--font-display: "Geist"', tokens)
-        self.assertIn('macrostructure: Stat-Led', css)
-        self.assertEqual(log := json.loads((ROOT / ".hallmark" / "log.json").read_text(encoding="utf-8")), sorted(log, key=lambda entry: entry["date"], reverse=True))
-        self.assertEqual(log[0]["theme"], "Midnight")
 
     def test_mobile_command_trigger_collapses_without_losing_label(self) -> None:
-        css = (STATIC / "hallmark-theme.css").read_text(encoding="utf-8")
+        css = (STATIC / "theme.css").read_text(encoding="utf-8")
         js = (STATIC / "shell-ui.js").read_text(encoding="utf-8")
         self.assertIn('@media (max-width: 700px)', css)
         self.assertIn('.shell-command-trigger span { display: none; }', css)
@@ -73,24 +60,11 @@ class HallmarkWebThemeTest(unittest.TestCase):
         css = (STATIC / "style.css").read_text(encoding="utf-8")
         self.assertNotIn('100vw', css)
 
-    def test_hallmark_log_is_newest_first_array(self) -> None:
-        log = json.loads((ROOT / ".hallmark" / "log.json").read_text(encoding="utf-8"))
-        self.assertIsInstance(log, list)
-        self.assertGreater(len(log), 0)
-        required = {"date", "build", "macrostructure", "theme", "drop", "enrichment", "summary"}
-        dates: list[str] = []
-        for entry in log:
-            self.assertIsInstance(entry, dict)
-            self.assertTrue(required.issubset(entry.keys()), f"missing fields: {required - entry.keys()}")
-            self.assertRegex(entry["date"], r"^\d{4}-\d{2}-\d{2}$")
-            dates.append(entry["date"])
-        self.assertEqual(dates, sorted(dates, reverse=True))
-
-    def test_service_worker_caches_hallmark_revision(self) -> None:
+    def test_service_worker_caches_theme_revision(self) -> None:
         worker = (STATIC / "service-worker.js").read_text(encoding="utf-8")
-        self.assertIn("subpc-living-v31", worker)
+        self.assertIn("subpc-living-v32", worker)
         self.assertIn("/static/tokens.css", worker)
-        self.assertIn("/static/hallmark-theme.css", worker)
+        self.assertIn("/static/theme.css", worker)
         for asset in ("geist-latin.woff2", "instrument-serif-latin.woff2", "jetbrains-mono-latin.woff2", "LICENSES.txt"):
             self.assertIn(f"/static/fonts/{asset}", worker)
             self.assertTrue((STATIC / "fonts" / asset).is_file())
@@ -260,7 +234,7 @@ class HallmarkWebThemeTest(unittest.TestCase):
         close_idx = app.index("function closeSettings")
         self.assertIn("setSettingsScrollLock(false)", app[close_idx:close_idx + 600])
         # shell-command-open must remain present (coexistence contract)
-        self.assertIn('shell-command-open', (STATIC / "hallmark-theme.css").read_text(encoding="utf-8"))
+        self.assertIn('shell-command-open', (STATIC / "theme.css").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

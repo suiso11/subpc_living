@@ -1,4 +1,4 @@
-const CACHE_NAME = 'subpc-living-v31';
+const CACHE_NAME = 'subpc-living-v32';
 const STATIC_ASSETS = [
   '/',
   '/?source=pwa',
@@ -11,7 +11,7 @@ const STATIC_ASSETS = [
   '/static/achievements.html',
   '/static/tokens.css',
   '/static/style.css',
-  '/static/hallmark-theme.css',
+  '/static/theme.css',
   '/static/fonts/geist-latin.woff2',
   '/static/fonts/instrument-serif-latin.woff2',
   '/static/fonts/jetbrains-mono-latin.woff2',

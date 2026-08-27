@@ -83,7 +83,7 @@ class AndroidPwaTest(unittest.TestCase):
 
     def test_service_worker_v31_precaches_android_assets(self) -> None:
         worker = (STATIC / "service-worker.js").read_text(encoding="utf-8")
-        self.assertIn("subpc-living-v31", worker)
+        self.assertIn("subpc-living-v32", worker)
         self.assertIn("'/?source=pwa'", worker)
         for name in ("icon-192.png", "icon-512.png", "icon-maskable-512.png", "manifest.json"):
             self.assertIn(f"/static/{name}", worker)

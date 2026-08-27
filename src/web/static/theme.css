@@ -1,5 +1,5 @@
-/* Hallmark · genre: atmospheric · macrostructure: Stat-Led · theme: Midnight · enrichment: Tier-A expanded growth instrument · nav: N13 · footer: Ft2 */
-/* The runtime theme is intentionally additive: tokens carry the palette, style.css carries layout. */
+/* subpc_living web theme: dark atmospheric shell with expanded growth instrument. */
+/* Additive layer: tokens.css owns values; style.css owns shared layout. */
 
 body { background-color: var(--color-paper-0); }
 .site-header, .task-header.site-header { color: var(--ink); }
