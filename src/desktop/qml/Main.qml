@@ -1,6 +1,7 @@
 pragma ComponentBehavior: Bound
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Controls as QQC2
 import QtQuick.Layouts
 import QtQuick.Window
 import "."
@@ -287,7 +288,7 @@ ApplicationWindow {
         padding: 20
         closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
         background: Rectangle { radius: Theme.radiusLarge; color: Theme.backgroundRaised; border.color: Theme.line }
-        Overlay.modal: Rectangle { color: "#990B0605" }
+        QQC2.Overlay.modal: Rectangle { color: "#990B0605" }
         contentItem: ColumnLayout {
             id: settingsColumn
             spacing: 12

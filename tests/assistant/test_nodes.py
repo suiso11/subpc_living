@@ -14,6 +14,8 @@ from src.assistant.nodes import (
 )
 from src.assistant.run_logger import SQLiteRunLogger
 from src.llm.providers.fake import FakeProvider
+from src.llm.providers.local_openai import LocalOpenAICompatibleProvider
+from src.llm.providers.ollama import OllamaProvider
 
 
 class NodeInventoryTest(unittest.TestCase):
@@ -311,6 +313,229 @@ class NodeInventoryTest(unittest.TestCase):
         self.assertEqual(len(inventory.providers()), 2)
         self.assertEqual(inventory.default_provider_id, "local-strong")
         self.assertEqual(inventory.fallback_provider_ids, ("local-fast",))
+        self.assertTrue(
+            all(spec.provider_kind == "ollama" for spec in inventory.providers())
+        )
+
+    def test_default_provider_kind_is_ollama(self) -> None:
+        inventory = NodeInventory.from_mapping(self.mapping())
+
+        for spec in inventory.providers():
+            self.assertEqual(spec.provider_kind, "ollama")
+            self.assertEqual(spec.api_key_env, "")
+
+    def test_ollama_remote_hostname_remains_allowed(self) -> None:
+        data = self.mapping()
+        data["nodes"][1]["providers"][0]["base_url"] = "http://remote-main:11434"
+
+        inventory = NodeInventory.from_mapping(data)
+
+        self.assertEqual(
+            inventory.providers()[1].base_url, "http://remote-main:11434"
+        )
+        self.assertEqual(inventory.providers()[1].provider_kind, "ollama")
+
+    def test_openai_compatible_spec_parses_with_key_env_name(self) -> None:
+        data = self.mapping()
+        data["nodes"][0]["providers"][0].update(
+            {
+                "provider_kind": "openai_compatible",
+                "base_url": "http://localhost:8080/v1",
+                "api_key_env": "NODE_API_KEY",
+            }
+        )
+
+        inventory = NodeInventory.from_mapping(data)
+
+        spec = inventory.providers()[0]
+        self.assertEqual(spec.provider_kind, "openai_compatible")
+        self.assertEqual(spec.api_key_env, "NODE_API_KEY")
+
+    def test_validation_rejects_unknown_provider_kind(self) -> None:
+        for kind in ("anthropic", "OPENAI_COMPATIBLE", 1, None):
+            with self.subTest(kind=kind):
+                data = self.mapping()
+                data["nodes"][0]["providers"][0]["provider_kind"] = kind
+                with self.assertRaisesRegex(
+                    InvalidNodeInventoryError, "provider_kind"
+                ):
+                    NodeInventory.from_mapping(data)
+
+    def test_validation_rejects_non_string_api_key_env(self) -> None:
+        for value in (1, ["K"], None):
+            with self.subTest(value=value):
+                data = self.mapping()
+                data["nodes"][0]["providers"][0]["api_key_env"] = value
+                with self.assertRaisesRegex(
+                    InvalidNodeInventoryError, "api_key_env"
+                ):
+                    NodeInventory.from_mapping(data)
+
+    def test_validation_rejects_non_loopback_openai_compatible_url(self) -> None:
+        cases = (
+            "http://main-pc:8080/v1",
+            "http://10.0.0.5:8080/v1",
+            "http://0.0.0.0:8080/v1",
+            "https://example.com/v1",
+            "ftp://localhost:8080/v1",
+        )
+        for url in cases:
+            with self.subTest(url=url):
+                data = self.mapping()
+                data["nodes"][0]["providers"][0].update(
+                    {
+                        "provider_kind": "openai_compatible",
+                        "base_url": url,
+                    }
+                )
+                with self.assertRaises(InvalidNodeInventoryError):
+                    NodeInventory.from_mapping(data)
+
+    def test_validation_accepts_loopback_openai_compatible_url(self) -> None:
+        for url in (
+            "http://localhost:8080/v1",
+            "https://127.0.0.1:8443/v1",
+            "http://[::1]:8080/v1",
+        ):
+            with self.subTest(url=url):
+                data = self.mapping()
+                data["nodes"][0]["providers"][0].update(
+                    {
+                        "provider_kind": "openai_compatible",
+                        "base_url": url,
+                    }
+                )
+                NodeInventory.from_mapping(data)
+
+    def test_default_builder_constructs_ollama_provider(self) -> None:
+        inventory = NodeInventory.from_mapping(self.mapping())
+
+        _, registry = build_node_service(inventory)
+
+        provider = registry.get("local-strong").provider
+        self.assertIsInstance(provider, OllamaProvider)
+        self.assertEqual(provider.provider_id, "local-strong")
+        self.assertEqual(provider.model, "strong-model")
+        self.assertTrue(registry.get("local-strong").local)
+
+    def test_default_builder_constructs_local_openai_provider(self) -> None:
+        data = self.mapping()
+        data["nodes"][0]["providers"][0].update(
+            {
+                "provider_kind": "openai_compatible",
+                "base_url": "http://localhost:8080/v1",
+            }
+        )
+        inventory = NodeInventory.from_mapping(data)
+
+        _, registry = build_node_service(inventory)
+
+        provider = registry.get("local-strong").provider
+        self.assertIsInstance(provider, LocalOpenAICompatibleProvider)
+        self.assertEqual(provider.provider_id, "local-strong")
+        self.assertEqual(provider.model, "strong-model")
+        self.assertEqual(provider._api_key, "")
+
+    def test_api_key_env_resolved_at_build_without_persistence(self) -> None:
+        data = self.mapping()
+        data["nodes"][0]["providers"][0].update(
+            {
+                "provider_kind": "openai_compatible",
+                "base_url": "http://localhost:8080/v1",
+                "api_key_env": "NODE_API_KEY",
+            }
+        )
+
+        with patch.dict(os.environ, {"NODE_API_KEY": "secret-value"}):
+            inventory = NodeInventory.from_mapping(data)
+            spec = inventory.providers()[0]
+            self.assertEqual(spec.api_key_env, "NODE_API_KEY")
+            self.assertNotIn("secret-value", repr(spec))
+            _, registry = build_node_service(inventory)
+
+        provider = registry.get("local-strong").provider
+        self.assertIsInstance(provider, LocalOpenAICompatibleProvider)
+        self.assertEqual(provider._api_key, "secret-value")
+        self.assertNotIn("secret-value", repr(spec))
+
+    def test_api_key_env_unset_yields_no_key(self) -> None:
+        data = self.mapping()
+        data["nodes"][0]["providers"][0].update(
+            {
+                "provider_kind": "openai_compatible",
+                "base_url": "http://localhost:8080/v1",
+                "api_key_env": "NODE_API_KEY_MISSING",
+            }
+        )
+        inventory = NodeInventory.from_mapping(data)
+
+        _, registry = build_node_service(inventory)
+
+        provider = registry.get("local-strong").provider
+        self.assertIsInstance(provider, LocalOpenAICompatibleProvider)
+        self.assertEqual(provider._api_key, "")
+
+    def test_validation_rejects_openai_compatible_with_local_false(self) -> None:
+        data = self.mapping()
+        data["nodes"][0]["providers"][0].update(
+            {
+                "provider_kind": "openai_compatible",
+                "base_url": "http://localhost:8080/v1",
+                "local": False,
+            }
+        )
+
+        with self.assertRaisesRegex(InvalidNodeInventoryError, "local"):
+            NodeInventory.from_mapping(data)
+
+    def test_openai_compatible_registers_local_from_validated_spec(self) -> None:
+        data = self.mapping()
+        data["nodes"][0]["providers"][0].update(
+            {
+                "provider_kind": "openai_compatible",
+                "base_url": "http://localhost:8080/v1",
+            }
+        )
+        inventory = NodeInventory.from_mapping(data)
+
+        _, registry = build_node_service(inventory)
+
+        spec = inventory.providers()[0]
+        self.assertTrue(spec.local)
+        self.assertTrue(registry.get("local-strong").local)
+
+    def test_blank_provider_kind_normalizes_to_ollama(self) -> None:
+        for value in ("", "   "):
+            with self.subTest(value=value):
+                data = self.mapping()
+                data["nodes"][0]["providers"][0]["provider_kind"] = value
+
+                inventory = NodeInventory.from_mapping(data)
+
+                spec = inventory.providers()[0]
+                self.assertEqual(spec.provider_kind, "ollama")
+                self.assertEqual(spec.api_key_env, "")
+
+    def test_injected_factory_bypasses_default_builder(self) -> None:
+        data = self.mapping()
+        data["nodes"][0]["providers"][0].update(
+            {
+                "provider_kind": "openai_compatible",
+                "base_url": "http://localhost:8080/v1",
+            }
+        )
+        inventory = NodeInventory.from_mapping(data)
+        captured: list = []
+
+        def factory(spec):
+            captured.append(spec)
+            return FakeProvider(spec.provider_id, model=spec.model)
+
+        _, registry = build_node_service(inventory, provider_factory=factory)
+
+        self.assertIsInstance(registry.get("local-strong").provider, FakeProvider)
+        self.assertEqual(captured[0].provider_kind, "openai_compatible")
+        self.assertEqual(captured[0].provider_id, "local-strong")
 
     def test_validation_rejects_empty_nodes(self) -> None:
         with self.assertRaisesRegex(InvalidNodeInventoryError, "nodes"):

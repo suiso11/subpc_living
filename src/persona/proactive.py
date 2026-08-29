@@ -20,6 +20,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Callable
 
+# stop() が worker 終了を待つ最大秒数。
+_STOP_JOIN_TIMEOUT = 5.0
+
 from src.persona.profile import UserProfile
 from src.companion.calendar import CalendarSource
 from src.companion.contracts import CompanionState
@@ -63,6 +66,7 @@ class ProactiveEngine:
         companion_policy: Optional[DeterministicProactivePolicy] = None,
         calendar_source: Optional[CalendarSource] = None,
         state_path: Optional[str] = None,
+        thread_factory: Optional[Callable[..., threading.Thread]] = None,
     ):
         """
         Args:
@@ -80,6 +84,8 @@ class ProactiveEngine:
                 profile ベース判定を維持)
             state_path: cooldown 状態 (_last_fired) を永続化する JSON パス。
                 None なら in-memory のみで保存・読み込みを行わない
+            thread_factory: バックグラウンド worker 生成用の注入フック (テスト用)。
+                None のとき既定の threading.Thread を使う。start() ごとに1回呼ばれる。
         """
         self.profile = profile
         self.check_interval = check_interval
@@ -101,9 +107,16 @@ class ProactiveEngine:
         # スキップして二重通知を防ぐ。
         self.skip_gcal_schedule = False
 
+        self._thread_factory = thread_factory or threading.Thread
+        self._lock = threading.Lock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._callback: Optional[Callable[[str, str], None]] = None
+
+        # 直前の CompanionState ポーリング結果。離席→復帰の遷移判定に使う。
+        # None は未観測 (初回ポーリング) を表し、通常の present+idle を復帰と
+        # 誤認しないよう None は復帰扱いにしない。
+        self._last_companion_state: Optional[CompanionState] = None
 
         # 発火抑制: 同じトリガーが短時間で連続発火しないように
         self._last_fired: dict[str, float] = {}
@@ -123,7 +136,7 @@ class ProactiveEngine:
         self._last_user_activity: float = time.time()
         self._conversation_prompt_index = datetime.now().toordinal() % len(CONVERSATION_PROMPTS)
 
-    def start(self, callback: Callable[[str, str], None]) -> None:
+    def start(self, callback: Callable[[str, str], None]) -> bool:
         """
         プロアクティブエンジンを起動
 
@@ -132,23 +145,101 @@ class ProactiveEngine:
                 trigger_type: "schedule_remind", "break_suggest", "greeting",
                     "pc_alert", "conversation_start"
                 message: AIが発話すべきメッセージテキスト
+
+        Returns:
+            True: ライブな worker が今回起動された。
+            False: 重複起動、旧 worker が生存中、worker 生成・起動失敗、即死。
+                生例外は外部へ露出しない (fail-soft)。
         """
-        self._callback = callback
-        self._running = True
-        self._started_at = time.time()
-        self._thread = threading.Thread(target=self._check_loop, daemon=True)
-        self._thread.start()
+        with self._lock:
+            if self._running:
+                return False
+            if self._thread is not None:
+                try:
+                    if self._thread.is_alive():
+                        return False
+                except Exception:
+                    return False
+
+            try:
+                thread = self._thread_factory(target=self._check_loop, daemon=True)
+            except Exception:
+                return False
+
+            # 所有権を thread.start() より先に確定させる (partially live worker を保持するため)
+            self._callback = callback
+            self._started_at = time.time()
+            self._running = True
+            self._thread = thread
+
+            try:
+                thread.start()
+            except Exception:
+                self._running = False
+                self._callback = None
+                try:
+                    alive = thread.is_alive()
+                except Exception:
+                    alive = True
+                # 部分的に起動して生存した worker は破棄せず所有権を保持する
+                self._thread = thread if alive else None
+                return False
+
+        # 即死検出: 起動直後に worker が死んでいたら失敗扱い (所有権は保持)
+        try:
+            thread.join(timeout=0)
+        except Exception:
+            pass
+        if not thread.is_alive():
+            self._running = False
+            return False
+        return True
 
     def stop(self) -> None:
-        """エンジンを停止"""
-        self._running = False
-        if self._thread:
-            self._thread.join(timeout=5)
-            self._thread = None
+        """エンジンを停止 (冪等)
+
+        タイムアウトで生存している worker は参照を保持して回収しない。
+        死亡を確認できたときだけ参照を破棄する。join / is_alive の失敗でも
+        生例外は露出しない。
+        """
+        with self._lock:
+            self._running = False
+            thread = self._thread
+
+        if thread is None:
+            return
+
+        try:
+            thread.join(timeout=_STOP_JOIN_TIMEOUT)
+        except Exception:
+            return
+
+        with self._lock:
+            try:
+                alive = thread.is_alive()
+            except Exception:
+                alive = True
+            if self._thread is thread and not alive:
+                self._thread = None
 
     @property
     def is_running(self) -> bool:
-        return self._running
+        """リクエストされた起動状態と、実際に生存している worker の両方が
+        成立するときだけ True。
+
+        予期せぬ worker 死亡や停止後 (join タイムアウト) の状態を「稼働中」と
+        報告しない。停止保留中に保持される生存 worker の所有権は _thread に残り、
+        再起動をブロックし続ける。
+        """
+        if not self._running:
+            return False
+        thread = self._thread
+        if thread is None:
+            return False
+        try:
+            return thread.is_alive()
+        except Exception:
+            return False
 
     def notify_user_activity(self) -> None:
         """ユーザーの操作を通知し、連続作業セッションを更新する。
@@ -195,6 +286,18 @@ class ProactiveEngine:
         if state.activity_mode == "away" or not state.present:
             return "away"
         return None
+
+    def _away_return_due(self, prev: Optional[CompanionState]) -> bool:
+        """直前のポーリング状態が離席・不在なら真の離席復帰とみなす。
+
+        未観測 (None) や直前も present の場合は False にし、通常の present+idle
+        を away_return と誤認しない。離席復帰は state 単体では判別できないため、
+        ProactiveEngine が保持する前回ポーリング結果 (self._last_companion_state)
+        を遷移情報として使う。
+        """
+        return prev is not None and (
+            prev.activity_mode == "away" or not prev.present
+        )
 
     def _resolve_next_event_unix(self, now_unix: float) -> float | None:
         """次の予定の開始時刻 (unix) を返す。見つからない場合は None。"""
@@ -317,51 +420,16 @@ class ProactiveEngine:
                     last_fired=dict(self._last_fired),
                 )
                 decision = self.companion_policy.decide(ctx)
-                if not decision.should_act or decision.action_kind != "schedule_remind":
+                if decision.should_act and decision.action_kind == "schedule_remind":
+                    self._fire_schedule_remind()
                     return
-                # Policy が schedule_remind を指示 → メッセージ生成
-                if not self._can_fire("schedule_remind"):
-                    return
-                if self.calendar_source is not None:
-                    self._check_schedule_remind_calendar()
-                    return
-                # profile ベースのメッセージ生成
-                # Policy が should_act=True としたので、次の予定を特定して
-                # 適応的なメッセージを生成する。5-15分のフィルタは不要。
-                now = datetime.now()
-                today_schedule = self.profile.get_today_schedule()
-                # 最小の正deltaを持つイベント (次に来る予定) を探す
-                best_item = None
-                best_title = ""
-                best_diff: float | None = None
-                for item in today_schedule:
-                    time_str = item.get("time", "")
-                    title = item.get("title", "")
-                    if not time_str or not title:
-                        continue
-                    if self.skip_gcal_schedule and str(item.get("note", "")).startswith("gcal:"):
-                        continue
-                    try:
-                        hour, minute = map(int, time_str.split(":"))
-                        event_time = now.replace(hour=hour, minute=minute, second=0)
-                        diff_minutes = (event_time - now).total_seconds() / 60
-                        if diff_minutes > 0 and (best_diff is None or diff_minutes < best_diff):
-                            best_diff = diff_minutes
-                            best_title = title
-                            best_item = item
-                    except (ValueError, TypeError):
-                        pass
-                # diff_minutes が None（予定が見つからない）場合は発火しない
-                if best_diff is None or best_item is None:
-                    return
-                # 適応的なメッセージテキスト
-                if best_diff <= 1:
-                    msg = f"もうすぐ「{best_title}」の時間です。"
-                elif best_diff <= 5:
-                    msg = f"あと{int(best_diff)}分で「{best_title}」の時間です。"
-                else:
-                    msg = f"あと{int(best_diff)}分で「{best_title}」の時間です。準備は大丈夫ですか？"
-                self._fire("schedule_remind", msg)
+                # focused 中でも予定接近ならリマインドする (従来契約: interruptible 不問)。
+                # 離席・不在は Policy が silent にするため、ここでは focused のみ扱う。
+                if state.activity_mode == "focused" and next_event_at is not None:
+                    delta = next_event_at - now_unix
+                    if 0.0 <= delta <= self.companion_policy.schedule_lead_seconds:
+                        self._fire_schedule_remind()
+                        return
                 return
 
         # --- 従来経路 ---
@@ -416,6 +484,52 @@ class ProactiveEngine:
         msg = f"あと{minutes}分で「{title}」の時間です。準備は大丈夫ですか？"
         self._fire("schedule_remind", msg)
 
+    def _fire_schedule_remind(self) -> None:
+        """Policy が schedule_remind を許可したときの実際の発火処理。
+
+        CalendarSource があればそちらで、なければ profile の次の予定から
+        適応的なメッセージを生成して発火する。cooldown はエンジン側で確認する。
+        """
+        if not self._can_fire("schedule_remind"):
+            return
+        if self.calendar_source is not None:
+            self._check_schedule_remind_calendar()
+            return
+        now = datetime.now()
+        today_schedule = self.profile.get_today_schedule()
+        # 最小の正deltaを持つイベント (次に来る予定) を探す
+        best_item = None
+        best_title = ""
+        best_diff: float | None = None
+        for item in today_schedule:
+            time_str = item.get("time", "")
+            title = item.get("title", "")
+            if not time_str or not title:
+                continue
+            if self.skip_gcal_schedule and str(item.get("note", "")).startswith("gcal:"):
+                continue
+            try:
+                hour, minute = map(int, time_str.split(":"))
+                event_time = now.replace(hour=hour, minute=minute, second=0)
+                diff_minutes = (event_time - now).total_seconds() / 60
+                if diff_minutes > 0 and (best_diff is None or diff_minutes < best_diff):
+                    best_diff = diff_minutes
+                    best_title = title
+                    best_item = item
+            except (ValueError, TypeError):
+                pass
+        # diff_minutes が None（予定が見つからない）場合は発火しない
+        if best_diff is None or best_item is None:
+            return
+        # 適応的なメッセージテキスト
+        if best_diff <= 1:
+            msg = f"もうすぐ「{best_title}」の時間です。"
+        elif best_diff <= 5:
+            msg = f"あと{int(best_diff)}分で「{best_title}」の時間です。"
+        else:
+            msg = f"あと{int(best_diff)}分で「{best_title}」の時間です。準備は大丈夫ですか？"
+        self._fire("schedule_remind", msg)
+
     def _check_break_suggest(self) -> None:
         """長時間作業の休憩提案: 2時間連続で通知"""
         # --- Policy 経路 ---
@@ -425,16 +539,27 @@ class ProactiveEngine:
             except Exception:
                 state = None
             if state is not None:
-                now_unix = time.time()
+                # 離席・不在中と集中割り込み不可は黙る (安全のための抑制を維持)
+                if state.activity_mode == "away" or not state.present:
+                    return
+                if state.activity_mode == "focused" and not state.interruptible:
+                    return
                 ctx = PolicyContext(
                     state=state,
-                    now=now_unix,
+                    now=time.time(),
                     last_fired=dict(self._last_fired),
                 )
                 decision = self.companion_policy.decide(ctx)
-                if not decision.should_act or decision.action_kind != "break_suggest":
+                if decision.should_act and decision.action_kind == "away_return":
+                    # 実際の離席→復帰遷移は away_return が担当する。遷移でない通常の
+                    # present+idle は policy の updated_at 近接ヒューリスティックで
+                    # away_return と判定されただけなので、break_suggest を妨げない。
+                    if self._away_return_due(self._last_companion_state):
+                        return
+                elif not decision.should_act or decision.action_kind != "break_suggest":
+                    # Policy が break_suggest を指示したときのみ休憩提案を出す。
+                    # silent / schedule_remind のときは二重発火を避けて黙る。
                     return
-                # Policy が break_suggest を指示 → メッセージ生成
                 if not self._can_fire("break_suggest"):
                     return
                 if self._session_start_time is None:
@@ -472,6 +597,12 @@ class ProactiveEngine:
         except Exception:
             return
         if state is None:
+            return
+        prev = self._last_companion_state
+        self._last_companion_state = state
+        # 実際の離席→復帰遷移だけを扱う。通常の present+idle (直前も present) や
+        # 初回ポーリング (未観測) を復帰と誤認しない。
+        if not self._away_return_due(prev):
             return
         if not self._can_fire("away_return"):
             return

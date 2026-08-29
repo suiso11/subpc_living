@@ -66,8 +66,12 @@ def _make_engine(
 class ScheduleRemindPolicyTest(unittest.TestCase):
     """_check_schedule_remind with companion_getter → policy.decide gating."""
 
-    def test_focused_not_interruptible_no_fire(self):
-        """a) focused + interruptible=False + schedule approaching: no fire."""
+    def test_focused_not_interruptible_schedule_approaching_fires(self):
+        """a) focused + interruptible=False + schedule approaching: fires.
+
+        ProactiveEngine の従来契約では schedule_remind は離席・不在のみ抑止し、
+        focused (interruptible 不問) でも予定接近ならリマインドする。
+        """
         now = 1000000.0
         state = _make_state(
             activity_mode="focused",
@@ -76,7 +80,8 @@ class ScheduleRemindPolicyTest(unittest.TestCase):
             updated_at=now - 10,
         )
         # next_event_at is within schedule_lead_seconds → policy would see it
-        # but focused + not interruptible → silent
+        # but focused + not interruptible → silent. Engine's legacy contract
+        # still allows the remind for focused.
         cal = mock.MagicMock()
         cal.next_event.return_value = mock.MagicMock(start_at=now + 300, title="会議")
         engine = _make_engine(
@@ -91,7 +96,8 @@ class ScheduleRemindPolicyTest(unittest.TestCase):
             mock_time.sleep = mock.MagicMock()
             engine._check_schedule_remind()
 
-        self.assertEqual(fired, [])
+        self.assertEqual(len(fired), 1)
+        self.assertEqual(fired[0][0], "schedule_remind")
 
     def test_focused_interruptible_schedule_approaching_fires(self):
         """b) focused + interruptible=True + schedule approaching: fires."""
@@ -200,8 +206,14 @@ class AwayReturnTest(unittest.TestCase):
     """_check_away_return fires when policy decides away_return."""
 
     def test_away_return_fires(self):
-        """d) present=True, activity_mode=idle, updated_at recent: fires."""
+        """d) 離席→復帰遷移 (直前ポーリングが away) で fires."""
         now = 1000000.0
+        prev_away = _make_state(
+            activity_mode="away",
+            present=False,
+            interruptible=False,
+            updated_at=now - 120,
+        )
         state = _make_state(
             activity_mode="idle",
             present=True,
@@ -210,6 +222,7 @@ class AwayReturnTest(unittest.TestCase):
             updated_at=now - 10,  # 10s ago < away_return_seconds(60)
         )
         engine = _make_engine(companion_getter=lambda: state)
+        engine._last_companion_state = prev_away
         fired = []
         engine._callback = lambda kind, msg: fired.append((kind, msg))
 
@@ -221,6 +234,35 @@ class AwayReturnTest(unittest.TestCase):
         self.assertEqual(len(fired), 1)
         self.assertEqual(fired[0][0], "away_return")
         self.assertIn("おかえりなさい", fired[0][1])
+
+    def test_away_return_no_fire_when_ordinary_idle(self):
+        """直前も present の通常 idle は復帰と誤認しない."""
+        now = 1000000.0
+        prev_idle = _make_state(
+            activity_mode="idle",
+            present=True,
+            focused_since=None,
+            interruptible=True,
+            updated_at=now - 120,
+        )
+        state = _make_state(
+            activity_mode="idle",
+            present=True,
+            focused_since=None,
+            interruptible=True,
+            updated_at=now - 10,
+        )
+        engine = _make_engine(companion_getter=lambda: state)
+        engine._last_companion_state = prev_idle
+        fired = []
+        engine._callback = lambda kind, msg: fired.append((kind, msg))
+
+        with mock.patch("src.persona.proactive.time") as mock_time:
+            mock_time.time.return_value = now
+            mock_time.sleep = mock.MagicMock()
+            engine._check_away_return()
+
+        self.assertEqual(fired, [])
 
     def test_away_return_no_fire_when_stale(self):
         """updated_at too old → policy says silent → no fire."""
@@ -310,6 +352,12 @@ class AwayReturnNamePartTest(unittest.TestCase):
 
     def test_name_included(self):
         now = 1000000.0
+        prev_away = _make_state(
+            activity_mode="away",
+            present=False,
+            interruptible=False,
+            updated_at=now - 120,
+        )
         state = _make_state(
             activity_mode="idle",
             present=True,
@@ -320,6 +368,7 @@ class AwayReturnNamePartTest(unittest.TestCase):
             companion_getter=lambda: state,
             profile=_make_profile(name="太郎"),
         )
+        engine._last_companion_state = prev_away
         fired = []
         engine._callback = lambda kind, msg: fired.append((kind, msg))
 
@@ -413,6 +462,211 @@ class BreakSuggestCompanionGetterNoneTest(unittest.TestCase):
             engine._check_break_suggest()
 
         engine.companion_policy.decide.assert_not_called()
+
+
+class _FakeThread:
+    """実際には実行しない worker スレッド。start/join/is_alive を記録する。"""
+
+    def __init__(self, target=None, daemon=True) -> None:
+        self._target = target
+        self._daemon = daemon
+        self._alive = False
+        self.started = 0
+        self.join_timeouts: list[float | None] = []
+
+    def start(self) -> None:
+        self.started += 1
+        self._alive = True
+
+    def join(self, timeout=None) -> None:
+        self.join_timeouts.append(timeout)
+
+    def is_alive(self) -> bool:
+        return self._alive
+
+    def mark_dead(self) -> None:
+        self._alive = False
+
+
+class _DeadOnStartThread(_FakeThread):
+    """start() 直後に即死する worker。"""
+
+    def start(self) -> None:
+        self.started += 1
+        self._alive = False
+
+
+class _PartialStartThread(_FakeThread):
+    """start() が生存フラグを立てたまま例外を投げる worker。"""
+
+    def start(self) -> None:
+        self.started += 1
+        self._alive = True
+        raise RuntimeError("secret partial start detail")
+
+
+class ProactiveEngineLifecycleTest(unittest.TestCase):
+    """ProactiveEngine のスレッドライフサイクルを実スレッドなしで決定的に検証。
+
+    スレッドは注入した thread_factory の偽物で代替し、ネットワーク・センサー・
+    データ等の実リソースには一切触れない。
+    """
+
+    def _make_engine(self, factory=None):
+        threads: list[_FakeThread] = []
+
+        def _default_factory(target=None, daemon=True) -> _FakeThread:
+            t = _FakeThread(target=target, daemon=daemon)
+            threads.append(t)
+            return t
+
+        engine = ProactiveEngine(
+            profile=_make_profile(),
+            thread_factory=factory or _default_factory,
+        )
+        return engine, threads
+
+    def test_start_success_and_is_running(self) -> None:
+        engine, threads = self._make_engine()
+        self.assertTrue(engine.start(callback=lambda k, m: None))
+        self.assertTrue(engine.is_running)
+        self.assertEqual(len(threads), 1)
+        self.assertEqual(threads[0].started, 1)
+        self.assertIs(engine._thread, threads[0])
+
+    def test_duplicate_start_rejected(self) -> None:
+        engine, threads = self._make_engine()
+        self.assertTrue(engine.start(callback=lambda k, m: None))
+        self.assertFalse(engine.start(callback=lambda k, m: None))
+        self.assertEqual(len(threads), 1)
+        self.assertEqual(threads[0].started, 1)
+
+    def test_start_rejected_while_old_worker_live(self) -> None:
+        engine, threads = self._make_engine()
+        self.assertTrue(engine.start(callback=lambda k, m: None))
+        engine.stop()  # タイムアウト相当で生存継続 → 所有権保持
+        self.assertFalse(engine.is_running)
+        self.assertFalse(engine.start(callback=lambda k, m: None))  # 旧 worker が残る
+        self.assertEqual(len(threads), 1)
+
+    def test_restart_allowed_after_reap(self) -> None:
+        engine, threads = self._make_engine()
+        self.assertTrue(engine.start(callback=lambda k, m: None))
+        threads[0].mark_dead()
+        engine.stop()
+        self.assertIsNone(engine._thread)
+        self.assertTrue(engine.start(callback=lambda k, m: None))
+        self.assertTrue(engine.is_running)
+        self.assertEqual(len(threads), 2)
+        self.assertIs(engine._thread, threads[1])
+
+    def test_thread_factory_failure_returns_false(self) -> None:
+        engine, _ = self._make_engine()
+
+        def bad_factory(target=None, daemon=True):
+            raise RuntimeError("secret factory detail")
+
+        engine._thread_factory = bad_factory
+        started = engine.start(callback=lambda k, m: None)
+        self.assertFalse(started)
+        self.assertFalse(engine.is_running)
+        self.assertIsNone(engine._thread)
+
+    def test_thread_start_failure_returns_false(self) -> None:
+        class _RaiseOnStart(_FakeThread):
+            def start(self) -> None:
+                self.started += 1
+                raise RuntimeError("secret start detail")
+
+        engine, _ = self._make_engine(factory=lambda target=None, daemon=True: _RaiseOnStart())
+        started = engine.start(callback=lambda k, m: None)
+        self.assertFalse(started)
+        self.assertFalse(engine.is_running)
+        self.assertIsNone(engine._thread)
+
+    def test_partial_start_retains_live_ownership(self) -> None:
+        engine, _ = self._make_engine(factory=lambda target=None, daemon=True: _PartialStartThread())
+        started = engine.start(callback=lambda k, m: None)
+        self.assertFalse(started)
+        self.assertFalse(engine.is_running)
+        thread = engine._thread
+        self.assertIsNotNone(thread)
+        self.assertTrue(thread.is_alive())
+        # 生存 worker が残っている限り再起動は拒否される
+        self.assertFalse(engine.start(callback=lambda k, m: None))
+        self.assertIs(engine._thread, thread)
+        # 死亡を確認できた時点で所有権が解放され再起動できる
+        thread.mark_dead()
+        engine.stop()
+        self.assertIsNone(engine._thread)
+
+    def test_immediate_death_rejected(self) -> None:
+        engine, _ = self._make_engine(factory=lambda target=None, daemon=True: _DeadOnStartThread())
+        started = engine.start(callback=lambda k, m: None)
+        self.assertFalse(started)
+        self.assertFalse(engine.is_running)
+
+    def test_stop_retains_live_thread_on_timeout(self) -> None:
+        engine, threads = self._make_engine()
+        self.assertTrue(engine.start(callback=lambda k, m: None))
+        engine.stop()  # join は即時返るが fake は生存したまま → 回収しない
+        self.assertFalse(engine.is_running)
+        self.assertIs(engine._thread, threads[0])
+
+    def test_repeated_stop_reaps_after_death(self) -> None:
+        engine, threads = self._make_engine()
+        self.assertTrue(engine.start(callback=lambda k, m: None))
+        engine.stop()  # 生存中は回収されない
+        self.assertIs(engine._thread, threads[0])
+        threads[0].mark_dead()
+        engine.stop()  # 死亡確認で回収
+        self.assertIsNone(engine._thread)
+
+    def test_is_running_false_when_thread_dies_unexpectedly(self) -> None:
+        engine, threads = self._make_engine()
+        self.assertTrue(engine.start(callback=lambda k, m: None))
+        threads[0].mark_dead()
+        self.assertFalse(engine.is_running)
+
+    def test_is_running_requires_requested_running(self) -> None:
+        engine, threads = self._make_engine()
+        self.assertTrue(engine.start(callback=lambda k, m: None))
+        engine._running = False  # リクエスト停止状態 (生存 worker が残っても)
+        self.assertFalse(engine.is_running)
+
+
+class BridgeLifecycleCompatTest(unittest.TestCase):
+    """ProactiveEngine の start が bool を返すようになっても、ブリッジ呼び出し
+    (戻り値を無視・stop は例外を握りつぶす) が壊れないことを検証する。"""
+
+    def test_start_and_stop_do_not_raise(self) -> None:
+        from unittest import mock
+        from src.discord_bot.proactive_bridge import ProactiveBridge, ProactiveConfig
+        from src.persona.conversation_loop import ConversationLoopStore
+
+        class _FakeBot:
+            def get_channel(self, channel_id):
+                return None
+
+        config = ProactiveConfig(enabled=True, channel_id=1)
+        store = ConversationLoopStore(
+            None,
+            base_interval_sec=3600,
+            reply_timeout_sec=3600,
+        )
+        engine = mock.MagicMock()
+        bridge = ProactiveBridge(
+            bot=_FakeBot(),
+            state=mock.MagicMock(llm=None, llm_profiles={}),
+            config=config,
+            profile=None,
+            engine=engine,
+            conversation_store=store,
+        )
+        bridge.start()
+        engine.start.assert_called_once()
+        bridge.stop()
+        engine.stop.assert_called_once()
 
 
 if __name__ == "__main__":

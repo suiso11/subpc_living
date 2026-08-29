@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from src.discord_bot.task_ui import parse_due, split_quick_input
+from src.tasks.formatting import format_short_due
 from src.tasks.store import TaskStore
 
 UTC = timezone.utc
@@ -80,9 +81,7 @@ def _task_line(task: dict, store: TaskStore) -> str:
         due = "期限なし"
     else:
         local = due_at.astimezone(store.tz)
-        due = local.strftime("%-m/%-d")
-        if task.get("due_granularity") != "date":
-            due += local.strftime(" %H:%M")
+        due = format_short_due(local, with_time=task.get("due_granularity") != "date")
     priority = {"high": "・だいじ", "low": "・あとで"}.get(task.get("priority"), "")
     line = f"#{task['id']} {task['title']}（{due}{priority}）"
     if task.get("action_hint"):
@@ -223,9 +222,7 @@ class TaskChatEditor:
                 changes["due_at"] = due_at
                 changes["due_granularity"] = granularity
                 local = due_at.astimezone(store.tz)
-                display = local.strftime("%-m/%-d")
-                if granularity != "date":
-                    display += local.strftime(" %H:%M")
+                display = format_short_due(local, with_time=granularity != "date")
                 descriptions.append(f"期限を「{display}」")
 
         if not changes:

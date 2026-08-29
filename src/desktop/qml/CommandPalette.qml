@@ -1,6 +1,7 @@
 pragma ComponentBehavior: Bound
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Controls as QQC2
 import QtQuick.Layouts
 import "."
 
@@ -64,7 +65,7 @@ Popup {
         border.color: Theme.line
         border.width: 1
     }
-    Overlay.modal: Rectangle { color: "#990B0605" }
+    QQC2.Overlay.modal: Rectangle { color: "#990B0605" }
 
     contentItem: ColumnLayout {
         spacing: 0

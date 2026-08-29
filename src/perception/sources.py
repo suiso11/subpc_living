@@ -232,7 +232,7 @@ def _process_name_reader(pid: int) -> str:
         return psutil.Process(pid).name()
     except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess) as exc:
         raise ActivitySourceUnavailableError(
-            f"cannot resolve process name for pid {pid}: {type(exc).__name__}"
+            f"cannot resolve process name: {type(exc).__name__}"
         ) from exc
 
 

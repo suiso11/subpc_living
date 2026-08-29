@@ -19,10 +19,11 @@ VLM 負荷を節約する。ただし min-resend 秒 (デフォルト 600=10分)
 送信失敗はログを出してリトライ継続 (指数バックオフ上限 5 分、プロセスは死なない)。
 Ctrl+C で綺麗に終了する (シグナルハンドラは使わず KeyboardInterrupt で抜ける)。
 
-使い方の例:
-    python screen_agent.py --url http://100.x.x.x:8000 --token mysecret
-    python screen_agent.py --once            # 1 回だけ送って終了 (動作確認用)
+使い方の例 (画面キャプチャは明示的な opt-in が必要):
+    python screen_agent.py --enable-screen-capture --url http://host:8000 --token TOKEN
+    python screen_agent.py --enable-screen-capture --once  # 1 回だけ送って終了
 環境変数でも指定可:
+    SENSOR_SCREEN_CAPTURE_ENABLED=true
     SCREEN_AGENT_URL / SCREEN_AGENT_TOKEN / SCREEN_AGENT_INTERVAL
 """
 import argparse
@@ -63,6 +64,11 @@ SEND_TIMEOUT = 30.0
 
 
 # ------------------------- 純粋ロジック (テスト対象) -------------------------
+
+def is_exact_true(value: object) -> bool:
+    """明示的な true だけを opt-in として受け入れる。"""
+    return isinstance(value, str) and value.strip().lower() == "true"
+
 
 def image_hash(jpeg_bytes: bytes) -> str:
     """縮小後 JPEG バイトの sha256 hex を返す。"""
@@ -147,23 +153,27 @@ def send_jpeg(url: str, token: str, jpeg_bytes: bytes) -> None:
 # ------------------------- メインループ -------------------------
 
 def run(args) -> int:
+    if not (
+        getattr(args, "enable_screen_capture", False)
+        or is_exact_true(os.environ.get("SENSOR_SCREEN_CAPTURE_ENABLED"))
+    ):
+        _log("ERROR: screen capture is disabled")
+        return 4
+
     url = args.url
     token = args.token
     if not url:
-        _log("エラー: --url (または env SCREEN_AGENT_URL) が必要です")
+        _log("ERROR: URL is missing")
         return 2
     if not token:
-        _log("エラー: --token (または env SCREEN_AGENT_TOKEN) が必要です")
+        _log("ERROR: token is missing")
         return 2
 
     if not (HAS_MSS and HAS_PIL and HAS_HTTPX):
-        _log("エラー: 依存が不足しています。 pip install mss pillow httpx")
+        _log("ERROR: required dependencies are unavailable")
         return 3
 
-    _log(
-        f"screen_agent 起動: url={url} interval={args.interval}s "
-        f"max_edge={args.max_edge} once={args.once}"
-    )
+    _log("screen_agent started")
 
     last_hash = None
     last_sent_at = None
@@ -174,8 +184,8 @@ def run(args) -> int:
             # --- キャプチャ ---
             try:
                 jpeg = capture_jpeg(args.max_edge, DEFAULT_JPEG_QUALITY)
-            except Exception as e:
-                _log(f"キャプチャ失敗: {e} (次の間隔で再試行)")
+            except Exception:
+                _log("ERROR: capture failed; retrying")
                 if args.once:
                     return 1
                 time.sleep(args.interval)
@@ -200,27 +210,32 @@ def run(args) -> int:
                     last_hash = new_hash
                     last_sent_at = time.time()
                     backoff = BACKOFF_START
-                    _log(f"送信 OK ({len(jpeg)} bytes, hash={new_hash[:12]})")
-                except Exception as e:
-                    _log(f"送信失敗: {e} — {backoff:.0f}秒後にリトライ")
+                    _log("screen_agent sent image")
+                except Exception:
+                    _log("ERROR: send failed; retrying")
                     if args.once:
                         return 1
                     time.sleep(backoff)
                     backoff = next_backoff(backoff)
 
             if args.once:
-                _log("--once: 1回送信して終了")
+                _log("screen_agent completed once")
                 return 0
 
             time.sleep(args.interval)
 
     except KeyboardInterrupt:
-        _log("Ctrl+C を受信、終了します")
+        _log("screen_agent stopped")
         return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="画面キャプチャエージェント (メインPC 常駐)")
+    p.add_argument(
+        "--enable-screen-capture",
+        action="store_true",
+        help="enable screen capture (or set SENSOR_SCREEN_CAPTURE_ENABLED=true)",
+    )
     p.add_argument(
         "--url",
         default=os.environ.get("SCREEN_AGENT_URL", ""),

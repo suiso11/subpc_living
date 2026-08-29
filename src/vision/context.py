@@ -9,7 +9,7 @@ import copy
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 from dataclasses import dataclass
 
 from src.vision.camera import CameraCapture
@@ -47,6 +47,9 @@ class VisionContext:
         emotion_model_path: Optional[str] = None,
         width: int = 640,
         height: int = 480,
+        camera: Optional[CameraCapture] = None,
+        analyzer: Optional[VisionAnalyzer] = None,
+        thread_factory: Optional[Callable[..., threading.Thread]] = None,
     ):
         """
         Args:
@@ -55,44 +58,127 @@ class VisionContext:
             emotion_model_path: emotion-ferplus ONNX モデルのパス
             width: カメラ解像度（幅）
             height: カメラ解像度（高さ）
+            camera: CameraCapture の差し替え (テスト用)。None なら既定を生成
+            analyzer: VisionAnalyzer の差し替え (テスト用)。None なら既定を生成
+            thread_factory: 解析スレッド生成用ファクトリ (テスト用)。None なら threading.Thread
         """
-        self.camera = CameraCapture(
+        self.camera = camera or CameraCapture(
             device_id=camera_id,
             width=width,
             height=height,
             fps=15,
         )
-        self.analyzer = VisionAnalyzer(emotion_model_path=emotion_model_path)
+        self.analyzer = analyzer or VisionAnalyzer(emotion_model_path=emotion_model_path)
         self.analysis_interval = analysis_interval
 
         self._state = VisionState()
         self._state_lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
+        self._thread_factory = thread_factory or threading.Thread
         self._running = False
         self._paused = False
+        self._stop_pending = False
         self._last_result: Optional[VisionResult] = None
 
     def start(self) -> bool:
-        """カメラ + バックグラウンド解析を開始"""
-        if not self.camera.start():
+        """カメラ + バックグラウンド解析を開始
+
+        前回スレッドがまだ生存中 (stop の join がタイムアウトした等) の場合は
+        重複起動を防ぐため False を返し、新規スレッドを生成しない。
+        カメラ起動・スレッド生成・スレッド起動の失敗は捕捉して後始末し False を返す。
+        ただしスレッド起動例外でスレッドが実際に生存している場合は起動成功扱い
+        (requested-running) として True を返し、生存中のカメラも落とさない。
+        実際に生存したスレッドがあれば所有権を保持して重複起動を防ぐ。
+        死亡が確認できたスレッドだけを置き換えて再起動する。
+        """
+        if self._thread is not None and self._thread.is_alive():
             return False
 
+        thread: Optional[threading.Thread] = None
+        try:
+            if not self.camera.start():
+                return False
+            thread = self._thread_factory(target=self._analysis_loop, daemon=True)
+            thread.start()
+            if not thread.is_alive():
+                # 起動直後に死亡 (予期せぬ worker 死亡) した場合は後始末して False
+                self._abort_start(thread)
+                return False
+        except Exception:
+            if thread is not None and thread.is_alive():
+                # start 例外だがスレッドは生存: 起動成功扱い (requested-running) を保持し、
+                # 生存中のカメラを落とさない (ネスト整合性の維持)
+                self._thread = thread
+                self._running = True
+                self._paused = False
+                self._stop_pending = False
+                return True
+            self._abort_start(thread)
+            return False
+
+        self._thread = thread
         self._running = True
-        self._thread = threading.Thread(target=self._analysis_loop, daemon=True)
-        self._thread.start()
+        self._paused = False
+        self._stop_pending = False
         return True
 
-    def stop(self):
-        """停止してリソースを解放"""
+    def _abort_start(self, thread: Optional[threading.Thread]):
+        """start() 失敗時のベストエフォート後始末。
+
+        開始済みカメラは停止を試みる。実際に生存したスレッドがあれば所有権を
+        保持し (stop_pending)、重複起動を防ぐ。未生存スレッドは参照を破棄する。
+        """
         self._running = False
-        if self._thread:
-            self._thread.join(timeout=5)
+        self._paused = False
+        if thread is not None and thread.is_alive():
+            self._thread = thread
+            self._stop_pending = True
+        else:
             self._thread = None
-        self.camera.stop()
+            self._stop_pending = False
+        try:
+            self.camera.stop()
+        except Exception:
+            pass
+
+    def stop(self):
+        """停止してリソースを解放。join がタイムアウトしてもスレッド所有権は保持する。
+
+        カメラを先に停止/解放して解析スレッドのブロック (camera.get_frame() 等) を
+        解除してから join する。join がタイムアウトした場合は _thread を保持したまま
+        にし、重複再起動を防ぐ (_stop_pending を立てる)。
+        スレッドの死亡が確認できた時点で所有権を解放する (その後 start() で再起動可能)。
+        何度呼んでも安全 (冪等)。
+        """
+        self._running = False
+        self.camera.stop()  # 先にカメラを止めて解析スレッドをブロック解除する
+
+        thread = self._thread
+        if thread is not None:
+            if thread.is_alive():
+                thread.join(timeout=5)
+                if thread.is_alive():
+                    self._stop_pending = True
+                else:
+                    self._thread = None
+                    self._stop_pending = False
+            else:
+                self._thread = None
+                self._stop_pending = False
 
     @property
     def is_running(self) -> bool:
-        return self._running and self.camera.is_running
+        """active (スレッド生存 かつ 停止要求なし かつ カメラ稼働) のときだけ True。
+
+        解析スレッドが予期せず死んだ場合や stop_pending 中は False になる。
+        """
+        if not self._running:
+            return False
+        if self._stop_pending:
+            return False
+        if self._thread is None or not self._thread.is_alive():
+            return False
+        return self.camera.is_running
 
     def pause(self) -> None:
         """解析を一時停止（カメラは維持）"""
@@ -161,10 +247,16 @@ class VisionContext:
         return "\n".join(lines)
 
     def get_status(self) -> dict:
-        """APIレスポンス用の状態辞書"""
+        """APIレスポンス用の状態辞書
+
+        固定キーのみ。例外内容やパス等の可変情報は含めない。
+        """
         state = self.get_state()
         return {
             "running": self.is_running,
+            "paused": self._paused,
+            "stop_pending": self._stop_pending,
+            "thread_alive": self._thread.is_alive() if self._thread else False,
             "user_present": state.user_present,
             "person_count": state.person_count,
             "emotion": state.dominant_emotion,
@@ -177,25 +269,43 @@ class VisionContext:
     # --- 内部: バックグラウンド解析 ---
 
     def _analysis_loop(self):
-        """バックグラウンド解析ループ"""
-        # カメラ起動直後は安定するまで少し待つ
-        time.sleep(0.5)
+        """バックグラウンド解析ループ
 
-        while self._running:
-            if self._paused:
+        camera.get_frame / sleep / ループ本体の想定外例外は致命的とみなし、
+        _running を False にしてカメラをベストエフォートで停止する (finally)。
+        解析エラー (analyzer.analyze) は従来どおり警告のみでループを継続する。
+        finally は解析スレッドが死亡する前に完了するため、生存中スレッドは
+        start() の重複起動チェックで捕捉され、再起動が生存中の capture を
+        上書きすることはない。
+        """
+        try:
+            # カメラ起動直後は安定するまで少し待つ
+            time.sleep(0.5)
+
+            while self._running:
+                if self._paused:
+                    time.sleep(self.analysis_interval)
+                    continue
+
+                frame = self.camera.get_frame()
+                if frame is not None:
+                    try:
+                        result = self.analyzer.analyze(frame)
+                        self._update_state(result)
+                    except Exception:
+                        # 解析エラーは警告のみ（ループ継続）
+                        pass
+
                 time.sleep(self.analysis_interval)
-                continue
-
-            frame = self.camera.get_frame()
-            if frame is not None:
-                try:
-                    result = self.analyzer.analyze(frame)
-                    self._update_state(result)
-                except Exception as e:
-                    # 解析エラーは警告のみ（ループ継続）
-                    pass
-
-            time.sleep(self.analysis_interval)
+        except Exception:
+            # camera.get_frame / sleep / ループ本体の想定外例外は致命的
+            self._running = False
+        finally:
+            # ベストエフォートでカメラを停止 (冪等)
+            try:
+                self.camera.stop()
+            except Exception:
+                pass
 
     def _update_state(self, result: VisionResult):
         """解析結果から状態を更新 (thread-safe)"""

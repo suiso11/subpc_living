@@ -12,6 +12,14 @@ from contextlib import contextmanager
 from src.monitor.collector import SystemMetrics
 
 
+class MetricsStorageError(RuntimeError):
+    """ストレージライフサイクル障害の固定/型のみの診断。
+
+    DBパス・SQLiteメッセージ・プロセス詳細などの生情報を一切含めない。
+    例外の型名は original から分離して維持し、message は固定文字列のみ。
+    """
+
+
 class MetricsStorage:
     """
     SQLite ベースのメトリクスストレージ
@@ -21,17 +29,26 @@ class MetricsStorage:
       - hourly_summary: 1時間ごとの集計サマリー
     """
 
-    def __init__(self, db_path: str = "data/metrics/system_metrics.db"):
+    def __init__(self, db_path: str = "data/metrics/system_metrics.db", process_details_enabled: bool = False):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn: Optional[sqlite3.Connection] = None
+        # プロセス詳細の opt-in。既定オフ。オフのときは書込も読出しも詳細を出さない。
+        self._process_details_enabled = process_details_enabled
 
     def initialize(self) -> None:
         """DB接続を開いてテーブルを作成"""
-        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode=WAL")  # 並行アクセス対応
-        self._conn.execute("PRAGMA synchronous=NORMAL")
-        self._create_tables()
+        try:
+            self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+            self._conn.execute("PRAGMA journal_mode=WAL")  # 並行アクセス対応
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+            self._create_tables()
+        except Exception as e:
+            self.close()
+            # DBパス・SQLiteメッセージを漏らさず、型のみで診断する (fail closed)。
+            raise MetricsStorageError(
+                f"metrics storage initialize failed ({type(e).__name__})"
+            ) from None
 
     def close(self) -> None:
         """DB接続を閉じる"""
@@ -41,18 +58,32 @@ class MetricsStorage:
 
     @contextmanager
     def _cursor(self):
-        """スレッドセーフなカーソルのコンテキストマネージャー"""
+        """スレッドセーフなカーソルのコンテキストマネージャー
+
+        障害時は rollback してから、DBパス・SQLiteメッセージを含まない
+        固定/型のみの診断で例外を送出する (fail closed)。
+        """
         if self._conn is None:
-            raise RuntimeError("DB未初期化。initialize() を先に呼んでください。")
-        cursor = self._conn.cursor()
+            raise MetricsStorageError("metrics storage not initialized")
+        cursor = None
         try:
+            cursor = self._conn.cursor()
             yield cursor
             self._conn.commit()
-        except Exception:
-            self._conn.rollback()
-            raise
+        except Exception as e:
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
+            raise MetricsStorageError(
+                f"metrics storage operation failed ({type(e).__name__})"
+            ) from None
         finally:
-            cursor.close()
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
 
     def _create_tables(self) -> None:
         """テーブル作成"""
@@ -110,7 +141,12 @@ class MetricsStorage:
 
     def store_metrics(self, m: SystemMetrics) -> None:
         """メトリクスを1レコード保存"""
-        top_procs_json = json.dumps(m.top_cpu_processes, ensure_ascii=False)
+        # 詳細無効時はプロセス詳細を永続化しない (fail closed)。
+        top_procs_json = (
+            json.dumps(m.top_cpu_processes, ensure_ascii=False)
+            if self._process_details_enabled
+            else "[]"
+        )
         extra = json.dumps({
             "cpu_per_core": m.cpu_per_core,
             "mem_total_gb": m.mem_total_gb,
@@ -185,6 +221,11 @@ class MetricsStorage:
         if not row:
             return None
 
+        # 読み出し境界で詳細を redact。無効時は過去に保存された詳細を含む行も隠す。
+        top_processes: list = []
+        if self._process_details_enabled and row[14]:
+            top_processes = json.loads(row[14])
+
         return {
             "timestamp": row[0], "cpu_percent": row[1],
             "cpu_freq_mhz": row[2], "load_avg_1m": row[3],
@@ -193,7 +234,7 @@ class MetricsStorage:
             "gpu_util_percent": row[8], "gpu_mem_used_mb": row[9],
             "gpu_temp_c": row[10], "gpu_power_w": row[11],
             "cpu_temp_c": row[12], "process_count": row[13],
-            "top_processes": json.loads(row[14]) if row[14] else [],
+            "top_processes": top_processes,
         }
 
     def compute_hourly_summary(self, hour_start: float) -> Optional[dict]:

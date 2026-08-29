@@ -9,11 +9,11 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.assistant.factory import build_local_provider
 from src.chat.config import ChatConfig
 from src.diary.collector import DiaryCollector
 from src.diary.service import DailyDiaryService
 from src.integrations.google_calendar import GoogleCalendarMCPClient
-from src.llm.providers.ollama import OllamaProvider
 
 
 def parse_args() -> argparse.Namespace:
@@ -31,22 +31,22 @@ def main() -> None:
     args = parse_args()
     target_date = date.fromisoformat(args.date)
     config = ChatConfig.load(PROJECT_ROOT / "config" / "chat_config.json")
-    llm = OllamaProvider(base_url=config.ollama_base_url, model=config.model)
-    calendar_client = None if args.no_calendar else GoogleCalendarMCPClient.from_env()
-    collector = DiaryCollector(
-        PROJECT_ROOT,
-        calendar_client=calendar_client,
-        timezone=args.timezone,
-    )
-    service = DailyDiaryService(
-        project_root=PROJECT_ROOT,
-        llm=llm,
-        collector=collector,
-        timezone=args.timezone,
-        temperature=0.4,
-        num_ctx=config.num_ctx,
-    )
+    _, llm = build_local_provider(config)
     try:
+        calendar_client = None if args.no_calendar else GoogleCalendarMCPClient.from_env()
+        collector = DiaryCollector(
+            PROJECT_ROOT,
+            calendar_client=calendar_client,
+            timezone=args.timezone,
+        )
+        service = DailyDiaryService(
+            project_root=PROJECT_ROOT,
+            llm=llm,
+            collector=collector,
+            timezone=args.timezone,
+            temperature=0.4,
+            num_ctx=config.num_ctx,
+        )
         result = service.generate(
             target_date,
             save=not args.no_save,

@@ -3,8 +3,13 @@ from __future__ import annotations
 
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
 
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from src.desktop.app import OverlayClickThroughController, _on_hotkey_activated
+from src.desktop.bridge import DesktopBridge
+from src.desktop.config import DesktopSettings
 from src.desktop.shell import (
     ShellVisualState,
     decide_shell_state,
@@ -206,6 +211,177 @@ class TestApplyClickThrough(unittest.TestCase):
         with patch("src.desktop.windows.os") as mock_os:
             mock_os.name = "posix"
             self.assertFalse(apply_click_through(12345, True))
+
+
+class _FakeOverlayWindow:
+    def __init__(self, hwnd: int) -> None:
+        self._hwnd = hwnd
+
+    def winId(self) -> int:
+        return self._hwnd
+
+
+class OverlayClickThroughTestCase(unittest.TestCase):
+    """Shared bridge/controller scaffolding (no GUI launch, no native calls)."""
+
+    def _make_bridge(self) -> DesktopBridge:
+        with patch("src.desktop.bridge.create_activity_runtime_from_env", return_value=None):
+            bridge = DesktopBridge(DesktopSettings(), offline=True)
+
+        def _cleanup() -> None:
+            bridge._overlay_click_through = False
+            bridge.shutdown()
+
+        self.addCleanup(_cleanup)
+        return bridge
+
+    def _make_controller(self, bridge: DesktopBridge, window=None):  # noqa: ANN001
+        controller = OverlayClickThroughController(bridge)
+        if window is not None:
+            controller.set_overlay_window(window)
+        self._controllers = getattr(self, "_controllers", [])
+        self._controllers.append(controller)
+        return controller
+
+
+class TestOverlayClickThroughApply(OverlayClickThroughTestCase):
+    @patch("src.desktop.app.apply_click_through", return_value=True)
+    def test_applies_true_and_false_to_overlay_window(self, mock_apply) -> None:
+        bridge = self._make_bridge()
+        bridge._overlay_enabled = True
+        self._make_controller(bridge, _FakeOverlayWindow(4321))
+
+        bridge.setOverlayClickThrough(True)
+        self.assertTrue(bridge.overlayClickThrough)
+        bridge.setOverlayClickThrough(False)
+        self.assertFalse(bridge.overlayClickThrough)
+
+        self.assertEqual(mock_apply.call_args_list, [call(4321, True), call(4321, False)])
+
+    @patch("src.desktop.app.apply_click_through", return_value=False)
+    def test_native_failure_resets_desired_state(self, mock_apply) -> None:
+        bridge = self._make_bridge()
+        bridge._overlay_enabled = True
+        self._make_controller(bridge, _FakeOverlayWindow(4321))
+
+        bridge.setOverlayClickThrough(True)
+
+        self.assertFalse(bridge.overlayClickThrough)
+        self.assertFalse(bridge._overlay_click_through)
+        self.assertGreaterEqual(mock_apply.call_count, 1)
+        self.assertEqual(mock_apply.call_args_list[0], call(4321, True))
+
+    @patch("src.desktop.app.apply_click_through", return_value=True)
+    def test_no_window_resets_without_native_call(self, mock_apply) -> None:
+        bridge = self._make_bridge()
+        bridge._overlay_enabled = True
+        self._make_controller(bridge, None)
+
+        bridge.setOverlayClickThrough(True)
+
+        self.assertFalse(bridge.overlayClickThrough)
+        mock_apply.assert_not_called()
+
+    @patch("src.desktop.app.apply_click_through", return_value=True)
+    def test_zero_hwnd_resets_without_native_call(self, mock_apply) -> None:
+        bridge = self._make_bridge()
+        bridge._overlay_enabled = True
+        self._make_controller(bridge, _FakeOverlayWindow(0))
+
+        bridge.setOverlayClickThrough(True)
+
+        self.assertFalse(bridge.overlayClickThrough)
+        mock_apply.assert_not_called()
+
+    @patch("src.desktop.app.apply_click_through", return_value=True)
+    def test_disable_is_best_effort_and_never_resets(self, mock_apply) -> None:
+        bridge = self._make_bridge()
+        bridge._overlay_enabled = True
+        self._make_controller(bridge, _FakeOverlayWindow(4321))
+        bridge.setOverlayClickThrough(True)
+        mock_apply.return_value = False
+
+        bridge.setOverlayClickThrough(False)
+
+        self.assertFalse(bridge.overlayClickThrough)
+        self.assertEqual(mock_apply.call_count, 2)  # one enable + one best-effort disable
+
+    @patch("src.desktop.app.apply_click_through", return_value=True)
+    def test_idempotent_requests_do_not_duplicate_native_calls(self, mock_apply) -> None:
+        bridge = self._make_bridge()
+        bridge._overlay_enabled = True
+        self._make_controller(bridge, _FakeOverlayWindow(4321))
+
+        bridge.setOverlayClickThrough(True)
+        bridge.setOverlayClickThrough(True)
+        bridge.setOverlayClickThrough(False)
+        bridge.setOverlayClickThrough(False)
+
+        self.assertEqual(mock_apply.call_args_list, [call(4321, True), call(4321, False)])
+
+    @patch("src.desktop.app.apply_click_through", return_value=True)
+    def test_disconnect_stops_handling_requests(self, mock_apply) -> None:
+        bridge = self._make_bridge()
+        bridge._overlay_enabled = True
+        controller = self._make_controller(bridge, _FakeOverlayWindow(4321))
+
+        controller.disconnect()
+        bridge.setOverlayClickThrough(True)
+
+        self.assertTrue(bridge.overlayClickThrough)
+        mock_apply.assert_not_called()
+
+    @patch("src.desktop.app.apply_click_through", return_value=True)
+    def test_apply_default_false_uses_bridge_apply(self, mock_apply) -> None:
+        bridge = self._make_bridge()
+        controller = self._make_controller(bridge, _FakeOverlayWindow(4321))
+
+        controller.apply_default_click_through()
+
+        self.assertFalse(bridge.overlayClickThrough)
+        mock_apply.assert_called_once_with(4321, False)
+
+    @patch("src.desktop.app.apply_click_through", return_value=True)
+    def test_apply_default_noop_without_window(self, mock_apply) -> None:
+        bridge = self._make_bridge()
+        controller = self._make_controller(bridge, None)
+
+        controller.apply_default_click_through()
+
+        mock_apply.assert_not_called()
+
+
+class TestHotkeyInteractionRestore(OverlayClickThroughTestCase):
+    @patch("src.desktop.app.apply_click_through", return_value=True)
+    def test_hotkey_requests_click_through_off_before_toggling(self, mock_apply) -> None:
+        bridge = self._make_bridge()
+        bridge._overlay_enabled = True
+        controller = self._make_controller(bridge, _FakeOverlayWindow(4321))
+        bridge.setOverlayClickThrough(True)
+
+        order: list[str] = []
+        bridge.overlayClickThroughRequested.connect(lambda _value: order.append("request"))
+        with patch("src.desktop.app._toggle_window", side_effect=lambda _w: order.append("toggle")):
+            _on_hotkey_activated(controller, _FakeOverlayWindow(0))
+
+        self.assertEqual(order, ["request", "toggle"])
+        self.assertFalse(bridge.overlayClickThrough)
+
+    @patch("src.desktop.app.apply_click_through", return_value=False)
+    def test_hotkey_after_native_failure_recovery_does_not_duplicate(self, mock_apply) -> None:
+        bridge = self._make_bridge()
+        bridge._overlay_enabled = True
+        controller = self._make_controller(bridge, _FakeOverlayWindow(4321))
+        bridge.setOverlayClickThrough(True)
+        self.assertFalse(bridge.overlayClickThrough)
+
+        requests: list[bool] = []
+        bridge.overlayClickThroughRequested.connect(requests.append)
+        with patch("src.desktop.app._toggle_window") as mock_toggle:
+            _on_hotkey_activated(controller, _FakeOverlayWindow(0))
+
+        self.assertEqual(requests, [])
+        mock_toggle.assert_called_once()
 
 
 if __name__ == "__main__":

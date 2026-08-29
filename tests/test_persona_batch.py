@@ -7,10 +7,14 @@ import unittest
 from contextlib import redirect_stdout
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
+from src.chat.config import ChatConfig
 from src.llm.errors import ProviderRequestError
 from src.llm.providers.fake import FakeProvider
 from src.persona.daily_personalizer import DailyPersonalizer
+from src.persona.personalize_daily import main as personalize_daily_main
 from src.persona.summarizer import ConversationSummarizer
 
 
@@ -129,6 +133,121 @@ class DailyPersonalizerTest(unittest.TestCase):
         )
         self.assertEqual(provider.calls[0]["options"]["temperature"], 0.25)
         self.assertEqual(provider.calls[0]["options"]["num_ctx"], 4096)
+
+
+class PersonalizeDailyMainEntrypointTest(unittest.TestCase):
+    """Offline wiring tests for the daily personalization entrypoint."""
+
+    def test_main_uses_build_local_provider_ollama_and_closes(self) -> None:
+        provider_cls, providers = _recording_provider_class()
+        personalizer_cls, personalizers = _recording_personalizer_class(fail=False)
+        config = ChatConfig(ollama_base_url="http://localhost:9999", model="qwen")
+        with (
+            patch("sys.argv", ["personalize-daily", "--date", "2026-08-18", "--dry-run"]),
+            patch.object(ChatConfig, "load", return_value=config),
+            patch("src.assistant.factory.OllamaProvider", provider_cls),
+            patch("src.persona.personalize_daily.DailyPersonalizer", personalizer_cls),
+            redirect_stdout(io.StringIO()),
+        ):
+            personalize_daily_main()
+
+        self.assertEqual(len(providers), 1)
+        self.assertEqual(
+            providers[0].kwargs,
+            {"base_url": "http://localhost:9999", "model": "qwen", "provider_id": "ollama"},
+        )
+        self.assertEqual(len(personalizers), 1)
+        self.assertIs(personalizers[0].kwargs["llm"], providers[0])
+        self.assertEqual(personalizers[0].kwargs["num_ctx"], config.num_ctx)
+        self.assertTrue(providers[0].closed)
+
+    def test_main_selects_openai_compatible_and_closes_on_failure(self) -> None:
+        provider_cls, providers = _recording_provider_class()
+        personalizer_cls, _personalizers = _recording_personalizer_class(fail=True)
+        config = ChatConfig(
+            local_provider_kind="openai_compatible",
+            local_base_url="http://localhost:8000/v1",
+            model="qwen",
+        )
+        with (
+            patch("sys.argv", ["personalize-daily", "--date", "2026-08-18", "--dry-run"]),
+            patch.object(ChatConfig, "load", return_value=config),
+            patch("src.assistant.factory.LocalOpenAICompatibleProvider", provider_cls),
+            patch("src.persona.personalize_daily.DailyPersonalizer", personalizer_cls),
+            redirect_stdout(io.StringIO()),
+        ):
+            with self.assertRaises(RuntimeError):
+                personalize_daily_main()
+
+        self.assertEqual(len(providers), 1)
+        self.assertEqual(
+            providers[0].kwargs,
+            {
+                "model": "qwen",
+                "base_url": "http://localhost:8000/v1",
+                "provider_id": "local-openai",
+                "api_key": None,
+            },
+        )
+        self.assertTrue(providers[0].closed)
+
+    def test_main_closes_provider_when_personalizer_constructor_fails(self) -> None:
+        provider_cls, providers = _recording_provider_class()
+        config = ChatConfig()
+
+        class ExplodingPersonalizer:
+            def __init__(self, **kwargs) -> None:
+                raise RuntimeError("forced personalizer constructor failure")
+
+        with (
+            patch("sys.argv", ["personalize-daily", "--date", "2026-08-18", "--dry-run"]),
+            patch.object(ChatConfig, "load", return_value=config),
+            patch("src.assistant.factory.OllamaProvider", provider_cls),
+            patch("src.persona.personalize_daily.DailyPersonalizer", ExplodingPersonalizer),
+            redirect_stdout(io.StringIO()),
+        ):
+            with self.assertRaises(RuntimeError):
+                personalize_daily_main()
+
+        self.assertEqual(len(providers), 1)
+        self.assertTrue(providers[0].closed)
+
+
+def _recording_provider_class():
+    instances = []
+
+    class RecordingProvider:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+            self.closed = False
+            instances.append(self)
+
+        def close(self) -> None:
+            self.closed = True
+
+    return RecordingProvider, instances
+
+
+def _recording_personalizer_class(*, fail: bool):
+    instances = []
+
+    class RecordingPersonalizer:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+            instances.append(self)
+
+        def run(self, target_date, **kwargs) -> SimpleNamespace:
+            if fail:
+                raise RuntimeError("forced entrypoint failure")
+            return SimpleNamespace(
+                target_date=target_date.isoformat(),
+                dry_run=kwargs.get("dry_run", False),
+                applied_count=1,
+                audit_path="",
+                skipped=[],
+            )
+
+    return RecordingPersonalizer, instances
 
 
 if __name__ == "__main__":

@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from src.chat.emotion import parse_emotion_tag
+from src.perception.policy import resolve_sensor_policy
 from src.persona.conversation_loop import ConversationLoopStore
 from src.persona.profile import UserProfile
 from src.persona.proactive import ProactiveEngine
@@ -325,7 +326,7 @@ class ProactiveBridge:
         return {
             "enabled": self.config.conversation_enabled,
             **self.conversation_store.status(self.config.channel_id),
-            "state_error": self.conversation_store.last_error,
+            "state_error": "yes" if self.conversation_store.last_error else "",
         }
 
     # --- コールバック (エンジンのスレッドから呼ばれる) ---
@@ -434,8 +435,29 @@ class ProactiveBridge:
                 pass
 
 
-def _build_monitor_context() -> Any:
-    """MonitorContext を pipeline.py と同様に構築 (失敗時 None)。"""
+def _cleanup_monitor_context(ctx: Any) -> None:
+    """MonitorContext の best-effort stop。クリーンアップ失敗を外へ漏らさない。"""
+    if ctx is None:
+        return
+    try:
+        ctx.stop()
+    except Exception:
+        pass
+
+
+def _build_monitor_context(env: Optional[dict] = None) -> Any:
+    """SensorPolicy.monitor が明示 true のときだけ MonitorContext を構築する。
+
+    canonical 名 (SENSOR_MONITOR_ENABLED) が明示 `true` でない限り、MonitorContext
+    の import・構築・start を一切行わず None を返す (fail closed / 既定オフ)。
+    共有解決器 resolve_sensor_policy を使うため canonical precedence が適用され、
+    false・空・不正値は監視センサーを有効化しない。start が false を返すか例外を
+    投げたときは、構築済み context を best-effort で stop してから None を返す
+    (リソースリーク防止)。start 成功時は stop せず context をそのまま返す。
+    """
+    if not resolve_sensor_policy(env).monitor:
+        return None
+    ctx = None
     try:
         from src.monitor.context import MonitorContext
 
@@ -444,10 +466,12 @@ def _build_monitor_context() -> Any:
             collect_interval=30.0,
         )
         if not ctx.start():
+            _cleanup_monitor_context(ctx)
             return None
         return ctx
-    except Exception as e:
-        print(f"[Discord] proactive monitor 初期化スキップ: {e}")
+    except Exception:
+        _cleanup_monitor_context(ctx)
+        print("[Discord] proactive monitor 初期化スキップ")
         return None
 
 
@@ -475,8 +499,8 @@ def create_proactive_bridge(
             profile_path=str(PROJECT_ROOT / "data" / "profile" / "user_profile.json"),
         )
         profile.load()
-    except Exception as e:
-        print(f"[Discord] proactive profile 初期化失敗のため無効化: {e}")
+    except Exception:
+        print("[Discord] proactive profile 初期化失敗のため無効化")
         return None
 
     monitor_context = _build_monitor_context()

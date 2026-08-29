@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator, Sequence
+import sys
 import threading
 import time
 from typing import TYPE_CHECKING
@@ -439,7 +440,15 @@ class StreamResult(Iterable[str]):
             finally:
                 close = getattr(chunks, "close", None)
                 if callable(close):
-                    close()
+                    # 生成例外 (または明示的closeによる GeneratorExit) が伝播中の場合、
+                    # 下層の close エラーが元の例外を覆い隠さないよう握りつぶす。
+                    # try節が正常に完了した経路でのみ close エラーをそのまま送出する。
+                    propagating = sys.exc_info()[0] is not None
+                    try:
+                        close()
+                    except Exception:
+                        if not propagating:
+                            raise
 
             # 終端時刻は一度だけ取得し、latency と last-success 記録で共用する
             # (clock の二重呼び出しはテストの有限 tick を枯渇させる)。
@@ -467,7 +476,12 @@ class StreamResult(Iterable[str]):
         raise error
 
     def close(self) -> None:
-        """内部generatorを閉じ、以後の反復を停止する。"""
+        """内部generatorを閉じ、以後の反復を停止する。
+
+        明示的なcloseは安全な操作として行う: 下層generatorの close エラーは
+        送出しない。また生成例外の伝播中にcloseされた場合も、元の例外を覆い
+        隠さない (_iterate の finally が伝播中の例外を保持する)。
+        """
         with self._state_lock:
             if self._closed:
                 return
@@ -478,8 +492,10 @@ class StreamResult(Iterable[str]):
         if iterator is not None:
             try:
                 iterator.close()
-            except ValueError:
+            except Exception:
                 # 別threadで実行中のgeneratorは閉じられないため停止フラグに委ねる。
+                # 明示的closeは安全な操作として、下層のcloseエラーは握りつぶす
+                # (伝播中の生成例外の覆い隠しは _iterate 側で防止済み)。
                 pass
 
         if self._response is None:

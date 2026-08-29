@@ -67,13 +67,19 @@ class ChatSession:
         self._messages.append({"role": "user", "content": content})
         self._trim_history()
 
-    def add_assistant_message(self, content: str, *, store_memory: bool = True) -> None:
+    def add_assistant_message(
+        self,
+        content: str,
+        *,
+        store_memory: bool = True,
+        record_growth: bool = True,
+    ) -> None:
         """アシスタントの応答を追加（RAG有効時はベクトルDBにも保存）
 
         store_memory=False のときは RAG への長期記憶保存をスキップする。
-        セッション履歴の追加・トリムは常に行い、成長台帳には
-        memory_saved=False で記録する。テキスト内容に基づく分類は行わない。
-        save() は呼び出さないためファイル保存が必要なら別途呼ぶこと。
+        record_growth=False のときは成長台帳への記録もスキップする。
+        セッション履歴の追加・トリムは常に行う。save() は呼び出さないため
+        ファイル保存が必要なら別途呼ぶこと。
         """
         self._messages.append({"role": "assistant", "content": content})
         self._trim_history()
@@ -92,9 +98,12 @@ class ChatSession:
                 )
 
         # 成長台帳: 本文は保存せず、成功した会話例とRAG保存成否だけを記録する。
-        # store_memory=False のときは memory_id が None のままなので
-        # memory_saved=False として記録される。
-        if self.growth_tracker is not None and len(self._messages) >= 2:
+        # record_growth=False のときは成長台帳へ一切アクセスしない。
+        if (
+            record_growth
+            and self.growth_tracker is not None
+            and len(self._messages) >= 2
+        ):
             user_msg = user_msg or self._messages[-2]
             if user_msg.get("role") == "user":
                 try:
@@ -109,11 +118,25 @@ class ChatSession:
                     # 計測失敗で会話自体を失敗させない。
                     pass
 
+    def rollback_last_user_message(self) -> bool:
+        """最終メッセージがユーザー発言のときだけ原子的に除去し True を返す。
+
+        履歴が空・最終メッセージが assistant など user でない場合は変更せず
+        False を返す。エラー時の巻き戻し (CLI / Voice / Web / Discord) に使い、
+        メッセージ内容は診断へ出さない。
+        """
+        if not self._messages or self._messages[-1].get("role") != "user":
+            return False
+        self._messages.pop()
+        return True
+
     def build_blocks(self) -> tuple:
         """build_messages が描画する ContextBlock を返す（描画前）。
 
-        プリロード・RAG・Web検索・Vision・Monitor・Screen・Calendar・Tasks・History の
-        各 ContextProvider から収集した ContextBlock を tuple で返す。
+        プリロード・RAG・Web検索・Vision・Monitor・Screen・Calendar・Emotion（有効時のみ）・
+        Tasks・History の各 ContextProvider から収集した ContextBlock を tuple で返す。
+        Emotion は Calendar の直後・Tasks の前に収集し、ContextPolicy の tasks-last 権威を
+        尊重してタスク状態が常に system 本文の最終文字列 block になるようにする。
         """
         from src.context.contracts import ContextBlock as _CB
         from src.context.providers.preload import PreloadContextProvider
@@ -175,6 +198,21 @@ class ChatSession:
             if block is not None:
                 blocks.append(block)
 
+        # 感情タグの指示 (有効時のみ)。タスク状態の権威ブロックよりも前に置くことで、
+        # タスク状態がシステムプロンプトの最終権威となる。指示文は機密を含まないため
+        # public / 非 local_only とし、ContextPolicy の tasks-last で tasks より前になる。
+        if self.emotion_tags:
+            from src.chat.emotion import EMOTION_TAG_INSTRUCTION
+
+            blocks.append(
+                _CB(
+                    source="emotion",
+                    content=EMOTION_TAG_INSTRUCTION,
+                    sensitivity="public",
+                    local_only=False,
+                )
+            )
+
         tasks_block = (
             TasksContextProvider.collect(self.task_store)
             if self.task_store is not None
@@ -195,169 +233,14 @@ class ChatSession:
         RAGが有効な場合、最新のユーザーメッセージで長期記憶を検索し、
         関連する過去の文脈をシステムプロンプトに注入する。
         History は ContextBlock 化して ContextBuilder 経由で描画する (Phase J)。
+        プロバイダ収集は build_blocks() へ委譲し、ContextBuilder 一経路で描画する。
+        build_messages() は引数なしで呼ばれるため local_only / local target を既定とし、
+        ContextPolicy で選択された block だけを描画する。
         """
-        # システムプロンプト + プリロード + RAGコンテキスト + Visionコンテキスト
-        system_content = self.system_prompt or ""
-
-        # Preload: プロフィール・スケジュール・最近の会話要約・時刻 (Phase 7)
-        # Phase J: PreloadContextProvider + ContextBuilder 経由で描画する。
-        # system_prompt 直後・RAG 前の現行位置を維持し、local_only / local target で
-        # ContextPolicy に通した str block だけを base system へ連結する。
-        if self.preloader is not None:
-            from src.context.builder import ContextBuilder
-            from src.context.providers.preload import PreloadContextProvider
-
-            preload_block = PreloadContextProvider.collect(self.preloader)
-            builder = ContextBuilder(system_content)
-            system_content = builder.build_system_content(
-                [preload_block] if preload_block is not None else [],
-                privacy="local_only",
-                target_local=True,
-            )
-
-        if self.rag is not None and self._messages:
-            # 最新のユーザーメッセージで検索
-            last_user = None
-            for msg in reversed(self._messages):
-                if msg["role"] == "user":
-                    last_user = msg["content"]
-                    break
-            # Phase J: RAGContextProvider + ContextBuilder 経由で描画する。
-            # Preload 直後・Web search 前の現行位置を維持し、local_only / local target
-            # で ContextPolicy に通した str block だけを base system へ連結する。
-            if last_user:
-                from src.context.builder import ContextBuilder
-                from src.context.providers.rag import RAGContextProvider
-
-                rag_block = RAGContextProvider.collect(self.rag, last_user)
-                builder = ContextBuilder(system_content)
-                system_content = builder.build_system_content(
-                    [rag_block] if rag_block is not None else [],
-                    privacy="local_only",
-                    target_local=True,
-                )
-
-        if self.web_search is not None and self._messages:
-            # 最新のユーザーメッセージで検索
-            last_user = None
-            for msg in reversed(self._messages):
-                if msg["role"] == "user":
-                    last_user = msg["content"]
-                    break
-            # Phase J: WebSearchContextProvider + ContextBuilder 経由で描画する。
-            # RAG 直後・Vision 前の現行位置を維持し、local_only / local target
-            # で ContextPolicy に通した str block だけを base system へ連結する。
-            if last_user:
-                from src.context.builder import ContextBuilder
-                from src.context.providers.web_search import WebSearchContextProvider
-
-                web_block = WebSearchContextProvider.collect(self.web_search, last_user)
-                builder = ContextBuilder(system_content)
-                system_content = builder.build_system_content(
-                    [web_block] if web_block is not None else [],
-                    privacy="local_only",
-                    target_local=True,
-                )
-
-        # Vision: カメラ映像の現在の状態を注入 (Phase J)
-        # Phase J: VisionContextProvider + ContextBuilder 経由で描画する。
-        # Web search 直後・Monitor 前の現行位置を維持し、local_only / local target
-        # で ContextPolicy に通した str block だけを base system へ連結する。
-        if self.vision_context is not None:
-            from src.context.builder import ContextBuilder
-            from src.context.providers.vision import VisionContextProvider
-
-            vision_block = VisionContextProvider.collect(self.vision_context)
-            builder = ContextBuilder(system_content)
-            system_content = builder.build_system_content(
-                [vision_block] if vision_block is not None else [],
-                privacy="local_only",
-                target_local=True,
-            )
-
-        # Monitor: サブPCの状態を注入 (Phase J)
-        # Phase J: MonitorContextProvider + ContextBuilder 経由で描画する。
-        # Vision 直後・Screen 前の現行位置を維持し、local_only / local target
-        # で ContextPolicy に通した str block だけを base system へ連結する。
-        if self.monitor_context is not None:
-            from src.context.builder import ContextBuilder
-            from src.context.providers.monitor import MonitorContextProvider
-
-            monitor_block = MonitorContextProvider.collect(self.monitor_context)
-            builder = ContextBuilder(system_content)
-            system_content = builder.build_system_content(
-                [monitor_block] if monitor_block is not None else [],
-                privacy="local_only",
-                target_local=True,
-            )
-
-        # Screen: ユーザーの画面で何をしているかを注入 (VLM描写) (Phase J)
-        # Phase J: ScreenContextProvider + ContextBuilder 経由で描画する。
-        # Monitor 直後・Calendar 前の現行位置を維持し、local_only / local target
-        # で ContextPolicy に通した str block だけを base system へ連結する。
-        if self.screen_context is not None:
-            from src.context.builder import ContextBuilder
-            from src.context.providers.screen import ScreenContextProvider
-
-            screen_block = ScreenContextProvider.collect(self.screen_context)
-            builder = ContextBuilder(system_content)
-            system_content = builder.build_system_content(
-                [screen_block] if screen_block is not None else [],
-                privacy="local_only",
-                target_local=True,
-            )
-
-        # Calendar: Google Calendar の今日〜明日の予定を注入 (ファイル読取のみ) (Phase J)
-        # Phase J: CalendarContextProvider + ContextBuilder 経由で描画する。
-        # Screen 直後・Emotion 前の現行位置を維持し、local_only / local target
-        # で ContextPolicy に通した str block だけを base system へ連結する。
-        if self.calendar_context is not None:
-            from src.context.builder import ContextBuilder
-            from src.context.providers.calendar import CalendarContextProvider
-
-            calendar_block = CalendarContextProvider.collect(self.calendar_context)
-            builder = ContextBuilder(system_content)
-            system_content = builder.build_system_content(
-                [calendar_block] if calendar_block is not None else [],
-                privacy="local_only",
-                target_local=True,
-            )
-
-        # 感情タグの指示 (有効時のみ)。タスク状態の権威ブロックよりも前に置くことで、
-        # タスク状態がシステムプロンプトの最終権威となる。
-        if self.emotion_tags:
-            from src.chat.emotion import EMOTION_TAG_INSTRUCTION
-            separator = "\n\n" if system_content else ""
-            system_content = system_content + separator + EMOTION_TAG_INSTRUCTION
-
-        # Tasks: 未完了タスク + 現在状態の権威ブロックを末尾に置く (0件でも必ず注入)。
-        # 会話履歴・RAG・訓練データを上書きする最終権威なので、他の動的コンテキスト・
-        # 感情タグ指示の後に配置する。TasksContextProvider 経由で ContextBlock 化し、
-        # History と同時に最終 ContextBuilder.build_messages へ渡す。
-        # ContextPolicy の tasks-last と Builder の system-first により、system 本文の
-        # 最終文字列 block が tasks authority になり、History の role messages は
-        # system message の後ろに配置される。
-        from src.context.providers.tasks import TasksContextProvider
-
-        tasks_block = (
-            TasksContextProvider.collect(self.task_store)
-            if self.task_store is not None
-            else None
-        )
-
-        # History: 現在の履歴を ContextBlock 化し、ContextBuilder 経由で描画する。
-        # build_messages() は引数なしで呼ばれるため local_only / local target を既定とし、
-        # ContextPolicy で選択された block だけを描画する。
         from src.context.builder import ContextBuilder
-        from src.context.providers.history import HistoryContextProvider
 
-        history_block = HistoryContextProvider.collect(self._messages)
-        blocks = [
-            block
-            for block in (tasks_block, history_block)
-            if block is not None
-        ]
-        builder = ContextBuilder(system_content)
+        blocks = self.build_blocks()
+        builder = ContextBuilder(self.system_prompt or "")
         return builder.build_messages(
             blocks,
             privacy="local_only",

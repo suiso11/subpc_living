@@ -76,7 +76,8 @@ class CompanionWiringTest(unittest.TestCase):
         audio_main._stop_companion_activity_runtime()
         self.assertIsNone(audio_main._activity_runtime)
 
-    def test_main_starts_and_stops_runtime(self) -> None:
+    def test_text_mode_does_not_start_or_stop_activity_runtime(self) -> None:
+        """Safety contract: --text-mode must not start/stop the activity runtime."""
         calls = []
         with mock.patch.object(
             audio_main,
@@ -88,6 +89,24 @@ class CompanionWiringTest(unittest.TestCase):
             side_effect=lambda: calls.append("stop"),
         ), mock.patch.object(audio_main, "run_text_to_speech_mode"), mock.patch(
             "sys.argv", ["audio-main", "--text-mode"]
+        ):
+            with redirect_stdout(io.StringIO()):
+                audio_main.main()
+        self.assertEqual(calls, [])
+
+    def test_voice_mode_starts_and_stops_activity_runtime(self) -> None:
+        """Lifecycle: voice mode (with mic consent) starts/stops the runtime."""
+        calls = []
+        with mock.patch.object(
+            audio_main,
+            "_start_companion_activity_runtime",
+            side_effect=lambda: calls.append("start"),
+        ), mock.patch.object(
+            audio_main,
+            "_stop_companion_activity_runtime",
+            side_effect=lambda: calls.append("stop"),
+        ), mock.patch.object(audio_main, "run_voice_mode"), mock.patch(
+            "sys.argv", ["audio-main", "--microphone"]
         ):
             with redirect_stdout(io.StringIO()):
                 audio_main.main()

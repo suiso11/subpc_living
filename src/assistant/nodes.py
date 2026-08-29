@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 import json
+import os
 from pathlib import Path
 import sys
 from types import MappingProxyType
@@ -12,8 +13,10 @@ from typing import Any
 
 from src.assistant.factory import _resolve_run_logger, _UNSET
 from src.assistant.service import AssistantService
+from src.chat.config import LOCAL_PROVIDER_KINDS, validate_local_base_url
 from src.llm.contracts import GenerationOptions
 from src.llm.provider import LLMProvider
+from src.llm.providers.local_openai import LocalOpenAICompatibleProvider
 from src.llm.providers.ollama import OllamaProvider
 from src.llm.registry import ProviderRegistry
 from src.llm.routing.static import StaticRouter
@@ -31,6 +34,8 @@ class ProviderSpec:
     local: bool = True
     profiles: tuple[str, ...] = ()
     node_id: str = ""
+    provider_kind: str = "ollama"
+    api_key_env: str = ""
 
 
 @dataclass(frozen=True)
@@ -136,10 +141,51 @@ class NodeInventory:
                         f"provider {provider_id}: model must not be empty"
                     )
 
+                raw_kind = raw_provider.get("provider_kind", "ollama")
+                if not isinstance(raw_kind, str):
+                    raise InvalidNodeInventoryError(
+                        f"provider {provider_id}: provider_kind must be a string"
+                    )
+                # ChatConfig と同じ規約で、空または空白のみの値は後方互換のため
+                # "ollama" へ正規化する。
+                provider_kind = raw_kind.strip() or "ollama"
+                if provider_kind not in LOCAL_PROVIDER_KINDS:
+                    raise InvalidNodeInventoryError(
+                        f"provider {provider_id}: unknown provider_kind "
+                        f"{provider_kind!r}; expected one of "
+                        f"{', '.join(LOCAL_PROVIDER_KINDS)}"
+                    )
+
+                # openai_compatible は ChatConfig と同じloopback限定の信頼境界を適用する。
+                # Ollama は従来どおり local / remote hostname を許す (後方互換)。
+                if provider_kind == "openai_compatible":
+                    try:
+                        validate_local_base_url(base_url)
+                    except ValueError as exc:
+                        raise InvalidNodeInventoryError(
+                            f"provider {provider_id}: {exc}"
+                        ) from exc
+
+                raw_api_key_env = raw_provider.get("api_key_env", "")
+                if not isinstance(raw_api_key_env, str):
+                    raise InvalidNodeInventoryError(
+                        f"provider {provider_id}: api_key_env must be a string"
+                    )
+                api_key_env = raw_api_key_env.strip()
+
                 local = raw_provider.get("local", True)
                 if not isinstance(local, bool):
                     raise InvalidNodeInventoryError(
                         f"provider {provider_id}: local must be a bool"
+                    )
+                # openai_compatible はloopback限定の信頼境界であり、cloud の
+                # 承認・redaction を迂回させないため local=False を拒否する
+                # (ChatConfig と同じ規約)。Ollama は従来どおり local / remote
+                # を許す (後方互換)。
+                if provider_kind == "openai_compatible" and not local:
+                    raise InvalidNodeInventoryError(
+                        f"provider {provider_id}: openai_compatible "
+                        "requires local=True (loopback-only)"
                     )
 
                 raw_profiles = raw_provider.get("profiles", ())
@@ -161,6 +207,8 @@ class NodeInventory:
                         local=local,
                         profiles=tuple(raw_profiles),
                         node_id=node_id,
+                        provider_kind=provider_kind,
+                        api_key_env=api_key_env,
                     )
                 )
 
@@ -245,12 +293,42 @@ class NodeInventory:
         )
 
 
+def _resolve_api_key(spec: ProviderSpec) -> str | None:
+    """openai_compatible の key を環境変数名のみから実行時に解決する。
+
+    キー値は spec にもログにも保持しない。env名未指定・未設定なら ``None``。
+    """
+    if not spec.api_key_env:
+        return None
+    return os.environ.get(spec.api_key_env) or None
+
+
 def _build_ollama_provider(spec: ProviderSpec) -> LLMProvider:
     return OllamaProvider(
         base_url=spec.base_url,
         model=spec.model,
         provider_id=spec.provider_id,
     )
+
+
+def _build_openai_compatible_provider(spec: ProviderSpec) -> LLMProvider:
+    return LocalOpenAICompatibleProvider(
+        model=spec.model,
+        base_url=spec.base_url,
+        provider_id=spec.provider_id,
+        api_key=_resolve_api_key(spec),
+    )
+
+
+def _build_provider(spec: ProviderSpec) -> LLMProvider:
+    """``provider_kind`` に応じて既定の Provider 実体を組み立てる。
+
+    Ollama は従来の ``OllamaProvider`` を維持し、openai_compatible は
+    ``LocalOpenAICompatibleProvider`` を spec の provider_id で組み立てる。
+    """
+    if spec.provider_kind == "openai_compatible":
+        return _build_openai_compatible_provider(spec)
+    return _build_ollama_provider(spec)
 
 
 def build_node_service(
@@ -265,11 +343,13 @@ def build_node_service(
     同じprofileは定義順で最初のProviderが優先される。
     設定の並び順が経路に影響するため注意すること。
     """
-    factory = provider_factory or _build_ollama_provider
+    factory = provider_factory or _build_provider
     registry = ProviderRegistry()
     profile_routes: dict[str, str] = {}
 
     for spec in inventory.providers():
+        # openai_compatible はloopback限定で local=False が検証済みの時点で
+        # 排除されているため、検証済み spec.local をそのまま登録する。
         registry.register(
             spec.provider_id,
             factory(spec),

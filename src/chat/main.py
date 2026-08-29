@@ -1,6 +1,6 @@
 """
 Phase 2: テキスト対話 CLIメインエントリポイント
-Ollamaの7Bモデル(Q4)を使ったインタラクティブなテキスト対話を実現する
+ローカル推論backend (Ollama または OpenAI互換) を使ったインタラクティブなテキスト対話を実現する
 """
 import sys
 import signal
@@ -10,9 +10,10 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.assistant import AssistantRequest, AssistantService
+from src.assistant import AssistantService
 from src.assistant.factory import build_local_service
-from src.chat.config import ChatConfig
+from src.assistant.requests import create_request
+from src.chat.config import ChatConfig, validate_local_provider_kind
 from src.chat.session import ChatSession
 from src.chat.web_search import create_web_search_context
 from src.growth.tracker import GrowthTracker
@@ -118,10 +119,11 @@ def run_chat_loop(config, session, service, *, read_input=input) -> None:
         # メッセージ送信
         session.add_user_message(user_input)
         blocks = session.build_blocks()
-        request = AssistantRequest(
+        request = create_request(
             text=user_input,
             conversation_id=session.session_id,
             channel="cli",
+            profile="chat_auto",
             privacy="local_only",
         )
 
@@ -130,15 +132,23 @@ def run_chat_loop(config, session, service, *, read_input=input) -> None:
         try:
             if config.stream:
                 # ストリーミング出力
-                stream = service.respond_stream(request, blocks, base_system=session.system_prompt)
-                for token in stream:
-                    print(token, end="", flush=True)
-                print()  # 改行
-                # 統計表示
-                stats_str = format_stats(stream.response.stats)
-                if stats_str:
-                    print(stats_str)
-                session.add_assistant_message(stream.response.text)
+                stream = None
+                try:
+                    stream = service.respond_stream(request, blocks, base_system=session.system_prompt)
+                    for token in stream:
+                        print(token, end="", flush=True)
+                    print()  # 改行
+                    # 統計表示
+                    stats_str = format_stats(stream.response.stats)
+                    if stats_str:
+                        print(stats_str)
+                    session.add_assistant_message(stream.response.text)
+                finally:
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except Exception:
+                            pass
             else:
                 # 非ストリーミング
                 response, _preview = service.respond(request, blocks, base_system=session.system_prompt)
@@ -147,8 +157,7 @@ def run_chat_loop(config, session, service, *, read_input=input) -> None:
         except Exception as e:
             print(f"{Color.RED}エラー: {e}{Color.RESET}")
             # エラー時はユーザーメッセージを巻き戻す
-            if session._messages and session._messages[-1]["role"] == "user":
-                session._messages.pop()
+            session.rollback_last_user_message()
 
 
 def main():
@@ -165,23 +174,35 @@ def main():
 
     # Assistantサービスの初期化
     service, registry = build_cli_service(config)
-    provider = registry.get("ollama").provider
+    provider = registry.get(config.resolved_local_provider_id()).provider
 
     try:
-        # 接続チェック
-        print(f"\n{Color.DIM}Ollama接続確認中...{Color.RESET}", end=" ", flush=True)
+        # 接続チェック (backend中性: Ollama / OpenAI互換のどちらでも同じ文言)
+        print(f"\n{Color.DIM}ローカル推論サーバー接続確認中... ({config.resolved_local_base_url()}){Color.RESET}", end=" ", flush=True)
         if not provider.is_available():
-            print(f"{Color.RED}❌ Ollamaに接続できません。サービスが起動しているか確認してください。{Color.RESET}")
-            print(f"{Color.DIM}  sudo systemctl start ollama{Color.RESET}")
+            print(f"{Color.RED}❌ ローカル推論サーバーに接続できません。サービスが起動しているか確認してください。{Color.RESET}")
             sys.exit(1)
-        print(f"{Color.GREEN}✅ 接続OK{Color.RESET}")
 
-        # モデル存在チェック
-        if not provider.has_model():
-            print(f"{Color.RED}❌ モデル '{config.model}' が見つかりません。{Color.RESET}")
-            print(f"{Color.DIM}利用可能なモデル: {', '.join(provider.list_models())}{Color.RESET}")
-            sys.exit(1)
-        print(f"{Color.GREEN}✅ モデル確認OK{Color.RESET}")
+        if validate_local_provider_kind(config) == "ollama":
+            # Ollama: /api/tags に基づく厳格なモデル存在確認 (has_model 1回で判定)
+            print(f"{Color.GREEN}✅ 接続OK{Color.RESET}")
+            if not provider.has_model():
+                print(f"{Color.RED}❌ モデル '{config.model}' が見つかりません。{Color.RESET}")
+                sys.exit(1)
+            print(f"{Color.GREEN}✅ モデル確認OK{Color.RESET}")
+        else:
+            # openai_compatible: is_available() はライフサイクルのみで接続成功を意味しない。
+            # /models はオプション。list_models() を1回だけ呼び、非空で設定モデルが
+            # 含まれないときだけ失敗し、空 (未実装) なら生成時に検証する警告で続行する。
+            discovered = provider.list_models()
+            if discovered and config.model not in discovered:
+                print(f"{Color.RED}❌ モデル '{config.model}' が見つかりません。{Color.RESET}")
+                print(f"{Color.DIM}利用可能なモデル: {', '.join(discovered)}{Color.RESET}")
+                sys.exit(1)
+            if not discovered:
+                print(f"{Color.YELLOW}⚠ モデル情報の取得に失敗しました。生成時に確認します。{Color.RESET}")
+            else:
+                print(f"{Color.GREEN}✅ モデル確認OK{Color.RESET}")
     except BaseException:
         registry.close()
         raise
@@ -198,6 +219,7 @@ def main():
         web_search=web_search,
         growth_tracker=growth_tracker,
         conversation_source="cli",
+        emotion_tags=config.emotion_tag_enabled,
     )
 
     print_help()

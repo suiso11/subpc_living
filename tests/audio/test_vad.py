@@ -1,9 +1,15 @@
 """
 EnergyVAD の基本テスト
 """
+import io
+import sys
+import unittest
+from contextlib import redirect_stdout
+from unittest import mock
+
 import numpy as np
 
-from src.audio.vad import EnergyVAD
+from src.audio.vad import EnergyVAD, SileroVAD, create_vad
 
 
 def test_vad_silence():
@@ -39,3 +45,62 @@ def test_vad_speech_then_silence():
 
     assert result is not None
     assert isinstance(result, np.ndarray)
+
+
+class SileroFallbackCanaryTest(unittest.TestCase):
+    """Silero VAD の構築・ロード失敗時のサニタイズ (canary) 検証。
+
+    raw のパス・モデル・エラー内容を漏らさず、固定メッセージ (ASCII) と
+    例外型名だけを出すことを保証する。auto は Energy VAD にフォールバックする。
+    """
+
+    _SILERO_SECRETS = ("/secret/silero", "silero-model-xyz", "http://silero-secret")
+
+    class CanaryError(RuntimeError):
+        def __str__(self) -> str:
+            return " | ".join(SileroFallbackCanaryTest._SILERO_SECRETS)
+
+    def test_auto_falls_back_to_energy_on_silero_failure(self):
+        with mock.patch(
+            "src.audio.vad.SileroVAD", side_effect=self.CanaryError()
+        ):
+            out = io.StringIO()
+            with redirect_stdout(out):
+                vad = create_vad("auto", sample_rate=16000)
+        assert isinstance(vad, EnergyVAD)
+        text = out.getvalue()
+        assert self.CanaryError.__name__ in text
+        for secret in self._SILERO_SECRETS:
+            assert secret not in text
+        for line in text.splitlines():
+            line.encode("ascii")
+
+    def test_explicit_silero_raises_fixed_error(self):
+        with mock.patch(
+            "src.audio.vad.SileroVAD", side_effect=self.CanaryError()
+        ):
+            try:
+                create_vad("silero", sample_rate=16000)
+                assert False, "expected RuntimeError"
+            except RuntimeError as exc:
+                assert str(exc) == "silero vad initialization failed"
+                assert exc.__cause__ is None
+                for secret in self._SILERO_SECRETS:
+                    assert secret not in str(exc)
+
+    def test_silero_load_error_is_fixed_and_nonsecret(self):
+        fake_torch = mock.Mock()
+        fake_torch.hub.load.side_effect = self.CanaryError()
+        with mock.patch.dict(sys.modules, {"torch": fake_torch}):
+            try:
+                SileroVAD(sample_rate=16000)
+                assert False, "expected RuntimeError"
+            except RuntimeError as exc:
+                assert str(exc) == "silero vad model load failed"
+                assert exc.__cause__ is None
+                for secret in self._SILERO_SECRETS:
+                    assert secret not in str(exc)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -4,6 +4,7 @@ import threading
 import time
 import unittest
 from collections import deque
+from unittest import mock
 
 from src.companion.contracts import CompanionState, PerceptionEvent
 from src.perception import ActivityRuntime, ActivityRuntimeStatus
@@ -43,6 +44,27 @@ class _FlagSource:
         self.calls += 1
         if self.failing:
             raise OSError("transient source outage")
+        return ActivitySample(
+            timestamp=float(self.calls),
+            idle_seconds=0.0,
+            app_category="work",
+        )
+
+
+class _BlockingSource:
+    """sample() が release イベントで解放されるまでブロックする ActivitySource。
+
+    停止タイムアウトの決定論的テスト用。解放されなければスレッドは止まらない。
+    """
+
+    def __init__(self) -> None:
+        self.release = threading.Event()
+        self.calls = 0
+
+    def sample(self) -> ActivitySample:
+        self.calls += 1
+        if not self.release.wait(30.0):
+            raise TimeoutError("block never released")
         return ActivitySample(
             timestamp=float(self.calls),
             idle_seconds=0.0,
@@ -102,6 +124,14 @@ class ActivityRuntimePipelineTest(unittest.TestCase):
         self.assertEqual(rt.status.failure_count, 0)
 
 
+class _CanaryCustomBoom(Exception):
+    """allowlist に無いカスタム例外クラス (canary)。
+
+    runtime は内部で型名を保持する (ログ/内部用途)。外部への写像は
+    bootstrap の allowlist mapper が担う。
+    """
+
+
 class ActivityRuntimeSourceErrorTest(unittest.TestCase):
     def test_source_error_records_type_and_keeps_state(self) -> None:
         src = _FakeSource()
@@ -115,6 +145,21 @@ class ActivityRuntimeSourceErrorTest(unittest.TestCase):
         self.assertEqual(rt.status.last_error_type, "OSError")
         self.assertEqual(rt.status.consecutive_failures, 1)
         self.assertEqual(rt.state.activity_mode, "focused")
+
+    def test_canary_custom_exception_stored_as_type_name_internally(self) -> None:
+        src = _FakeSource()
+        rt = ActivityRuntime(src)
+        src.push_error(_CanaryCustomBoom("secret canary detail"))
+        rt.collect_once()
+        # 内部 (runtime status) は型名を保持する。外部 payload の写像は
+        # bootstrap の allowlist mapper が internal_error へ落とす。
+        self.assertEqual(rt.status.last_error_type, "_CanaryCustomBoom")
+        self.assertNotIn("secret canary detail", str(vars(rt)))
+        from src.perception.bootstrap import sensor_error_code_from_name
+
+        self.assertEqual(
+            sensor_error_code_from_name(rt.status.last_error_type), "internal_error"
+        )
 
     def test_source_error_message_is_not_retained(self) -> None:
         src = _FakeSource()
@@ -265,6 +310,8 @@ class ActivityRuntimeStatusTest(unittest.TestCase):
                 "failure_count",
                 "consecutive_failures",
                 "last_error_type",
+                "stop_failed",
+                "stop_failed_at",
             },
         )
         self.assertFalse(status.running)
@@ -273,6 +320,8 @@ class ActivityRuntimeStatusTest(unittest.TestCase):
         self.assertEqual(status.failure_count, 0)
         self.assertEqual(status.consecutive_failures, 0)
         self.assertIsNone(status.last_error_type)
+        self.assertFalse(status.stop_failed)
+        self.assertIsNone(status.stop_failed_at)
 
     def test_status_tracks_running_and_updates(self) -> None:
         src = _FakeSource()
@@ -336,9 +385,266 @@ class ActivityRuntimeValidationTest(unittest.TestCase):
             ActivityRuntime(_FakeSource(), callback="not-callable")
 
 
+class ActivityRuntimeStopHardeningTest(unittest.TestCase):
+    """ブロックする source に対する fail-safe / 冪等な停止の決定論的テスト。"""
+
+    def _stop_blocked(
+        self,
+        rt: ActivityRuntime,
+        release: threading.Event,
+    ) -> None:
+        """ブロックを解除し、スレッド終了を確認して所有権を解放する後始末。"""
+        release.set()
+        self.assertTrue(_wait_until(lambda: not rt.is_running, timeout=5.0))
+        rt.stop(timeout=1.0)
+        self.assertFalse(rt.is_running)
+        self.assertFalse(rt.status.stop_failed)
+
+    def test_stop_timeout_keeps_ownership_and_reports_fixed_failure(self) -> None:
+        src = _BlockingSource()
+        rt = ActivityRuntime(src, poll_interval=0.01, stop_event=threading.Event())
+        rt.start()
+        first = rt._thread
+        self.assertTrue(rt.is_running)
+        rt.stop(timeout=0.2)
+        # 生存スレッドを停止済みと報告しない (所有権を保持、真実の running を返す)
+        self.assertTrue(rt.is_running)
+        self.assertTrue(rt.status.running)
+        self.assertIs(rt._thread, first)
+        # 固定の失敗状態のみ公開し、例外の内容は漏れない
+        self.assertTrue(rt.status.stop_failed)
+        self.assertIsNotNone(rt.status.stop_failed_at)
+        self.assertIsNone(rt.status.last_error_type)
+        self._stop_blocked(rt, src.release)
+
+    def test_repeated_stop_is_idempotent_while_thread_live(self) -> None:
+        src = _BlockingSource()
+        rt = ActivityRuntime(src, poll_interval=0.01, stop_event=threading.Event())
+        rt.start()
+        first = rt._thread
+        rt.stop(timeout=0.2)
+        rt.stop(timeout=0.2)
+        rt.stop(timeout=0.2)
+        self.assertTrue(rt.status.stop_failed)
+        self.assertIs(rt._thread, first)
+        self.assertTrue(rt.is_running)
+        alive = [
+            t
+            for t in threading.enumerate()
+            if t.name == "activity-runtime" and t.is_alive()
+        ]
+        self.assertEqual(len(alive), 1)
+        self._stop_blocked(rt, src.release)
+
+    def test_restart_denied_while_thread_still_live(self) -> None:
+        src = _BlockingSource()
+        rt = ActivityRuntime(src, poll_interval=0.01, stop_event=threading.Event())
+        rt.start()
+        first = rt._thread
+        rt.stop(timeout=0.2)
+        self.assertTrue(rt.status.stop_failed)
+        rt.start()
+        # 再起動を拒否: 新しいスレッドを生成せず、複製コレクタを作らない
+        self.assertIs(rt._thread, first)
+        self.assertTrue(rt.is_running)
+        alive = [
+            t
+            for t in threading.enumerate()
+            if t.name == "activity-runtime" and t.is_alive()
+        ]
+        self.assertEqual(len(alive), 1)
+        self._stop_blocked(rt, src.release)
+
+    def test_restart_allowed_after_prior_thread_confirmed_dead(self) -> None:
+        src = _BlockingSource()
+        rt = ActivityRuntime(src, poll_interval=0.01, stop_event=threading.Event())
+        rt.start()
+        first = rt._thread
+        rt.stop(timeout=0.2)
+        self.assertTrue(rt.status.stop_failed)
+        # ブロック解除 → 前スレッドが自ら終了
+        src.release.set()
+        self.assertTrue(_wait_until(lambda: not rt.is_running, timeout=5.0))
+        # 終了確認後の start() はリソースを回収して再起動できる
+        rt.start()
+        self.assertIsNot(rt._thread, first)
+        self.assertTrue(rt.is_running)
+        self.assertFalse(rt.status.stop_failed)
+        self.assertIsNone(rt.status.stop_failed_at)
+        rt.stop(timeout=1.0)
+        self.assertFalse(rt.is_running)
+
+    def test_prompt_stop_normal_path_keeps_clean_state(self) -> None:
+        src = _FlagSource()
+        stop_event = threading.Event()
+        rt = ActivityRuntime(src, poll_interval=0.01, stop_event=stop_event)
+        rt.start()
+        first = rt._thread
+        stop_event.set()
+        rt.stop(timeout=1.0)
+        self.assertFalse(rt.is_running)
+        self.assertFalse(rt.status.stop_failed)
+        self.assertIsNone(rt.status.stop_failed_at)
+        rt.start()
+        self.assertIsNot(rt._thread, first)
+        self.assertTrue(rt.is_running)
+        rt.stop(timeout=1.0)
+        self.assertFalse(rt.is_running)
+        self.assertIsNone(rt._thread)
+
+
 class ActivityRuntimeExportTest(unittest.TestCase):
     def test_package_exports_match_module(self) -> None:
         self.assertIs(ActivityRuntime, ModActivityRuntime)
+
+
+class _FakeThread:
+    """threading.Thread の決定論的代替。
+
+    start 例外・即死・部分起動 (start 例外でも生存) をクラス属性で設定できる。
+    made に生成順のインスタンスを残す。
+    """
+
+    start_error: BaseException | None = None
+    die_immediately = False
+    partial_alive = False
+    made: list = []
+
+    def __init__(
+        self,
+        *,
+        target: object = None,
+        name: str | None = None,
+        daemon: bool | None = None,
+        **kwargs: object,
+    ) -> None:
+        self.target = target
+        self.name = name
+        self.daemon = daemon
+        self._started = False
+        self._alive = False
+        _FakeThread.made.append(self)
+
+    def start(self) -> None:
+        if _FakeThread.start_error is not None:
+            if _FakeThread.partial_alive:
+                self._alive = True
+            raise _FakeThread.start_error
+        self._started = True
+        self._alive = not _FakeThread.die_immediately
+
+    def is_alive(self) -> bool:
+        return self._alive
+
+    def join(self, timeout: float | None = None) -> None:
+        if self._started:
+            self._alive = False
+
+    def kill(self) -> None:
+        self._alive = False
+
+
+class ActivityRuntimeStartHardeningTest(unittest.TestCase):
+    """start の factory/start 例外・即死・所有権保持の決定論的テスト。"""
+
+    def setUp(self) -> None:
+        _FakeThread.made.clear()
+        _FakeThread.start_error = None
+        _FakeThread.die_immediately = False
+        _FakeThread.partial_alive = False
+
+    def tearDown(self) -> None:
+        _FakeThread.start_error = None
+        _FakeThread.die_immediately = False
+        _FakeThread.partial_alive = False
+
+    def test_factory_failure_returns_false_and_creates_no_worker(self) -> None:
+        rt = ActivityRuntime(_FakeSource())
+        with mock.patch.object(
+            threading,
+            "Thread",
+            side_effect=RuntimeError("thread factory boom"),
+        ):
+            self.assertFalse(rt.start())
+        self.assertIsNone(rt._thread)
+        self.assertFalse(rt.is_running)
+        self.assertFalse(rt.status.running)
+        rt.stop(timeout=0.1)
+
+    def test_start_failure_not_live_returns_false_and_clears_worker(self) -> None:
+        _FakeThread.start_error = RuntimeError("start boom")
+        rt = ActivityRuntime(_FakeSource())
+        with mock.patch.object(threading, "Thread", new=_FakeThread):
+            self.assertFalse(rt.start())
+        self.assertEqual(len(_FakeThread.made), 1)
+        self.assertIsNone(rt._thread)
+        self.assertFalse(rt.is_running)
+        self.assertFalse(rt.status.running)
+        rt.stop(timeout=0.1)
+        self.assertIsNone(rt._thread)
+        self.assertFalse(rt.status.stop_failed)
+
+    def test_start_failure_partially_live_returns_true_and_retains_worker(
+        self,
+    ) -> None:
+        _FakeThread.start_error = RuntimeError("start boom")
+        _FakeThread.partial_alive = True
+        rt = ActivityRuntime(_FakeSource())
+        with mock.patch.object(threading, "Thread", new=_FakeThread):
+            self.assertTrue(rt.start())
+        self.assertEqual(len(_FakeThread.made), 1)
+        self.assertIs(rt._thread, _FakeThread.made[0])
+        self.assertTrue(rt.is_running)
+        self.assertTrue(rt.status.running)
+        self.assertFalse(rt.status.stop_failed)
+        self.assertIsNone(rt.status.stop_failed_at)
+        # 生存スレッドがある限り再起動は拒否される
+        with mock.patch.object(threading, "Thread", new=_FakeThread):
+            self.assertFalse(rt.start())
+        self.assertEqual(len(_FakeThread.made), 1)
+        self.assertIs(rt._thread, _FakeThread.made[0])
+        # 死亡確認後は所有権が解放され再起動できる
+        _FakeThread.made[0].kill()
+        _FakeThread.start_error = None
+        _FakeThread.partial_alive = False
+        with mock.patch.object(threading, "Thread", new=_FakeThread):
+            self.assertTrue(rt.start())
+        self.assertIsNot(rt._thread, _FakeThread.made[0])
+        self.assertIs(rt._thread, _FakeThread.made[1])
+        self.assertTrue(rt.is_running)
+        rt.stop(timeout=0.1)
+        self.assertFalse(rt.is_running)
+        self.assertIsNone(rt._thread)
+
+    def test_immediate_death_returns_false_and_clears_worker(self) -> None:
+        _FakeThread.die_immediately = True
+        rt = ActivityRuntime(_FakeSource())
+        with mock.patch.object(threading, "Thread", new=_FakeThread):
+            self.assertFalse(rt.start())
+        self.assertEqual(len(_FakeThread.made), 1)
+        self.assertIsNone(rt._thread)
+        self.assertFalse(rt.is_running)
+        self.assertFalse(rt.status.running)
+        _FakeThread.die_immediately = False
+        with mock.patch.object(threading, "Thread", new=_FakeThread):
+            self.assertTrue(rt.start())
+        self.assertIs(rt._thread, _FakeThread.made[1])
+        self.assertTrue(rt.is_running)
+        rt.stop(timeout=0.1)
+        self.assertFalse(rt.is_running)
+
+    def test_start_never_overwrites_live_worker(self) -> None:
+        rt = ActivityRuntime(_FakeSource())
+        with mock.patch.object(threading, "Thread", new=_FakeThread):
+            self.assertTrue(rt.start())
+        first = rt._thread
+        self.assertTrue(rt.is_running)
+        with mock.patch.object(threading, "Thread", new=_FakeThread):
+            self.assertFalse(rt.start())
+        self.assertIs(rt._thread, first)
+        self.assertTrue(rt.is_running)
+        rt.stop(timeout=0.1)
+        self.assertFalse(rt.is_running)
 
 
 if __name__ == "__main__":

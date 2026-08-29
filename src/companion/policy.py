@@ -60,6 +60,7 @@ class PolicyContext:
 class DeterministicProactivePolicy:
     """CompanionState と時刻から介入可否を決定的に決める Policy。
 
+    - away / 不在 (present=False) 中は黙る (全アクション抑止, reason="away")。
     - focused 中は黙る (予定が迫っていて interruptible なら schedule_remind 可)。
     - away 復帰直後は away_return。
     - 長時間作業 (focused_since から long_work_seconds 以上) かつ interruptible
@@ -86,6 +87,9 @@ class DeterministicProactivePolicy:
 
     def decide(self, ctx: PolicyContext) -> PolicyDecision:
         state = ctx.state
+
+        if state.activity_mode == "away" or not state.present:
+            return self._silent(reason="away", cooldown_key="away")
 
         if state.activity_mode == "focused":
             if self._schedule_approaching(ctx) and state.interruptible:

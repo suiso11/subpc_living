@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import io
 import json
 import sqlite3
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from datetime import date, datetime
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+from src.chat.config import ChatConfig
 from src.diary.collector import DiaryCollector, DiarySources
+from src.diary.main import main as diary_main
 from src.diary.service import DailyDiaryService
 from src.integrations.google_calendar import GoogleCalendarMCPClient
 from src.llm.errors import ProviderRequestError
@@ -339,6 +345,164 @@ class DailyPersonalizerTest(unittest.TestCase):
         path = root / "data" / "diary" / "2026-07-01.md"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("# 2026-07-01 の日記\n\nコーヒーイベントの話があった。", encoding="utf-8")
+
+
+class DiaryMainEntrypointTest(unittest.TestCase):
+    """Offline wiring tests for the manual diary entrypoint (src.diary.main)."""
+
+    def test_main_uses_build_local_provider_ollama_default_and_closes(self) -> None:
+        provider_cls, providers = _recording_provider_class()
+        service_cls, services = _recording_service_class(fail=False)
+        config = ChatConfig(ollama_base_url="http://localhost:9999", model="qwen")
+        with (
+            patch("sys.argv", ["diary-main", "--date", "2026-07-01", "--no-calendar", "--no-save"]),
+            patch.object(ChatConfig, "load", return_value=config),
+            patch("src.assistant.factory.OllamaProvider", provider_cls),
+            patch("src.diary.main.DiaryCollector", _FakeCollectorClass),
+            patch("src.diary.main.DailyDiaryService", service_cls),
+            redirect_stdout(io.StringIO()),
+        ):
+            diary_main()
+
+        self.assertEqual(len(providers), 1)
+        self.assertEqual(
+            providers[0].kwargs,
+            {"base_url": "http://localhost:9999", "model": "qwen", "provider_id": "ollama"},
+        )
+        self.assertEqual(len(services), 1)
+        self.assertIs(services[0].kwargs["llm"], providers[0])
+        self.assertEqual(services[0].kwargs["num_ctx"], config.num_ctx)
+        self.assertTrue(providers[0].closed)
+
+    def test_main_selects_openai_compatible_provider_and_closes(self) -> None:
+        provider_cls, providers = _recording_provider_class()
+        service_cls, services = _recording_service_class(fail=False)
+        config = ChatConfig(
+            local_provider_kind="openai_compatible",
+            local_base_url="http://localhost:8000/v1",
+            model="qwen",
+        )
+        with (
+            patch("sys.argv", ["diary-main", "--date", "2026-07-01", "--no-calendar", "--no-save"]),
+            patch.object(ChatConfig, "load", return_value=config),
+            patch("src.assistant.factory.LocalOpenAICompatibleProvider", provider_cls),
+            patch("src.diary.main.DiaryCollector", _FakeCollectorClass),
+            patch("src.diary.main.DailyDiaryService", service_cls),
+            redirect_stdout(io.StringIO()),
+        ):
+            diary_main()
+
+        self.assertEqual(len(providers), 1)
+        self.assertEqual(
+            providers[0].kwargs,
+            {
+                "model": "qwen",
+                "base_url": "http://localhost:8000/v1",
+                "provider_id": "local-openai",
+                "api_key": None,
+            },
+        )
+        self.assertIs(services[0].kwargs["llm"], providers[0])
+        self.assertTrue(providers[0].closed)
+
+    def test_main_closes_provider_when_generation_fails(self) -> None:
+        provider_cls, providers = _recording_provider_class()
+        service_cls, _services = _recording_service_class(fail=True)
+        config = ChatConfig()
+        with (
+            patch("sys.argv", ["diary-main", "--date", "2026-07-01", "--no-calendar", "--no-save"]),
+            patch.object(ChatConfig, "load", return_value=config),
+            patch("src.assistant.factory.OllamaProvider", provider_cls),
+            patch("src.diary.main.DiaryCollector", _FakeCollectorClass),
+            patch("src.diary.main.DailyDiaryService", service_cls),
+            redirect_stdout(io.StringIO()),
+        ):
+            with self.assertRaises(RuntimeError):
+                diary_main()
+
+        self.assertEqual(len(providers), 1)
+        self.assertTrue(providers[0].closed)
+
+    def test_main_closes_provider_when_calendar_client_construction_fails(self) -> None:
+        provider_cls, providers = _recording_provider_class()
+        config = ChatConfig()
+
+        class ExplodingCalendar:
+            @classmethod
+            def from_env(cls):
+                raise RuntimeError("forced calendar client failure")
+
+        with (
+            patch("sys.argv", ["diary-main", "--date", "2026-07-01"]),
+            patch.object(ChatConfig, "load", return_value=config),
+            patch("src.assistant.factory.OllamaProvider", provider_cls),
+            patch("src.diary.main.GoogleCalendarMCPClient", ExplodingCalendar),
+            patch("src.diary.main.DiaryCollector", _FakeCollectorClass),
+            redirect_stdout(io.StringIO()),
+        ):
+            with self.assertRaises(RuntimeError):
+                diary_main()
+
+        self.assertEqual(len(providers), 1)
+        self.assertTrue(providers[0].closed)
+
+    def test_main_closes_provider_when_service_constructor_fails(self) -> None:
+        provider_cls, providers = _recording_provider_class()
+        config = ChatConfig()
+
+        class ExplodingService:
+            def __init__(self, **kwargs) -> None:
+                raise RuntimeError("forced service constructor failure")
+
+        with (
+            patch("sys.argv", ["diary-main", "--date", "2026-07-01", "--no-calendar", "--no-save"]),
+            patch.object(ChatConfig, "load", return_value=config),
+            patch("src.assistant.factory.OllamaProvider", provider_cls),
+            patch("src.diary.main.DiaryCollector", _FakeCollectorClass),
+            patch("src.diary.main.DailyDiaryService", ExplodingService),
+            redirect_stdout(io.StringIO()),
+        ):
+            with self.assertRaises(RuntimeError):
+                diary_main()
+
+        self.assertEqual(len(providers), 1)
+        self.assertTrue(providers[0].closed)
+
+
+class _FakeCollectorClass:
+    def __init__(self, *args, **kwargs) -> None:
+        pass
+
+
+def _recording_provider_class():
+    instances = []
+
+    class RecordingProvider:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+            self.closed = False
+            instances.append(self)
+
+        def close(self) -> None:
+            self.closed = True
+
+    return RecordingProvider, instances
+
+
+def _recording_service_class(*, fail: bool):
+    instances = []
+
+    class RecordingService:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+            instances.append(self)
+
+        def generate(self, *args, **kwargs) -> SimpleNamespace:
+            if fail:
+                raise RuntimeError("forced entrypoint failure")
+            return SimpleNamespace(markdown="# 2026-07-01 の日記\n\n生成された。", markdown_path="")
+
+    return RecordingService, instances
 
 
 if __name__ == "__main__":

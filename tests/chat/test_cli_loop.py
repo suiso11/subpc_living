@@ -4,7 +4,8 @@ from contextlib import redirect_stdout
 import io
 import tempfile
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from src.assistant import AssistantRequest, AssistantService
 from src.chat.config import ChatConfig
@@ -66,18 +67,51 @@ class FailingStreamProvider(FakeProvider):
         yield from self.stream_chunks
 
 
+class FakeStreamResult:
+    """Offline StreamResult 風オブジェクト。close() 回数を記録する。"""
+
+    def __init__(self, chunks, text, stats=None) -> None:
+        self._chunks = chunks
+        self.response = SimpleNamespace(text=text, stats=stats or {})
+        self.close_count = 0
+
+    def __iter__(self):
+        yield from self._chunks
+
+    def close(self) -> None:
+        self.close_count += 1
+
+
+class FailingStreamResult(FakeStreamResult):
+    """反復途中で例外を送出する StreamResult 風オブジェクト。"""
+
+    def __init__(self, chunks, text, exc, stats=None) -> None:
+        super().__init__(chunks, text, stats=stats)
+        self.exc = exc
+
+    def __iter__(self):
+        yield from self._chunks
+        raise self.exc
+
+
 class StartupProvider(FakeProvider):
-    def __init__(self, *, available: bool, has_model: bool) -> None:
+    def __init__(
+        self, *, available: bool, has_model: bool, models: list[str] | None = None
+    ) -> None:
         super().__init__(available=available)
         self._has_model = has_model
+        self._models = list(models) if models is not None else []
         self.close_calls = 0
+        self.has_model_calls = 0
+        self.list_calls = 0
 
     def has_model(self) -> bool:
+        self.has_model_calls += 1
         return self._has_model
 
-    @staticmethod
-    def list_models() -> list[str]:
-        return ["other-model"]
+    def list_models(self) -> list[str]:
+        self.list_calls += 1
+        return list(self._models)
 
     def close(self) -> None:
         self.close_calls += 1
@@ -391,6 +425,309 @@ class CliLoopTest(unittest.TestCase):
 
                 self.assertEqual(raised.exception.code, 1)
                 self.assertEqual(provider.close_calls, 1)
+                # Ollama は厳格に is_available -> has_model の順で判定し、
+                # リスト再取得 (list_models 直接呼び) を行わない。
+                self.assertEqual(provider.list_calls, 0)
+                self.assertEqual(
+                    provider.has_model_calls, 0 if not available else 1
+                )
+
+    def _run_startup_ok(self, config, registry) -> str:
+        """main() を起動チェック成功まで走らせ、標準出力を返す。
+
+        データベース書き込み・対話ループ・Web検索を回避してオフラインで実行する。
+        """
+        provider = registry.entries()[0].provider
+        service = AssistantService(
+            registry,
+            StaticRouter(registry, default_provider_id=config.resolved_local_provider_id()),
+            options=GenerationOptions(),
+        )
+        output = io.StringIO()
+        with (
+            patch.object(chat_main.ChatConfig, "load", return_value=config),
+            patch.object(chat_main, "create_web_search_context", return_value=None),
+            patch.object(
+                chat_main,
+                "build_cli_service",
+                return_value=(service, registry),
+            ),
+            patch.object(chat_main, "run_chat_loop", return_value=None),
+            patch.object(
+                chat_main, "GrowthTracker", side_effect=RuntimeError("no db in tests")
+            ),
+            patch.object(
+                chat_main,
+                "ChatSession",
+                return_value=SimpleNamespace(turn_count=0, save=lambda: None),
+            ),
+            redirect_stdout(output),
+        ):
+            chat_main.main()
+        return output.getvalue()
+
+    def test_main_startup_preserves_default_ollama_backend(self) -> None:
+        config = ChatConfig()
+        provider = StartupProvider(available=True, has_model=True)
+        registry = ProviderRegistry()
+        registry.register("ollama", provider, local=True)
+
+        output = self._run_startup_ok(config, registry)
+
+        self.assertIn("接続OK", output)
+        self.assertIn("モデル確認OK", output)
+        # Ollama は厳格に has_model で判定し、直接 list_models は呼ばない。
+        self.assertEqual(provider.has_model_calls, 1)
+        self.assertEqual(provider.list_calls, 0)
+        self.assertEqual(provider.close_calls, 1)
+
+    def test_main_startup_uses_resolved_provider_id_for_openai_compatible(self) -> None:
+        config = ChatConfig(
+            local_provider_kind="openai_compatible",
+            local_provider_id="llama-server",
+        )
+        provider = StartupProvider(
+            available=True, has_model=True, models=[config.model]
+        )
+        registry = ProviderRegistry()
+        registry.register("llama-server", provider, local=True)
+
+        output = self._run_startup_ok(config, registry)
+
+        # "ollama" のみを登録していないので、get("ollama") に戻すと
+        # UnknownProviderError で失敗するはず。backend中性の文言で起動できること。
+        # openai_compatible は is_available() がライフサイクルのみのため「接続OK」とは
+        # 表示せず、/models 確認 (list_models 1回) を続行する。
+        self.assertIn("モデル確認OK", output)
+        self.assertNotIn("接続OK", output)
+        self.assertNotIn("ollama", output.lower())
+        self.assertEqual(provider.list_calls, 1)
+        self.assertEqual(provider.has_model_calls, 0)
+        self.assertEqual(provider.close_calls, 1)
+
+    def test_openai_compatible_empty_discovery_continues_with_warning(self) -> None:
+        config = ChatConfig(local_provider_kind="openai_compatible")
+        provider = StartupProvider(available=True, has_model=False, models=[])
+        registry = ProviderRegistry()
+        registry.register("local-openai", provider, local=True)
+
+        output = self._run_startup_ok(config, registry)
+
+        # /models が未実装 (空) でも起動を失敗させず、中立的な警告で続行する。
+        self.assertIn("モデル情報の取得に失敗しました。生成時に確認します。", output)
+        self.assertNotIn("接続OK", output)
+        self.assertEqual(provider.list_calls, 1)
+        self.assertEqual(provider.has_model_calls, 0)
+        self.assertEqual(provider.close_calls, 1)
+
+    def test_openai_compatible_known_missing_model_fails_and_closes(self) -> None:
+        config = ChatConfig(local_provider_kind="openai_compatible")
+        provider = StartupProvider(
+            available=True, has_model=False, models=["other-model"]
+        )
+        registry = ProviderRegistry()
+        registry.register("local-openai", provider, local=True)
+        service = AssistantService(
+            registry,
+            StaticRouter(registry, default_provider_id="local-openai"),
+            options=GenerationOptions(),
+        )
+        output = io.StringIO()
+
+        with (
+            patch.object(chat_main.ChatConfig, "load", return_value=config),
+            patch.object(
+                chat_main, "create_web_search_context", return_value=None
+            ),
+            patch.object(
+                chat_main,
+                "build_cli_service",
+                return_value=(service, registry),
+            ),
+            redirect_stdout(output),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            chat_main.main()
+
+        self.assertEqual(raised.exception.code, 1)
+        self.assertIn("モデル 'qwen2.5:7b-instruct-q4_K_M' が見つかりません", output.getvalue())
+        self.assertIn("利用可能なモデル: other-model", output.getvalue())
+        # 検出済みリスト1回だけで判定し、has_model (内部リスト再取得) は使わない。
+        self.assertEqual(provider.list_calls, 1)
+        self.assertEqual(provider.has_model_calls, 0)
+        self.assertEqual(provider.close_calls, 1)
+
+    def test_openai_compatible_unavailable_fails_and_closes(self) -> None:
+        config = ChatConfig(local_provider_kind="openai_compatible")
+        provider = StartupProvider(available=False, has_model=True)
+        registry = ProviderRegistry()
+        registry.register("local-openai", provider, local=True)
+        service = AssistantService(
+            registry,
+            StaticRouter(registry, default_provider_id="local-openai"),
+            options=GenerationOptions(),
+        )
+        output = io.StringIO()
+
+        with (
+            patch.object(chat_main.ChatConfig, "load", return_value=config),
+            patch.object(
+                chat_main, "create_web_search_context", return_value=None
+            ),
+            patch.object(
+                chat_main,
+                "build_cli_service",
+                return_value=(service, registry),
+            ),
+            redirect_stdout(output),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            chat_main.main()
+
+        self.assertEqual(raised.exception.code, 1)
+        self.assertIn("接続できません", output.getvalue())
+        self.assertEqual(provider.list_calls, 0)
+        self.assertEqual(provider.has_model_calls, 0)
+        self.assertEqual(provider.close_calls, 1)
+
+    def test_main_wires_emotion_tag_enabled_into_cli_session(self) -> None:
+        config = ChatConfig(emotion_tag_enabled=True)
+        provider = StartupProvider(available=True, has_model=True)
+        registry = ProviderRegistry()
+        registry.register("ollama", provider, local=True)
+        service = AssistantService(
+            registry,
+            StaticRouter(registry, default_provider_id="ollama"),
+            options=GenerationOptions(),
+        )
+        session_stub = SimpleNamespace(turn_count=0, save=lambda: "saved")
+        output = io.StringIO()
+
+        with (
+            patch.object(chat_main.ChatConfig, "load", return_value=config),
+            patch.object(chat_main, "create_web_search_context", return_value=None),
+            patch.object(
+                chat_main,
+                "build_cli_service",
+                return_value=(service, registry),
+            ),
+            patch.object(chat_main, "run_chat_loop", return_value=None),
+            patch.object(
+                chat_main, "GrowthTracker", side_effect=RuntimeError("offline")
+            ),
+            patch.object(
+                chat_main, "ChatSession", return_value=session_stub
+            ) as chat_session_cls,
+            redirect_stdout(output),
+        ):
+            chat_main.main()
+
+        self.assertIs(chat_session_cls.call_args.kwargs["emotion_tags"], True)
+
+
+class CliStreamCloseTest(unittest.TestCase):
+    """CLI run_chat_loop の StreamResult close / error 挙動。"""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def make_session(self) -> ChatSession:
+        config = ChatConfig(stream=True)
+        return ChatSession(
+            system_prompt=config.effective_system_prompt(),
+            max_history_turns=config.max_history_turns,
+            history_dir=self.temp_dir.name,
+        )
+
+    @staticmethod
+    def run_loop(config, session, service, *inputs: str) -> str:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            run_chat_loop(
+                config,
+                session,
+                service,
+                read_input=InputSequence(*inputs),
+            )
+        return output.getvalue()
+
+    def test_stream_normal_completion_closes_exactly_once(self) -> None:
+        config = ChatConfig(stream=True)
+        stream = FakeStreamResult(("応", "答"), text="応答")
+        service = Mock()
+        service.respond_stream.return_value = stream
+        session = self.make_session()
+
+        self.run_loop(config, session, service, "質問")
+
+        self.assertEqual(stream.close_count, 1)
+        self.assertEqual(
+            session.messages,
+            [
+                {"role": "user", "content": "質問"},
+                {"role": "assistant", "content": "応答"},
+            ],
+        )
+
+    def test_stream_empty_response_closes_exactly_once(self) -> None:
+        config = ChatConfig(stream=True)
+        stream = FakeStreamResult((), text="")
+        service = Mock()
+        service.respond_stream.return_value = stream
+        session = self.make_session()
+
+        self.run_loop(config, session, service, "質問")
+
+        self.assertEqual(stream.close_count, 1)
+        self.assertEqual(
+            session.messages,
+            [
+                {"role": "user", "content": "質問"},
+                {"role": "assistant", "content": ""},
+            ],
+        )
+
+    def test_stream_generation_error_closes_exactly_once_and_rolls_back(self) -> None:
+        config = ChatConfig(stream=True)
+        exc = ProviderRequestError("fake", "respond_stream", "planned failure")
+        stream = FailingStreamResult(("部分",), text="", exc=exc)
+        service = Mock()
+        service.respond_stream.return_value = stream
+        session = self.make_session()
+
+        output = self.run_loop(config, session, service, "失敗する質問")
+
+        self.assertEqual(stream.close_count, 1)
+        self.assertIn("部分", output)
+        self.assertIn("エラー:", output)
+        self.assertEqual(session.messages, [])
+
+    def test_respond_stream_failure_continues_without_leaking_close(self) -> None:
+        config = ChatConfig(stream=True)
+        exc = ProviderRequestError("fake", "respond_stream", "start failure")
+        good_stream = FakeStreamResult(("回復",), text="回復")
+        service = Mock()
+        service.respond_stream.side_effect = [exc, good_stream]
+        session = self.make_session()
+
+        output = self.run_loop(
+            config, session, service, "失敗する質問", "次の質問"
+        )
+
+        self.assertIn("エラー:", output)
+        self.assertIn("回復", output)
+        self.assertEqual(service.respond_stream.call_count, 2)
+        self.assertEqual(good_stream.close_count, 1)
+        self.assertEqual(
+            session.messages,
+            [
+                {"role": "user", "content": "次の質問"},
+                {"role": "assistant", "content": "回復"},
+            ],
+        )
 
 
 if __name__ == "__main__":

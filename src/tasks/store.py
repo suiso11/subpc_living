@@ -24,6 +24,7 @@ from typing import Any, Callable, Iterable, Optional
 from zoneinfo import ZoneInfo
 
 from src.tasks.decomposer import decompose_task
+from src.tasks.formatting import format_short_due
 from src.tasks.safety import is_sensitive_text
 
 UTC = timezone.utc
@@ -147,7 +148,8 @@ class TaskStore:
                     source TEXT NOT NULL DEFAULT 'command',
                     created_at TEXT NOT NULL,
                     completed_at TEXT,
-                    breakdown_json TEXT NOT NULL DEFAULT '[]'
+                    breakdown_json TEXT NOT NULL DEFAULT '[]',
+                    rev INTEGER NOT NULL DEFAULT 0
                 )
                 """
             )
@@ -225,6 +227,21 @@ class TaskStore:
             conn.execute("ALTER TABLE tasks ADD COLUMN calendar_synced_at TEXT")
         if "breakdown_json" not in cols:
             conn.execute("ALTER TABLE tasks ADD COLUMN breakdown_json TEXT NOT NULL DEFAULT '[]'")
+        if "rev" not in cols:
+            # 楽観的並行制御用のリビジョン。リマインドを無効化しうる変更が
+            # 同一トランザクションで rev = rev + 1 する。冪等 (存在すれば何もしない)。
+            conn.execute("ALTER TABLE tasks ADD COLUMN rev INTEGER NOT NULL DEFAULT 0")
+        # task_notifications の lease カラム (重複送信防止) は旧DBに無いことがある。
+        # CREATE TABLE IF NOT EXISTS は既存テーブルを変えないため、不足分だけ ALTER する。
+        # 新規DBでは CREATE 側に両カラムが含まれており、ここは何もしない (冪等)。
+        notif_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_notifications)").fetchall()
+        }
+        if notif_cols:
+            if "lease_owner" not in notif_cols:
+                conn.execute("ALTER TABLE task_notifications ADD COLUMN lease_owner TEXT")
+            if "lease_until" not in notif_cols:
+                conn.execute("ALTER TABLE task_notifications ADD COLUMN lease_until TEXT")
         # task_candidates は CREATE TABLE IF NOT EXISTS で新規DBには due_granularity 付きで
         # 作られる。旧DBに同テーブルが既に存在してカラム無しの場合だけ ALTER する。
         # テーブル自体が無い場合は上の CREATE で新スキーマが作られているので何もしない。
@@ -369,6 +386,7 @@ class TaskStore:
             "completed_at": from_iso(row["completed_at"]),
             "calendar_event_id": row["calendar_event_id"],
             "calendar_synced_at": from_iso(row["calendar_synced_at"]),
+            "rev": row["rev"] or 0,
         }
 
     # --- CRUD ---
@@ -503,6 +521,7 @@ class TaskStore:
             params.append(priority)
         if not fields:
             return False
+        fields.append("rev = rev + 1")  # リマインドを無効化しうる変更を記録
         params.append(task_id)
         with self._tx(immediate=True) as conn:
             cur = conn.execute(
@@ -539,7 +558,7 @@ class TaskStore:
                 return False
             hint, steps = self._generated_breakdown(str(row["title"]), row["note"])
             conn.execute(
-                "UPDATE tasks SET action_hint = ?, breakdown_json = ? WHERE id = ?",
+                "UPDATE tasks SET action_hint = ?, breakdown_json = ?, rev = rev + 1 WHERE id = ?",
                 (hint, self._encode_breakdown(steps), task_id),
             )
             self._log_event(conn, task_id, "decompose", "manual regenerate", now)
@@ -594,7 +613,8 @@ class TaskStore:
         now = now or utc_now()
         with self._tx(immediate=True) as conn:
             cur = conn.execute(
-                "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ? AND status = 'open'",
+                "UPDATE tasks SET status = 'done', completed_at = ?, rev = rev + 1 "
+                "WHERE id = ? AND status = 'open'",
                 (to_iso(now), task_id),
             )
             changed = cur.rowcount > 0
@@ -609,7 +629,8 @@ class TaskStore:
         now = now or utc_now()
         with self._tx(immediate=True) as conn:
             cur = conn.execute(
-                "UPDATE tasks SET status = 'dropped', completed_at = ? WHERE id = ? AND status = 'open'",
+                "UPDATE tasks SET status = 'dropped', completed_at = ?, rev = rev + 1 "
+                "WHERE id = ? AND status = 'open'",
                 (to_iso(now), task_id),
             )
             changed = cur.rowcount > 0
@@ -635,6 +656,10 @@ class TaskStore:
                 WHERE task_id = ?
                 """,
                 (to_iso(until), to_iso(until), task_id),
+            )
+            conn.execute(
+                "UPDATE tasks SET rev = rev + 1 WHERE id = ? AND status = 'open'",
+                (task_id,),
             )
             self._log_event(conn, task_id, "snooze", f"until={to_iso(until)}", now)
         return True
@@ -762,6 +787,44 @@ class TaskStore:
                 claimed.append(task)
         return claimed
 
+    def revalidate_notification_lease(
+        self,
+        task_id: int,
+        owner: str,
+        expected_rev: int,
+        *,
+        lease_seconds: int = 120,
+        now: Optional[datetime] = None,
+    ) -> bool:
+        """外部コールバック直前の lease と rev の再検証 (BEGIN IMMEDIATE)。
+
+        - task が open かつ rev が expected_rev と一致し、かつ lease_owner が
+          owner のときだけ lease を延長して True を返す。
+        - それ以外 (存在しない / done/dropped / rev 不一致) は owner の
+          stale lease だけを安全に解除して False を返す。他 owner の lease は
+          触らない。
+        """
+        now = now or utc_now()
+        now_iso = to_iso(now)
+        lease_until_iso = to_iso(now + timedelta(seconds=lease_seconds))
+        with self._tx(immediate=True) as conn:
+            row = conn.execute(
+                "SELECT status, rev FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if row is None or row["status"] != "open" or (row["rev"] or 0) != expected_rev:
+                conn.execute(
+                    "UPDATE task_notifications SET lease_owner = NULL, lease_until = NULL "
+                    "WHERE task_id = ? AND lease_owner = ?",
+                    (task_id, owner),
+                )
+                return False
+            cur = conn.execute(
+                "UPDATE task_notifications SET lease_owner = ?, lease_until = ? "
+                "WHERE task_id = ? AND lease_owner = ?",
+                (owner, lease_until_iso, task_id, owner),
+            )
+            return cur.rowcount > 0
+
     def record_notification(
         self,
         task_id: int,
@@ -772,14 +835,38 @@ class TaskStore:
         repeat_count: int,
         fired: bool,
         now: Optional[datetime] = None,
-    ) -> None:
+        expected_rev: Optional[int] = None,
+    ) -> bool:
         """claim 済みタスクの通知状態を更新し、lease を解放する。
 
         fired=True のとき last_notified_at と last_stage を更新する。
         fired=False (未発火・繰り越し等) のときは next_notify_at のみ更新する。
+
+        expected_rev を指定した場合、task が open かつ rev が expected_rev と
+        一致し、かつ lease_owner が owner のときだけ更新して True を返す。
+        それ以外は何も更新せず、owner の stale lease だけを安全に解除して
+        False を返す (並行の done/drop/update/snooze を上書きしない)。
+        省略時は旧挙動のまま無条件更新して True を返す。
         """
         now = now or utc_now()
         with self._tx(immediate=True) as conn:
+            if expected_rev is not None:
+                row = conn.execute(
+                    "SELECT status, rev FROM tasks WHERE id = ?", (task_id,)
+                ).fetchone()
+                if row is None or row["status"] != "open" or (row["rev"] or 0) != expected_rev:
+                    conn.execute(
+                        "UPDATE task_notifications SET lease_owner = NULL, lease_until = NULL "
+                        "WHERE task_id = ? AND lease_owner = ?",
+                        (task_id, owner),
+                    )
+                    return False
+                cur = conn.execute(
+                    "SELECT lease_owner FROM task_notifications WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()
+                if cur is None or cur["lease_owner"] != owner:
+                    return False
             if fired:
                 conn.execute(
                     """
@@ -800,6 +887,7 @@ class TaskStore:
                     """,
                     (to_iso(next_notify_at), repeat_count, task_id),
                 )
+        return True
 
     def release_lease(self, task_id: int, owner: str) -> None:
         with self._tx(immediate=True) as conn:
@@ -1063,9 +1151,7 @@ def format_local_due(due_at: Optional[datetime], granularity: Optional[str], tz:
     if due_at is None:
         return "期限なし"
     local = due_at.astimezone(tz)
-    if granularity == "date":
-        return local.strftime("%-m/%-d")
-    return local.strftime("%-m/%-d %H:%M")
+    return format_short_due(local, with_time=granularity != "date")
 
 
 AUTHORITY_HEADER = (

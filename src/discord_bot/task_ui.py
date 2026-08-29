@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 import discord
 
 from src.tasks.extractor import build_extraction_prompt, validate_extraction
+from src.tasks.formatting import format_short_due
 
 UTC = timezone.utc
 
@@ -425,7 +426,7 @@ def _refresh_board(state: Any) -> None:
 def make_due_summary(due_at: Optional[datetime], tz: ZoneInfo) -> str:
     if due_at is None:
         return "期限なし"
-    return due_at.astimezone(tz).strftime("%-m/%-d %H:%M")
+    return format_short_due(due_at.astimezone(tz), with_time=True)
 
 
 class TaskConfirmView(discord.ui.View):

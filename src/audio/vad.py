@@ -82,7 +82,7 @@ class EnergyVAD:
         # 閾値をノイズフロアの3倍に設定
         self.energy_threshold = max(self._noise_floor * 3, 0.005)
         self._calibrated = True
-        print(f"[VAD] キャリブレーション完了: noise_floor={self._noise_floor:.4f}, threshold={self.energy_threshold:.4f}")
+        print("[VAD] calibration complete")
         return self._noise_floor
 
     def process_frame(self, frame: np.ndarray) -> Optional[np.ndarray]:
@@ -218,15 +218,14 @@ class SileroVAD:
             )
             self._model = model
             self._model.eval()
-            logger.info("[VAD] Silero VAD モデルロード完了")
-            print("[VAD] Silero VAD モデルロード完了")
+            logger.info("[VAD] silero vad model loaded")
+            print("[VAD] silero vad model loaded")
         except ImportError:
             raise ImportError(
-                "Silero VAD requires torch. "
-                "Install with: pip install torch torchaudio"
-            )
-        except Exception as e:
-            raise RuntimeError(f"Silero VAD モデルロード失敗: {e}")
+                "silero vad requires torch and torchaudio"
+            ) from None
+        except Exception:
+            raise RuntimeError("silero vad model load failed") from None
 
     def process_frame(self, frame: np.ndarray) -> Optional[np.ndarray]:
         """
@@ -292,7 +291,7 @@ class SileroVAD:
 
     def calibrate(self, audio_data: np.ndarray, duration_sec: float = 1.0) -> float:
         """Silero VADはキャリブレーション不要だが、互換性のためインターフェースを提供"""
-        print("[VAD] Silero VAD はキャリブレーション不要です (DNNベースで自動適応)")
+        print("[VAD] silero vad does not require calibration")
         return 0.0
 
     @property
@@ -317,17 +316,17 @@ def create_vad(
         VADインスタンス
     """
     if vad_type == "silero":
-        return SileroVAD(sample_rate=sample_rate, **kwargs)
+        try:
+            return SileroVAD(sample_rate=sample_rate, **kwargs)
+        except Exception:
+            raise RuntimeError("silero vad initialization failed") from None
     elif vad_type == "energy":
         return EnergyVAD(sample_rate=sample_rate, **kwargs)
     elif vad_type == "auto":
         try:
-            import torch  # noqa: F401
-            import torchaudio  # noqa: F401
-            print("[VAD] torch + torchaudio が利用可能 → Silero VAD を使用")
             return SileroVAD(sample_rate=sample_rate, **kwargs)
-        except ImportError:
-            print("[VAD] Silero VAD 依存ライブラリ不足 → Energy VAD にフォールバック (pip install torchaudio)")
+        except Exception as exc:
+            print(f"[VAD] silero unavailable ({type(exc).__name__}); falling back to energy vad")
             return EnergyVAD(sample_rate=sample_rate, **kwargs)
     else:
-        raise ValueError(f"未知のVADタイプ: {vad_type}")
+        raise ValueError("unknown vad type") from None

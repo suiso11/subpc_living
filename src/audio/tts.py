@@ -145,7 +145,7 @@ class KokoroTTS:
 
         self.models_dir.mkdir(parents=True, exist_ok=True)
 
-        print("[TTS] kokoro-onnx モデルをダウンロード中...")
+        print("[TTS] model download started")
         hf_hub_download(
             self.HF_REPO, self.MODEL_FILE,
             local_dir=str(self.models_dir),
@@ -154,7 +154,7 @@ class KokoroTTS:
             self.HF_REPO, self.VOICES_FILE,
             local_dir=str(self.models_dir),
         )
-        print("[TTS] ✅ モデルダウンロード完了")
+        print("[TTS] model download complete")
 
     def load(self) -> None:
         """モデルをロード"""
@@ -162,12 +162,12 @@ class KokoroTTS:
             return
 
         if not self.is_installed():
-            print("[TTS] モデルが見つかりません。ダウンロードします...")
+            print("[TTS] model missing; downloading")
             self.install()
 
         from kokoro_onnx import Kokoro
 
-        print("[TTS] kokoro-onnx モデルをロード中...")
+        print("[TTS] model load started")
         start = time.time()
         providers = self._resolve_onnx_providers()
         if providers is None:
@@ -181,12 +181,11 @@ class KokoroTTS:
                 try:
                     ort.preload_dlls(directory="")
                 except Exception as e:
-                    print(f"[TTS] CUDAライブラリのプリロードに失敗: {e}")
+                    print(f"[TTS] CUDA preload failed: {type(e).__name__}")
             session = ort.InferenceSession(str(self._model_path), providers=providers)
             self._kokoro = Kokoro.from_session(session, str(self._voices_path))
         elapsed = time.time() - start
-        provider_text = ", ".join(self._kokoro.sess.get_providers())
-        print(f"[TTS] モデルロード完了 ({elapsed:.1f}秒, providers={provider_text})")
+        print(f"[TTS] model load complete ({elapsed:.1f}s)")
 
         if self.lang == "ja":
             self._load_ja_g2p()
@@ -229,10 +228,10 @@ class KokoroTTS:
         try:
             from misaki import ja
             self._ja_g2p = ja.JAG2P()
-            print("[TTS] 日本語G2P (misaki) ロード完了")
+            print("[TTS] Japanese G2P load complete")
         except Exception as e:
-            print(f"[TTS] ⚠️ 日本語G2Pロード失敗 (espeak-ngにフォールバック、漢字は読めません): {e}")
-            print("[TTS]    修復方法: .venv/bin/python -m unidic download")
+            print(f"[TTS] Japanese G2P load failed; using fallback: {type(e).__name__}")
+            print("[TTS] repair: install the Japanese dictionary")
 
     def _create_chunk(self, chunk: str) -> tuple[np.ndarray, int]:
         """1チャンクを合成。日本語はmisakiで音素化してから渡す。"""
@@ -289,13 +288,13 @@ class KokoroTTS:
                 all_samples.append(samples)
                 if index < len(chunks) - 1:
                     all_samples.append(_pause_samples(sr))
-            except (IndexError, Exception) as e:
-                # 音素変換エラー時はスキップして続行
-                print(f"[TTS] チャンク合成スキップ: {e} ({chunk[:20]}...)")
+            except Exception as e:
+                # 音素変換エラー時はスキップして続行。チャンク本文・例外本文は出さない。
+                print(f"[TTS] chunk synthesis failed: {type(e).__name__}")
                 continue
 
         if not all_samples:
-            print("[TTS] 全チャンク失敗")
+            print("[TTS] all chunks failed")
             return self._empty_wav()
 
         combined = np.concatenate(all_samples)
@@ -313,7 +312,10 @@ class KokoroTTS:
 
         wav_data = wav_buffer.getvalue()
         duration = len(combined) / sr
-        print(f"[TTS] 合成完了 ({elapsed:.2f}秒, 音声{duration:.1f}秒, {len(chunks)}チャンク): {text[:30]}{'...' if len(text) > 30 else ''}")
+        print(
+            f"[TTS] synthesis complete (elapsed={elapsed:.2f}s, "
+            f"duration={duration:.1f}s, chunks={len(chunks)})"
+        )
 
         return wav_data
 

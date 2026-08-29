@@ -239,6 +239,90 @@ class NativeAudioRecorderTest(unittest.TestCase):
             self.assertEqual(wav.getframerate(), 16000)
             self.assertEqual(wav.getnframes(), 160)
 
+    def test_stop_failure_close_success_clears_stream_and_preserves_chunks(self) -> None:
+        import numpy as np
+
+        class FakeStream:
+            def __init__(self, *, callback, **kwargs):
+                del kwargs
+                self.callback = callback
+                self.close_calls = 0
+
+            def start(self):
+                self.callback(np.array([[11], [-7]], dtype=np.int16), 2, None, None)
+
+            def stop(self):
+                raise RuntimeError("raw stop failure C:\\private\\device")
+
+            def close(self):
+                self.close_calls += 1
+
+        stream_holder = []
+
+        def make_stream(**kwargs):
+            stream = FakeStream(**kwargs)
+            stream_holder.append(stream)
+            return stream
+
+        fake = SimpleNamespace(InputStream=make_stream)
+        with patch.dict(sys.modules, {"sounddevice": fake}):
+            recorder = NativeAudioRecorder(sample_rate=16000)
+            recorder.start()
+            with self.assertRaisesRegex(RuntimeError, "^audio recorder stop failed$"):
+                recorder.stop()
+
+        self.assertFalse(recorder.recording)
+        self.assertEqual(len(recorder._chunks), 1)
+        self.assertEqual(stream_holder[0].close_calls, 1)
+
+    def test_stop_and_close_failure_retains_stream_for_retry(self) -> None:
+        import numpy as np
+
+        class FakeStream:
+            def __init__(self, *, callback, **kwargs):
+                del kwargs
+                self.callback = callback
+                self.stop_calls = 0
+                self.close_calls = 0
+
+            def start(self):
+                self.callback(np.array([[3], [4], [5]], dtype=np.int16), 3, None, None)
+
+            def stop(self):
+                self.stop_calls += 1
+                if self.stop_calls == 1:
+                    raise RuntimeError("raw stop failure")
+
+            def close(self):
+                self.close_calls += 1
+                if self.close_calls == 1:
+                    raise RuntimeError("raw close failure")
+
+        stream_holder = []
+
+        def make_stream(**kwargs):
+            stream = FakeStream(**kwargs)
+            stream_holder.append(stream)
+            return stream
+
+        fake = SimpleNamespace(InputStream=make_stream)
+        with patch.dict(sys.modules, {"sounddevice": fake}):
+            recorder = NativeAudioRecorder(sample_rate=16000)
+            recorder.start()
+            with self.assertRaisesRegex(RuntimeError, "^audio recorder stop failed$"):
+                recorder.stop()
+            self.assertTrue(recorder.recording)
+            self.assertEqual(len(recorder._chunks), 1)
+
+            payload = recorder.stop()
+
+        self.assertFalse(recorder.recording)
+        self.assertEqual(recorder._chunks, [])
+        self.assertEqual(stream_holder[0].stop_calls, 2)
+        self.assertEqual(stream_holder[0].close_calls, 2)
+        with wave.open(io.BytesIO(payload), "rb") as wav:
+            self.assertEqual(wav.getnframes(), 3)
+
 
 if __name__ == "__main__":
     unittest.main()

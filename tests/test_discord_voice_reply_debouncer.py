@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 
-from src.discord_bot.voice_reply_debouncer import VoiceReplyDebouncer
+from src.discord_bot.voice_reply_debouncer import (
+    VoiceReplyDebouncer,
+    VoiceReplyGenerationGate,
+)
 
 
 class _FakeHandle:
@@ -151,6 +155,166 @@ class VoiceReplyDebouncerTest(unittest.TestCase):
         # Buffer cleared; a stray timer fire must not double-flush.
         loop.advance(5.0)
         self.assertEqual(len(flushed), 1)
+
+
+class _FakeTask:
+    """Minimal deterministic stand-in for an asyncio.Task used by the gate.
+
+    Supports ``done()`` / ``cancel()`` / ``add_done_callback()`` only, so the gate's
+    sync revoke and task-tracking can be tested without any event loop.
+    """
+
+    def __init__(self, done: bool = False) -> None:
+        self._done = done
+        self.cancel_calls = 0
+        self._done_callbacks: list = []
+
+    def done(self) -> bool:
+        return self._done
+
+    def cancel(self) -> None:
+        self.cancel_calls += 1
+
+    def add_done_callback(self, callback) -> None:
+        self._done_callbacks.append(callback)
+
+    def finish(self) -> None:
+        self._done = True
+        for callback in self._done_callbacks:
+            callback(self)
+
+
+class VoiceReplyGenerationGateTest(unittest.TestCase):
+    """VoiceReplyGenerationGate の世代管理・revoke・タスク追跡を検証する。"""
+
+    def test_activate_returns_incrementing_generation(self) -> None:
+        gate = VoiceReplyGenerationGate()
+        self.assertFalse(gate.active)
+        self.assertEqual(gate.generation, 0)
+        gen1 = gate.activate()
+        self.assertEqual(gen1, 1)
+        self.assertTrue(gate.active)
+        gen2 = gate.activate()
+        self.assertEqual(gen2, 2)
+
+    def test_is_active_requires_same_generation(self) -> None:
+        gate = VoiceReplyGenerationGate()
+        gen = gate.activate()
+        self.assertTrue(gate.is_active(gen))
+        self.assertFalse(gate.is_active(gen - 1))
+        self.assertFalse(gate.is_active(gen + 1))
+        self.assertFalse(gate.is_active(0))
+
+    def test_reactivate_invalidates_old_generation(self) -> None:
+        gate = VoiceReplyGenerationGate()
+        gen1 = gate.activate()
+        gen2 = gate.activate()
+        self.assertFalse(gate.is_active(gen1))
+        self.assertTrue(gate.is_active(gen2))
+
+    def test_revoke_deactivates_and_increments_generation(self) -> None:
+        async def scenario() -> None:
+            gate = VoiceReplyGenerationGate()
+            gen = gate.activate()
+            await gate.revoke()
+            self.assertFalse(gate.active)
+            self.assertEqual(gate.generation, gen + 1)
+            self.assertFalse(gate.is_active(gen))
+
+        asyncio.run(scenario())
+
+    def test_revoke_with_no_tracked_tasks_returns_immediately(self) -> None:
+        async def scenario() -> None:
+            gate = VoiceReplyGenerationGate()
+            gen = gate.activate()
+            await gate.revoke()
+            self.assertFalse(gate.active)
+            self.assertEqual(gate.generation, gen + 1)
+
+        asyncio.run(scenario())
+
+    def test_revoke_cancels_and_awaits_multiple_tracked_tasks(self) -> None:
+        async def scenario() -> None:
+            gate = VoiceReplyGenerationGate()
+            gen = gate.activate()
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def blocker() -> None:
+                started.set()
+                await release.wait()
+
+            # 「バリア」: 両方の返信タスクが実行中になるのを待ってから revoke する。
+            task_a = asyncio.create_task(blocker())
+            task_b = asyncio.create_task(blocker())
+            await started.wait()
+            gate.track(task_a)
+            gate.track(task_b)
+            await gate.revoke()
+            self.assertFalse(gate.active)
+            self.assertNotEqual(gate.generation, gen)
+            self.assertTrue(task_a.cancelled())
+            self.assertTrue(task_b.cancelled())
+
+        asyncio.run(scenario())
+
+    def test_revoke_is_bounded_when_task_ignores_cancellation(self) -> None:
+        async def scenario() -> None:
+            # timeout=0: revoke は待ちに時間上限を設け、即座に返らなければならない。
+            gate = VoiceReplyGenerationGate(revoke_timeout=0)
+            gen = gate.activate()
+            started = asyncio.Event()
+
+            async def stubborn() -> None:
+                started.set()
+                try:
+                    await asyncio.sleep(30)
+                except asyncio.CancelledError:
+                    await asyncio.sleep(0.01)
+
+            task = asyncio.create_task(stubborn())
+            await started.wait()
+            gate.track(task)
+            await gate.revoke()
+            self.assertFalse(gate.active)
+            self.assertNotEqual(gate.generation, gen)
+            # キャンセルを無視しても待ちは上限内。後片付けだけ行う。
+            done, _ = await asyncio.wait([task], timeout=1)
+            self.assertIn(task, done)
+
+        asyncio.run(scenario())
+
+    def test_revoke_sync_cancels_running_tasks_skips_done(self) -> None:
+        gate = VoiceReplyGenerationGate()
+        gen = gate.activate()
+        running = _FakeTask()
+        done = _FakeTask(done=True)
+        gate.track(running)
+        gate.track(done)
+        gate.revoke_sync()
+        self.assertFalse(gate.active)
+        self.assertEqual(gate.generation, gen + 1)
+        self.assertEqual(running.cancel_calls, 1)
+        self.assertEqual(done.cancel_calls, 0)
+
+    def test_revoke_cancels_tracked_autoread_child(self) -> None:
+        gate = VoiceReplyGenerationGate()
+        gate.activate()
+        autoread_task = _FakeTask()
+        gate.track(autoread_task)
+
+        gate.revoke_sync()
+
+        self.assertEqual(autoread_task.cancel_calls, 1)
+
+    def test_track_discards_finished_tasks_via_done_callback(self) -> None:
+        gate = VoiceReplyGenerationGate()
+        gate.activate()
+        task = _FakeTask()
+        gate.track(task)
+        self.assertIn(task, gate._tasks)
+        task.finish()
+        self.assertNotIn(task, gate._tasks)
 
 
 if __name__ == "__main__":

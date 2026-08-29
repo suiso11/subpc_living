@@ -10,6 +10,7 @@
           "base_url": "http://localhost:11434",
           "model": "<sub-pc-model>",
           "local": true,
+          "provider_kind": "ollama",
           "profiles": ["chat_auto", "deep_reasoning"]
         }
       ]
@@ -24,6 +25,7 @@
           "base_url": "http://main-pc:11434",
           "model": "<main-pc-model>",
           "local": true,
+          "provider_kind": "ollama",
           "profiles": ["voice_fast", "task_local"]
         }
       ]

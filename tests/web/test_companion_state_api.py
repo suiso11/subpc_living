@@ -35,7 +35,7 @@ def _patch_env(overrides: dict[str, str] | None = None) -> dict:
     return mock.patch.dict(
         server.os.environ,
         values,
-        clear=False,
+        clear=True,
     )
 
 
@@ -56,15 +56,81 @@ class CompanionStartupHelperTest(unittest.TestCase):
         self.assertIsNone(server.activity_runtime)
 
     def test_disabled_when_env_is_unset(self) -> None:
-        with mock.patch.dict(
-            server.os.environ,
-            {"COMPANION_ACTIVITY_ENABLED": ""},
-            clear=False,
-        ), mock.patch.object(
+        with _patch_env({"COMPANION_ACTIVITY_ENABLED": ""}), mock.patch.object(
             server, "create_activity_source", side_effect=AssertionError("must not create source")
         ):
             self.assertIsNone(server._start_companion_activity_runtime())
         self.assertIsNone(server.activity_runtime)
+
+    def test_disabled_by_default_with_no_activity_env(self) -> None:
+        with mock.patch.dict(
+            server.os.environ,
+            {},
+            clear=True,
+        ), mock.patch(
+            "src.perception.bootstrap.create_activity_source",
+            side_effect=AssertionError("must not create source"),
+        ):
+            self.assertIsNone(server._start_companion_activity_runtime())
+        self.assertIsNone(server.activity_runtime)
+
+    def test_canonical_sensor_activity_true_enables(self) -> None:
+        fake = _FakeSource()
+        with mock.patch.dict(
+            server.os.environ,
+            {
+                "SENSOR_ACTIVITY_ENABLED": "true",
+                "COMPANION_ACTIVITY_POLL_INTERVAL_SECONDS": "5",
+                "COMPANION_ACTIVITY_IDLE_THRESHOLD_SECONDS": "300",
+                "COMPANION_ACTIVITY_AWAY_THRESHOLD_SECONDS": "1800",
+            },
+            clear=True,
+        ), mock.patch("src.perception.bootstrap.create_activity_source", return_value=fake):
+            runtime = server._start_companion_activity_runtime()
+        self.assertIsNotNone(runtime)
+        self.assertIs(server.activity_runtime, runtime)
+        self.assertTrue(runtime.is_running)
+
+    def test_canonical_false_overrides_legacy_true(self) -> None:
+        with _patch_env(
+            {
+                "COMPANION_ACTIVITY_ENABLED": "true",
+                "SENSOR_ACTIVITY_ENABLED": "false",
+            }
+        ), mock.patch(
+            "src.perception.bootstrap.create_activity_source",
+            side_effect=AssertionError("must not create source"),
+        ):
+            self.assertIsNone(server._start_companion_activity_runtime())
+        self.assertIsNone(server.activity_runtime)
+
+    def test_legacy_activity_true_alone_still_enables(self) -> None:
+        fake = _FakeSource()
+        with mock.patch.dict(
+            server.os.environ,
+            {"COMPANION_ACTIVITY_ENABLED": "true"},
+            clear=True,
+        ), mock.patch("src.perception.bootstrap.create_activity_source", return_value=fake):
+            runtime = server._start_companion_activity_runtime()
+        self.assertIsNotNone(runtime)
+        self.assertIs(server.activity_runtime, runtime)
+        self.assertTrue(runtime.is_running)
+
+    def test_invalid_canonical_activity_values_fail_closed(self) -> None:
+        for value in ("", "0", "1", "yes", "on", "no", "false"):
+            with self.subTest(value=value), mock.patch.dict(
+                server.os.environ,
+                {
+                    "SENSOR_ACTIVITY_ENABLED": value,
+                    "COMPANION_ACTIVITY_ENABLED": "true",
+                },
+                clear=True,
+            ), mock.patch(
+                "src.perception.bootstrap.create_activity_source",
+                side_effect=AssertionError("must not create source"),
+            ):
+                self.assertIsNone(server._start_companion_activity_runtime())
+            self.assertIsNone(server.activity_runtime)
 
     def test_enabled_creates_source_and_starts_runtime(self) -> None:
         fake = _FakeSource()

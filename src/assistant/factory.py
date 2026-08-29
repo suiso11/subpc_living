@@ -10,17 +10,25 @@ from typing import TYPE_CHECKING
 from src.assistant.cloud_service import CloudRouteBridge
 from src.assistant.run_logger import RunLogger, SQLiteRunLogger
 from src.assistant.service import AssistantService
+from src.chat.config import (
+    resolve_local_api_key,
+    resolve_local_base_url,
+    resolve_local_provider_id,
+    validate_local_provider_kind,
+)
 from src.llm.approval import ApprovalGate
 from src.llm.cloud_config import CloudConfig, CloudConfigError
 from src.llm.contracts import GenerationOptions
 from src.llm.providers.cloud import FakeCloudProvider
 from src.llm.providers.cloud_http import OpenAICompatibleProvider
+from src.llm.providers.local_openai import LocalOpenAICompatibleProvider
 from src.llm.providers.ollama import OllamaProvider
 from src.llm.registry import ProviderRegistry
 from src.llm.routing.static import StaticRouter
 
 if TYPE_CHECKING:
     from src.chat.config import ChatConfig
+    from src.llm.provider import LLMProvider
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +69,47 @@ def _build_options(config: "ChatConfig") -> GenerationOptions:
     )
 
 
+def build_local_provider(
+    config: "ChatConfig",
+    *,
+    provider=None,
+    provider_id: str = "ollama",
+) -> tuple[str, "LLMProvider"]:
+    """config からローカルbackend Providerを一つ解決して返す。
+
+    Provider の組み立てだけを行い、AssistantService / ProviderRegistry / Router /
+    run logger は作らない。よって logger や DB の副作用は一切ない。
+
+    ``provider`` が注入されていれば ``provider_id`` (既定 ``"ollama"``) と一緒に
+    そのまま返す (後方互換)。無ければ ``local_provider_kind`` に応じて Ollama /
+    OpenAI互換ローカルbackendを作り、config から導出した provider_id で返す。
+    どちらのProviderも ``local=True`` として登録される想定で、cloud の承認・
+    redaction セマンティクスを受けない。
+
+    返り値は ``(resolved_id, provider)``。``resolved_id`` は Registry キー・
+    error/log 用の provider_id として使える。
+    """
+    if provider is not None:
+        return provider_id, provider
+
+    kind = validate_local_provider_kind(config)
+    resolved_id = resolve_local_provider_id(config)
+    if kind == "openai_compatible":
+        resolved: "LLMProvider" = LocalOpenAICompatibleProvider(
+            model=config.model,
+            base_url=resolve_local_base_url(config),
+            provider_id=resolved_id,
+            api_key=resolve_local_api_key(config),
+        )
+    else:
+        resolved = OllamaProvider(
+            base_url=resolve_local_base_url(config),
+            model=config.model,
+            provider_id=resolved_id,
+        )
+    return resolved_id, resolved
+
+
 def build_local_service(
     config: "ChatConfig",
     *,
@@ -68,19 +117,18 @@ def build_local_service(
     provider_id: str = "ollama",
     run_logger: RunLogger | None = _UNSET,  # type: ignore[assignment]
 ) -> tuple[AssistantService, ProviderRegistry]:
-    """ChatConfigからローカルOllama単体構成のServiceとRegistryを作る。
+    """ChatConfigからローカル単体構成のServiceとRegistryを作る。
 
-    クラウドProviderは一切登録しない（既定はローカルのみ）。
+    クラウドProviderは一切登録しない（既定はローカルのみ）。backend は
+    ``local_provider_kind`` で選び、無設定 (``"ollama"``) 時は従来通り
+    Ollama + ``ollama_base_url`` + provider_id ``"ollama"`` を維持する。
     """
-    if provider is None:
-        provider = OllamaProvider(
-            base_url=config.ollama_base_url,
-            model=config.model,
-        )
-
+    resolved_id, resolved_provider = build_local_provider(
+        config, provider=provider, provider_id=provider_id
+    )
     registry = ProviderRegistry()
-    registry.register(provider_id, provider, local=True)
-    router = StaticRouter(registry, default_provider_id=provider_id)
+    registry.register(resolved_id, resolved_provider, local=True)
+    router = StaticRouter(registry, default_provider_id=resolved_id)
     options = _build_options(config)
     return (
         AssistantService(
@@ -111,15 +159,12 @@ def build_assistant_service(
     ``cloud_provider`` を渡した場合は cloud_config の設定にかかわらず
     そのオブジェクトをクラウドProviderとして登録する（テスト注入用）。
     """
-    if provider is None:
-        provider = OllamaProvider(
-            base_url=config.ollama_base_url,
-            model=config.model,
-        )
-
+    resolved_id, resolved_provider = build_local_provider(
+        config, provider=provider, provider_id=provider_id
+    )
     registry = ProviderRegistry()
-    registry.register(provider_id, provider, local=True)
-    router = StaticRouter(registry, default_provider_id=provider_id)
+    registry.register(resolved_id, resolved_provider, local=True)
+    router = StaticRouter(registry, default_provider_id=resolved_id)
     options = _build_options(config)
     service = AssistantService(
         registry,

@@ -157,6 +157,7 @@ class TaskReminderEngine:
         timezone_name: str = "Asia/Tokyo",
         quiet_hours: tuple[int, int] = (1, 8),
         check_interval: float = 60.0,
+        lease_seconds: int = 120,
         now_fn: Callable[[], datetime] = lambda: datetime.now(UTC),
     ):
         self.store = store
@@ -165,6 +166,7 @@ class TaskReminderEngine:
         self.timezone_name = timezone_name
         self.quiet_hours = quiet_hours
         self.check_interval = check_interval
+        self.lease_seconds = lease_seconds
         self._now_fn = now_fn
 
         self._running = False
@@ -211,10 +213,13 @@ class TaskReminderEngine:
         local_now = now.astimezone(tz)
         is_quiet = in_quiet_hours(local_now, self.quiet_hours)
 
-        claimed = self.store.claim_due_notifications(self.owner, now)
+        claimed = self.store.claim_due_notifications(
+            self.owner, now, lease_seconds=self.lease_seconds
+        )
         fired = 0
         for task in claimed:
             notif = task["notification"]
+            rev = task["rev"]
             due_at = task["due_at"]
             if due_at is None:
                 self.store.release_lease(task["id"], self.owner)
@@ -225,24 +230,39 @@ class TaskReminderEngine:
             )
 
             if not should_fire:
-                self.store.record_notification(
+                ok = self.store.record_notification(
                     task["id"], self.owner,
                     stage=stage, next_notify_at=next_at,
                     repeat_count=new_count, fired=False, now=now,
+                    expected_rev=rev,
                 )
+                if not ok:
+                    continue  # 並行変更で無効化。上書きしない。
                 continue
 
             # quiet hours: 超過以外は繰り越す (quiet 明けに再評価)。
             if is_quiet and stage != "overdue":
                 carry_local = quiet_end_after(local_now, self.quiet_hours)
                 carry_utc = carry_local.astimezone(UTC)
-                self.store.record_notification(
+                ok = self.store.record_notification(
                     task["id"], self.owner,
                     stage=notif["last_stage"],  # 段階は進めない
                     next_notify_at=carry_utc,
                     repeat_count=notif["repeat_count"],
                     fired=False, now=now,
+                    expected_rev=rev,
                 )
+                if not ok:
+                    continue  # 並行変更で無効化。上書きしない。
+                continue
+
+            # 外部コールバックの直前に lease と rev を再検証する。
+            # done/drop/update/snooze で無効化されていたら発火せずスキップ。
+            valid = self.store.revalidate_notification_lease(
+                task["id"], self.owner, rev,
+                lease_seconds=self.lease_seconds, now=now,
+            )
+            if not valid:
                 continue
 
             message = format_reminder_message(task, now, stage, tz)
@@ -257,9 +277,12 @@ class TaskReminderEngine:
             except Exception as e:
                 print(f"[TaskReminder] callback error: {e}")
 
+            # コールバック中の並行更新/スヌーズ/完了を上書きしない。
+            # expected_rev が一致しない record はストア側で拒否される。
             self.store.record_notification(
                 task["id"], self.owner,
                 stage=stage, next_notify_at=next_at,
                 repeat_count=new_count, fired=True, now=now,
+                expected_rev=rev,
             )
         return fired

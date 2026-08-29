@@ -15,6 +15,7 @@ from .sources import (
     WindowsActivitySource,
     create_activity_source,
 )
+from .policy import SensorPolicy, resolve_sensor_policy
 from .bootstrap import companion_state_payload, create_activity_runtime_from_env
 
 __all__ = [
@@ -30,7 +31,9 @@ __all__ = [
     "LinuxActivitySource",
     "ProcessNameClassifier",
     "WindowsActivitySource",
+    "SensorPolicy",
     "create_activity_source",
     "create_activity_runtime_from_env",
+    "resolve_sensor_policy",
     "companion_state_payload",
 ]

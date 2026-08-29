@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -19,6 +20,7 @@ from src.discord_bot.proactive_bridge import (
     PROJECT_ROOT,
     ProactiveBridge,
     ProactiveConfig,
+    _build_monitor_context,
     create_proactive_bridge,
     rewrite_message,
 )
@@ -481,6 +483,128 @@ class NotifyActivityTest(unittest.TestCase):
         )
         bridge.notify_user_activity()
         engine.notify_user_activity.assert_called_once()
+
+
+class MonitorGateTest(unittest.TestCase):
+    """Discord proactive bridge の共有 SensorPolicy.monitor ゲート (オフライン)。
+
+    canonical (SENSOR_MONITOR_ENABLED) の明示 true でのみ MonitorContext を
+    構築・start する。既定 / false / 空 / 不正値では import・構築・start の
+    一切を行わず None を返す (fail closed)。
+    """
+
+    MONITOR = "SENSOR_MONITOR_ENABLED"
+
+    def _fake_ctx(self, start: bool = True) -> MagicMock:
+        ctx = MagicMock()
+        ctx.start.return_value = start
+        return ctx
+
+    def test_default_off_returns_none_without_import(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            # sys.modules に None を置いておくと import 時に ImportError になる。
+            # ゲートが import より前にあるため、ここでは例外が起きず None で返る。
+            with patch.dict(sys.modules, {"src.monitor.context": None}):
+                self.assertIsNone(_build_monitor_context())
+
+    def test_non_true_values_make_zero_resource_calls(self) -> None:
+        for value in ("", "false", "0", "1", "yes", "on", "no"):
+            with self.subTest(value=value):
+                with patch.dict(os.environ, {self.MONITOR: value}, clear=True):
+                    with patch("src.monitor.context.MonitorContext") as mc:
+                        self.assertIsNone(_build_monitor_context())
+                mc.assert_not_called()
+
+    def test_canonical_true_constructs_and_starts(self) -> None:
+        with patch.dict(os.environ, {self.MONITOR: "true"}, clear=True):
+            with patch(
+                "src.monitor.context.MonitorContext",
+                return_value=self._fake_ctx(True),
+            ) as mc:
+                ctx = _build_monitor_context()
+        mc.assert_called_once()
+        mc.return_value.start.assert_called_once_with()
+        self.assertIs(ctx, mc.return_value)
+
+    def test_canonical_true_start_failure_returns_none(self) -> None:
+        with patch.dict(os.environ, {self.MONITOR: "true"}, clear=True):
+            with patch(
+                "src.monitor.context.MonitorContext",
+                return_value=self._fake_ctx(False),
+            ) as mc:
+                ctx = _build_monitor_context()
+        mc.assert_called_once()
+        mc.return_value.start.assert_called_once_with()
+        self.assertIsNone(ctx)
+
+    def test_canonical_true_construction_failure_returns_none(self) -> None:
+        with patch.dict(os.environ, {self.MONITOR: "true"}, clear=True):
+            with patch(
+                "src.monitor.context.MonitorContext",
+                side_effect=RuntimeError("boom"),
+            ) as mc:
+                ctx = _build_monitor_context()
+        mc.assert_called_once()
+        self.assertIsNone(ctx)
+
+    def test_start_false_stops_context_exactly_once(self) -> None:
+        with patch.dict(os.environ, {self.MONITOR: "true"}, clear=True):
+            with patch(
+                "src.monitor.context.MonitorContext",
+                return_value=self._fake_ctx(False),
+            ) as mc:
+                ctx = _build_monitor_context()
+        mc.assert_called_once()
+        mc.return_value.start.assert_called_once_with()
+        mc.return_value.stop.assert_called_once_with()
+        self.assertIsNone(ctx)
+
+    def test_start_raise_stops_context_exactly_once(self) -> None:
+        with patch.dict(os.environ, {self.MONITOR: "true"}, clear=True):
+            with patch(
+                "src.monitor.context.MonitorContext",
+                return_value=self._fake_ctx(True),
+            ) as mc:
+                mc.return_value.start.side_effect = RuntimeError("boom")
+                ctx = _build_monitor_context()
+        mc.assert_called_once()
+        mc.return_value.stop.assert_called_once_with()
+        self.assertIsNone(ctx)
+
+    def test_success_keeps_context_without_stop(self) -> None:
+        with patch.dict(os.environ, {self.MONITOR: "true"}, clear=True):
+            with patch(
+                "src.monitor.context.MonitorContext",
+                return_value=self._fake_ctx(True),
+            ) as mc:
+                ctx = _build_monitor_context()
+        mc.assert_called_once()
+        mc.return_value.start.assert_called_once_with()
+        mc.return_value.stop.assert_not_called()
+        self.assertIs(ctx, mc.return_value)
+
+    def test_stop_raise_on_start_false_does_not_leak(self) -> None:
+        with patch.dict(os.environ, {self.MONITOR: "true"}, clear=True):
+            with patch(
+                "src.monitor.context.MonitorContext",
+                return_value=self._fake_ctx(False),
+            ) as mc:
+                mc.return_value.stop.side_effect = RuntimeError("cleanup boom")
+                ctx = _build_monitor_context()
+        mc.return_value.stop.assert_called_once_with()
+        self.assertIsNone(ctx)
+
+    def test_stop_raise_on_start_raise_does_not_leak(self) -> None:
+        with patch.dict(os.environ, {self.MONITOR: "true"}, clear=True):
+            with patch(
+                "src.monitor.context.MonitorContext",
+                return_value=self._fake_ctx(True),
+            ) as mc:
+                mc.return_value.start.side_effect = RuntimeError("start boom")
+                mc.return_value.stop.side_effect = RuntimeError("cleanup boom")
+                ctx = _build_monitor_context()
+        mc.return_value.stop.assert_called_once_with()
+        self.assertIsNone(ctx)
 
 
 class CompanionGateTest(unittest.TestCase):
@@ -1026,6 +1150,71 @@ class ProactivePersistenceTest(unittest.TestCase):
             response = bridge.handle_conversation_control(1, "今日は静かに")
             self.assertIn("静かに", response)
             mock_rr.assert_called_once_with("conversation_start")
+
+
+class ProactiveSanitizationCanaryTest(unittest.TestCase):
+    """proactive MonitorContext / bridge の sanitization canary (ゲート維持 + 固定診断)。
+
+    MonitorContext の構築・start 失敗と create_proactive_bridge の初期化失敗時に、
+    生の例外文字列・パス・URL が print / status へ表面化しないことを保証する。
+    fail closed ゲート (既定オフ・失敗時は None) は従来どおり維持する。
+    """
+
+    CANARY = "canary raw boom C:\\Users\\secret\\metrics.db"
+
+    def test_monitor_context_failure_does_not_print_raw_content(self) -> None:
+        with patch.dict(os.environ, {"SENSOR_MONITOR_ENABLED": "true"}, clear=True):
+            with patch(
+                "src.monitor.context.MonitorContext",
+                side_effect=RuntimeError(self.CANARY),
+            ) as mc:
+                with patch("builtins.print") as mock_print:
+                    self.assertIsNone(_build_monitor_context())
+        mc.assert_called_once()
+        for call in mock_print.call_args_list:
+            text = " ".join(str(a) for a in call.args)
+            self.assertNotIn("secret", text)
+            self.assertNotIn(self.CANARY, text)
+
+    def test_bridge_profile_failure_does_not_print_raw_content(self) -> None:
+        enabled_cfg = ProactiveConfig(enabled=True, channel_id=1)
+        with (
+            patch(
+                "src.discord_bot.proactive_bridge.ProactiveConfig.from_env",
+                return_value=enabled_cfg,
+            ),
+            patch(
+                "src.discord_bot.proactive_bridge._build_monitor_context",
+                return_value=None,
+            ),
+            patch(
+                "src.discord_bot.proactive_bridge.UserProfile",
+                autospec=True,
+            ) as mock_profile,
+        ):
+            mock_profile.return_value.load.side_effect = RuntimeError(self.CANARY)
+            with patch("builtins.print") as mock_print:
+                self.assertIsNone(create_proactive_bridge(_state(), _FakeBot(None)))
+        for call in mock_print.call_args_list:
+            text = " ".join(str(a) for a in call.args)
+            self.assertNotIn("secret", text)
+            self.assertNotIn(self.CANARY, text)
+
+    def test_conversation_status_masks_state_error(self) -> None:
+        store = ConversationLoopStore(None, base_interval_sec=3600, reply_timeout_sec=3600)
+        store.last_error = self.CANARY
+        bridge = ProactiveBridge(
+            bot=_FakeBot(None),
+            state=_state(),
+            config=ProactiveConfig(enabled=True, channel_id=1),
+            profile=None,
+            engine=MagicMock(),
+            conversation_store=store,
+        )
+        status = bridge.conversation_status()
+        self.assertEqual(status["state_error"], "yes")
+        self.assertNotIn("secret", str(status))
+        self.assertNotIn(self.CANARY, str(status))
 
 
 if __name__ == "__main__":

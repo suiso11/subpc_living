@@ -1,6 +1,7 @@
 pragma ComponentBehavior: Bound
 import QtQuick
 import QtQuick3D
+import QtQuick3D.AssetUtils
 
 Item {
     id: avatar3D
@@ -64,7 +65,7 @@ Item {
                 id: loader
                 source: avatar3D.modelUrl
                 onStatusChanged: {
-                    if (status === RuntimeLoader.Failed) {
+                    if (status === RuntimeLoader.Error) {
                         avatar3D.loadFailed()
                     }
                 }

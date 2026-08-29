@@ -10,10 +10,11 @@ Phase 10: マルチGPUメトリクス表示対応
 import time
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from src.monitor.collector import SystemCollector, SystemMetrics
 from src.monitor.storage import MetricsStorage
+from src.perception.policy import resolve_sensor_policy
 
 
 class MonitorContext:
@@ -29,47 +30,141 @@ class MonitorContext:
         self,
         db_path: str = "data/metrics/system_metrics.db",
         collect_interval: float = 30.0,
+        process_details_enabled: Optional[bool] = None,
+        *,
+        write_attempts: int = 3,
+        write_retry_delay: float = 0.25,
+        sleep_fn: Optional[Callable[[float], None]] = None,
     ):
         """
         Args:
             db_path: SQLite DBのパス
             collect_interval: 収集間隔 (秒)
+            process_details_enabled: プロセス詳細収集の opt-in。None のとき
+                SENSOR_PROCESS_DETAILS_ENABLED から解決する (既定オフ / fail closed)。
+            write_attempts: 書込失敗時の最大再試行回数 (デフォルト 3)。
+                1 未満は 1 に切り上げる。
+            write_retry_delay: 再試行間の短い有界バックオフ (秒)。
+                0 未満は 0 に切り上げる。
+            sleep_fn: バックオフ sleep の注入フック (テスト用)。None のとき time.sleep。
         """
-        self.collector = SystemCollector(interval=collect_interval)
-        self.storage = MetricsStorage(db_path=db_path)
+        if process_details_enabled is None:
+            process_details_enabled = resolve_sensor_policy().process_details
+        self.process_details_enabled = process_details_enabled
+        self.write_attempts = max(1, int(write_attempts))
+        self.write_retry_delay = max(0.0, float(write_retry_delay))
+        self._sleep = sleep_fn or time.sleep
+        self._db_error_count = 0
+        self._dropped_write_count = 0
+        self.collector = SystemCollector(
+            interval=collect_interval, process_details_enabled=process_details_enabled
+        )
+        self.storage = MetricsStorage(
+            db_path=db_path, process_details_enabled=process_details_enabled
+        )
         self.collect_interval = collect_interval
         self._running = False
 
     def start(self) -> bool:
-        """DB初期化 + バックグラウンド収集を開始"""
-        try:
-            self.storage.initialize()
-            self.collector.start(callback=self._on_metrics)
+        """DB初期化 + バックグラウンド収集を開始
+
+        storage に触れる前に collector の実状態を検査する (受付前検査)。
+        - 既に実稼働中 (``collector.is_running``) なら storage を触らず冪等に True
+        - 前回 stop が完了せず旧 worker が生存 (``thread_alive`` かつ ``stop_pending``)
+          の間は、storage を触らず・置き換えず・閉じずに False (reactivate しない)
+        どちらでもないときのみ storage の initialize と collector の start を試みる。
+
+        Returns:
+            ストレージ初期化と収集 worker 開始の両方が成功したとき True。
+            どちらかが失敗した場合は収集 worker を停止し DB を閉じてから False。
+        """
+        # 既に実稼働中: storage に触れず冪等に True (単一飛行維持)。
+        if self.collector.is_running:
             self._running = True
             return True
-        except Exception as e:
-            print(f"⚠️  MonitorContext 起動失敗: {e}")
+        # 旧 worker が生存 (stop_pending): storage を触らず・置き換えず・閉じず False。
+        if self.collector.thread_alive and self.collector.stop_pending:
             return False
+        try:
+            self.storage.initialize()
+        except Exception as e:
+            self._running = False
+            self._cleanup_after_failed_start()
+            # DBパス・SQLiteメッセージなどの生情報は出力しない。型のみで診断する。
+            print(f"monitor start failed: {type(e).__name__}")
+            return False
+        if not self.collector.start(callback=self._on_metrics):
+            self._running = False
+            self._cleanup_after_failed_start()
+            print("monitor start failed: collector unavailable")
+            return False
+        self._running = True
+        return True
+
+    def _cleanup_after_failed_start(self) -> None:
+        """start() 失敗時の部分後始末。失敗していない側のリソースも冪等に閉じる。
+
+        コレクター worker が生存し続けている間 (stop_pending) は storage を閉じない
+        (生存 worker のコールバックが storage を書き続けるため)。worker の死を確認
+        できたときのみ storage を閉じる。
+        """
+        try:
+            self.collector.stop()
+        except Exception:
+            pass
+        if not self.collector.thread_alive:
+            try:
+                self.storage.close()
+            except Exception:
+                pass
 
     def stop(self) -> None:
-        """収集を停止しDBを閉じる"""
+        """収集を停止する。
+
+        collector を先に停止 (join) する。join タイムアウトでコレクター worker が
+        生存し続ける間は storage を開いたまま所有する (生存 worker のコールバックが
+        storage を書くため、閉じると書込を壊す)。worker の死を確認できたとき、
+        または繰り返し stop で死を確認したときにのみ storage を閉じる。
+        """
         self._running = False
         self.collector.stop()
-        self.storage.close()
+        if not self.collector.thread_alive:
+            self.storage.close()
 
     @property
     def is_running(self) -> bool:
+        """stop 要求後は即座に False (worker が生存し続けていても)。"""
         return self._running and self.collector.is_running
 
     def _on_metrics(self, metrics: SystemMetrics) -> None:
-        """メトリクス収集時のコールバック — DBに保存"""
-        try:
-            self.storage.store_metrics(metrics)
-        except Exception as e:
-            # ログ欠損自体は許容するが、初回失敗と周期的に通知して異常を検知可能に
-            self._db_error_count = getattr(self, "_db_error_count", 0) + 1
-            if self._db_error_count == 1 or self._db_error_count % 100 == 0:
-                print(f"⚠️  メトリクスDB書込失敗 ({self._db_error_count}件目): {e}")
+        """メトリクス収集時のコールバック — DBに保存 (有限回の再試行つき)
+
+        一時的な書込失敗に対して同じ metrics オブジェクトを write_attempts 回まで
+        再試行し、成功したらその時点で止める。試行間には write_retry_delay 秒の
+        短い有界バックオフを挟む。全試行失敗 (exhaustion) のときだけ固定の
+        dropped-write カウンタを増やし、型のみ・ASCII の診断を出す (パス・
+        SQLiteメッセージ・プロセス詳細は出さない)。キュー・バッファは持たず、
+        メモリは増加しない。
+        """
+        last_error: Optional[Exception] = None
+        attempt = 0
+        while attempt < self.write_attempts:
+            try:
+                self.storage.store_metrics(metrics)
+                return
+            except Exception as e:
+                attempt += 1
+                last_error = e
+                if attempt < self.write_attempts:
+                    self._sleep(self.write_retry_delay)
+        # 全試行失敗: 固定カウンタを増やし、型のみ・ASCII で通知 (パス・プロセス詳細なし)。
+        self._dropped_write_count += 1
+        self._db_error_count += 1
+        if self._db_error_count == 1 or self._db_error_count % 100 == 0:
+            print(
+                f"metrics db write dropped ({self._db_error_count}th, "
+                f"attempts={self.write_attempts}, {type(last_error).__name__})"
+            )
 
     def get_context_text(self) -> str:
         """
@@ -156,11 +251,20 @@ class MonitorContext:
         return "\n".join(lines)
 
     def get_status(self) -> dict:
-        """APIレスポンス用の状態辞書"""
+        """APIレスポンス用の状態辞書
+
+        状態メタデータは固定キー (bool / 安全なカウンタ) のみ。例外内容・パス・
+        プロセス詳細などの可変情報は含めない。外部公開は Web 側の allowlist で
+        さらに絞られる。
+        """
         metrics = self.collector.get_latest()
         result = {
             "running": self.is_running,
+            "thread_alive": self.collector.thread_alive,
+            "stop_pending": self.collector.stop_pending,
             "collect_interval": self.collect_interval,
+            "write_attempts": self.write_attempts,
+            "dropped_writes": self._dropped_write_count,
             "record_count": 0,
         }
         try:

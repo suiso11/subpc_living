@@ -210,6 +210,23 @@ class ContextPolicySelectTest(unittest.TestCase):
         ContextPolicy.select(blocks, privacy="cloud_allowed", target_local=False)
         self.assertEqual(tuple((b.source, b.priority) for b in blocks), before)
 
+    def test_emotion_source_ordered_before_tasks(self) -> None:
+        blocks = [
+            block("screen", "画面", priority=0),
+            block("emotion", "感情指示", priority=0),
+            block("tasks", "タスク権威", priority=0),
+        ]
+        result = ContextPolicy.select(blocks, privacy="local_only", target_local=True)
+        self.assertEqual([b.source for b in result], ["screen", "emotion", "tasks"])
+
+    def test_emotion_public_survives_cloud_filter(self) -> None:
+        blocks = [
+            block("emotion", "感情指示", sensitivity="public"),
+            block("tasks", "タスク権威", sensitivity="personal", local_only=True),
+        ]
+        result = ContextPolicy.select(blocks, privacy="cloud_allowed", target_local=False)
+        self.assertEqual([b.source for b in result], ["emotion"])
+
 
 class ContextPolicyPrivacyContractTest(unittest.TestCase):
     def test_unknown_privacy_rejected_even_for_local_target(self) -> None:

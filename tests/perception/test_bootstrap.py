@@ -11,14 +11,21 @@ from src.perception.activity import ActivitySample
 class _FakeSource:
     def __init__(self) -> None:
         self.calls = 0
+        self.failing: BaseException | None = None
 
     def sample(self) -> ActivitySample:
+        if self.failing is not None:
+            raise self.failing
         self.calls += 1
         return ActivitySample(
             timestamp=float(self.calls),
             idle_seconds=0.0,
             app_category="work",
         )
+
+
+class _CanaryCustomBoom(Exception):
+    """allowlist に無いカスタム例外クラス (canary)。"""
 
 
 _ENV_TRUE = {
@@ -34,6 +41,28 @@ def _env(overrides: dict[str, str] | None = None) -> dict[str, str]:
     if overrides:
         values.update(overrides)
     return values
+
+
+class _FakeRuntime:
+    """bootstrap 用の ActivityRuntime 代替。start の真偽・例外を制御できる。"""
+
+    def __init__(
+        self,
+        *,
+        start_result: bool = True,
+        start_error: BaseException | None = None,
+    ) -> None:
+        self.start_result = start_result
+        self.start_error = start_error
+        self.stop_calls = 0
+
+    def start(self) -> bool:
+        if self.start_error is not None:
+            raise self.start_error
+        return self.start_result
+
+    def stop(self, timeout: float = 1.0) -> None:
+        self.stop_calls += 1
 
 
 class CreateActivityRuntimeFromEnvTest(unittest.TestCase):
@@ -159,6 +188,35 @@ class CreateActivityRuntimeFromEnvTest(unittest.TestCase):
         self.assertIsNotNone(runtime)
         runtime.stop(timeout=1.0)
 
+    def test_false_start_stops_constructed_runtime_and_returns_none(self) -> None:
+        fake_runtime = _FakeRuntime(start_result=False)
+        logger = mock.Mock()
+        with mock.patch.object(
+            bootstrap, "create_activity_source", return_value=_FakeSource()
+        ), mock.patch.object(bootstrap, "ActivityRuntime", return_value=fake_runtime):
+            result = bootstrap.create_activity_runtime_from_env(
+                _env(), logger=logger
+            )
+        self.assertIsNone(result)
+        self.assertEqual(fake_runtime.stop_calls, 1)
+        logged = str([c.args for c in logger.warning.call_args_list])
+        self.assertIn("startup incomplete", logged)
+
+    def test_start_raise_stops_constructed_runtime_and_returns_none(self) -> None:
+        fake_runtime = _FakeRuntime(start_error=RuntimeError("start exploded"))
+        logger = mock.Mock()
+        with mock.patch.object(
+            bootstrap, "create_activity_source", return_value=_FakeSource()
+        ), mock.patch.object(bootstrap, "ActivityRuntime", return_value=fake_runtime):
+            result = bootstrap.create_activity_runtime_from_env(
+                _env(), logger=logger
+            )
+        self.assertIsNone(result)
+        self.assertEqual(fake_runtime.stop_calls, 1)
+        logged = str([c.args for c in logger.warning.call_args_list])
+        self.assertIn("RuntimeError", logged)
+        self.assertNotIn("start exploded", logged)
+
 
 class CompanionStatePayloadTest(unittest.TestCase):
     def test_none_runtime_returns_disabled(self) -> None:
@@ -234,6 +292,41 @@ class CompanionStatePayloadTest(unittest.TestCase):
         self.assertEqual(payload["consecutive_failures"], 0)
         self.assertIsNone(payload["last_error_type"])
         self.assertIsNotNone(payload["last_update_at"])
+
+    def test_known_error_type_maps_to_fixed_unavailable_code(self) -> None:
+        source = _FakeSource()
+        source.failing = OSError("boom")
+        runtime = ActivityRuntime(source, poll_interval=5.0)
+        runtime.collect_once()
+        payload = bootstrap.companion_state_payload(runtime)
+        self.assertEqual(payload["last_error_type"], "unavailable")
+
+    def test_canary_custom_error_type_maps_to_internal_error(self) -> None:
+        source = _FakeSource()
+        source.failing = _CanaryCustomBoom("secret canary detail")
+        runtime = ActivityRuntime(source, poll_interval=5.0)
+        runtime.collect_once()
+        payload = bootstrap.companion_state_payload(runtime)
+        self.assertEqual(payload["last_error_type"], "internal_error")
+        # 例外クラス名そのものは外部 payload へ載せない
+        self.assertNotIn("_CanaryCustomBoom", str(payload))
+        self.assertNotIn("secret canary detail", str(payload))
+
+    def test_code_mapper_unknown_name_is_internal_error(self) -> None:
+        self.assertEqual(
+            bootstrap.sensor_error_code_from_name("_CanaryCustomBoom"),
+            "internal_error",
+        )
+        self.assertEqual(bootstrap.sensor_error_code_from_name(None), "internal_error")
+        self.assertEqual(
+            bootstrap.sensor_error_code(TimeoutError("x")), "timeout"
+        )
+        self.assertEqual(
+            bootstrap.sensor_error_code(ValueError("x")), "invalid_input"
+        )
+        self.assertEqual(
+            bootstrap.sensor_error_code(ConnectionError("x")), "unavailable"
+        )
 
 
 if __name__ == "__main__":

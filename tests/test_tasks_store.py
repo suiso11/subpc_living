@@ -8,7 +8,7 @@ import unittest.mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from src.tasks.store import TaskStore, build_task_authority_block, build_task_context
+from src.tasks.store import TaskStore, build_task_authority_block, build_task_context, from_iso
 
 UTC = timezone.utc
 
@@ -334,6 +334,187 @@ class TaskStoreTest(unittest.TestCase):
     def test_claim_skips_tasks_without_due(self) -> None:
         self.store.add("no-due", now=self.now)
         self.assertEqual(self.store.claim_due_notifications("o", self.now), [])
+
+
+class TaskRevTest(unittest.TestCase):
+    """楽観的リビジョン (rev) と lease 再検証のテスト。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.db_path = str(Path(self._tmp.name) / "tasks.db")
+        self.store = TaskStore(db_path=self.db_path, timezone_name="Asia/Tokyo").initialize()
+        self.addCleanup(self.store.close)
+        self.now = datetime(2026, 7, 3, 3, 0, tzinfo=UTC)  # JST 12:00
+
+    def _add_due(self) -> int:
+        return self.store.add(
+            "t", due_at=self.now + timedelta(hours=2),
+            due_granularity="datetime", now=self.now,
+        )
+
+    def test_rev_starts_zero_and_increments_on_mutations(self) -> None:
+        tid = self.store.add("t", now=self.now)
+        self.assertEqual(self.store.get(tid)["rev"], 0)
+        self.store.update(tid, title="u", now=self.now)
+        self.assertEqual(self.store.get(tid)["rev"], 1)
+        self.store.snooze(tid, self.now + timedelta(hours=1), now=self.now)
+        self.assertEqual(self.store.get(tid)["rev"], 2)
+        self.store.regenerate_breakdown(tid, now=self.now)
+        self.assertEqual(self.store.get(tid)["rev"], 3)
+        self.store.done(tid, now=self.now)
+        self.assertEqual(self.store.get(tid)["rev"], 4)
+
+    def test_drop_and_due_update_increment_rev(self) -> None:
+        tid = self.store.add("t", now=self.now)
+        self.store.drop(tid, now=self.now)
+        self.assertEqual(self.store.get(tid)["rev"], 1)
+        tid2 = self.store.add("t2", now=self.now)
+        self.store.update(tid2, due_at=self.now + timedelta(days=1),
+                          due_granularity="datetime", now=self.now)
+        self.assertEqual(self.store.get(tid2)["rev"], 1)
+
+    def test_claim_payload_includes_rev(self) -> None:
+        tid = self._add_due()
+        claimed = self.store.claim_due_notifications("o", self.now)
+        self.assertEqual([c["id"] for c in claimed], [tid])
+        self.assertEqual(claimed[0]["rev"], 0)
+        self.store.update(tid, title="変更", now=self.now)
+        claimed2 = self.store.claim_due_notifications("o", self.now)
+        self.assertEqual(claimed2[0]["rev"], 1)
+
+    def test_rev_migration_idempotent(self) -> None:
+        legacy_path = str(Path(self._tmp.name) / "legacy_rev.db")
+        conn = sqlite3.connect(legacy_path)
+        conn.execute(
+            """CREATE TABLE tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, note TEXT,
+                action_hint TEXT, due_at TEXT, due_granularity TEXT,
+                priority TEXT NOT NULL DEFAULT 'normal', status TEXT NOT NULL DEFAULT 'open',
+                source TEXT NOT NULL DEFAULT 'command', created_at TEXT NOT NULL,
+                completed_at TEXT, breakdown_json TEXT NOT NULL DEFAULT '[]'
+            )"""
+        )
+        conn.execute(
+            "INSERT INTO tasks (title, status, source, created_at) VALUES (?, 'open', 'command', ?)",
+            ("旧タスク", self.now.isoformat()),
+        )
+        conn.commit()
+        conn.close()
+
+        legacy = TaskStore(legacy_path, timezone_name="Asia/Tokyo").initialize()
+        try:
+            self.assertEqual(legacy.get(1)["rev"], 0)  # 旧行は 0 から
+            legacy.update(1, title="変更", now=self.now)
+            self.assertEqual(legacy.get(1)["rev"], 1)
+            # 再初期化しても冪等 (ALTER 失敗せず、rev は維持される)
+            legacy.close()
+            legacy = TaskStore(legacy_path, timezone_name="Asia/Tokyo").initialize()
+            self.assertEqual(legacy.get(1)["rev"], 1)
+            self.assertEqual(legacy.get(1)["title"], "変更")
+        finally:
+            legacy.close()
+
+    def test_revalidate_lease_valid_and_invalid(self) -> None:
+        tid = self._add_due()
+        self.store.claim_due_notifications("o1", self.now, lease_seconds=120)
+        # rev 一致・自 owner → lease 延長して True
+        self.assertTrue(self.store.revalidate_notification_lease(
+            tid, "o1", 0, lease_seconds=120, now=self.now))
+        # rev 不一致 → False + 自 owner の lease がクリアされる
+        self.store.claim_due_notifications("o1", self.now, lease_seconds=120)
+        self.assertFalse(self.store.revalidate_notification_lease(
+            tid, "o1", 999, lease_seconds=120, now=self.now))
+        # クリアされたので別 owner が取れる
+        self.assertEqual(
+            [c["id"] for c in self.store.claim_due_notifications("o2", self.now)], [tid])
+
+    def test_revalidate_lease_requires_owner(self) -> None:
+        tid = self._add_due()
+        self.store.claim_due_notifications("o2", self.now)
+        # 別 owner の lease は触らず False
+        self.assertFalse(self.store.revalidate_notification_lease(
+            tid, "o1", 0, now=self.now))
+        # 他 owner が持ったまま
+        self.assertEqual(
+            [c["id"] for c in self.store.claim_due_notifications("o1", self.now)], [])
+
+    def test_revalidate_lease_requires_open(self) -> None:
+        tid = self._add_due()
+        self.store.claim_due_notifications("o1", self.now)
+        self.store.done(tid, now=self.now)
+        self.assertFalse(self.store.revalidate_notification_lease(tid, "o1", 0, now=self.now))
+        # done 済みは claim されない
+        self.assertEqual(self.store.claim_due_notifications("o1", self.now), [])
+
+    def test_revalidate_lease_unknown_task(self) -> None:
+        self.assertFalse(self.store.revalidate_notification_lease(9999, "o1", 0, now=self.now))
+
+    def test_record_notification_expected_rev_stale_rejected(self) -> None:
+        tid = self._add_due()
+        self.store.claim_due_notifications("o1", self.now)
+        self.store.update(tid, title="変わった", now=self.now)  # rev 0→1
+        # 古い rev での記録は拒否され、通知状態を上書きしない
+        ok = self.store.record_notification(
+            tid, "o1", stage="3h", next_notify_at=self.now + timedelta(minutes=30),
+            repeat_count=1, fired=True, now=self.now, expected_rev=0,
+        )
+        self.assertFalse(ok)
+        with self.store._tx() as conn:
+            n = conn.execute(
+                "SELECT next_notify_at FROM task_notifications WHERE task_id = ?", (tid,)
+            ).fetchone()
+        self.assertIsNone(n["next_notify_at"])
+        # 現在の rev なら成功 (lease を取り直してから)
+        self.store.claim_due_notifications("o1", self.now)
+        ok2 = self.store.record_notification(
+            tid, "o1", stage="3h", next_notify_at=self.now + timedelta(minutes=30),
+            repeat_count=1, fired=True, now=self.now,
+            expected_rev=self.store.get(tid)["rev"],
+        )
+        self.assertTrue(ok2)
+
+    def test_record_notification_stale_rejects_when_closed(self) -> None:
+        tid = self._add_due()
+        self.store.claim_due_notifications("o1", self.now)
+        self.store.done(tid, now=self.now)
+        self.assertFalse(self.store.record_notification(
+            tid, "o1", stage="3h", next_notify_at=self.now + timedelta(hours=1),
+            repeat_count=1, fired=True, now=self.now, expected_rev=0,
+        ))
+
+    def test_record_notification_without_expected_rev_backward_compat(self) -> None:
+        tid = self._add_due()
+        # 旧呼び出し形 (expected_rev 省略) は無条件更新して True
+        self.assertTrue(self.store.record_notification(
+            tid, "o1", stage="3h", next_notify_at=self.now + timedelta(hours=1),
+            repeat_count=1, fired=False, now=self.now,
+        ))
+        with self.store._tx() as conn:
+            n = conn.execute(
+                "SELECT next_notify_at FROM task_notifications WHERE task_id = ?", (tid,)
+            ).fetchone()
+        self.assertEqual(from_iso(n["next_notify_at"]), self.now + timedelta(hours=1))
+
+    def test_revalidate_and_record_cross_connection(self) -> None:
+        tid = self._add_due()
+        store2 = TaskStore(db_path=self.db_path, timezone_name="Asia/Tokyo").initialize()
+        try:
+            claimed2 = store2.claim_due_notifications("o2", self.now)
+            self.assertEqual([c["id"] for c in claimed2], [tid])
+            # 別接続から正しい rev / 自 owner で revalidate → True
+            self.assertTrue(store2.revalidate_notification_lease(tid, "o2", 0, now=self.now))
+            # 別接続の他 owner は revalidate できない
+            self.assertFalse(self.store.revalidate_notification_lease(tid, "o1", 0, now=self.now))
+            # 別接続の done で rev が進むと、古い rev の record は拒否される
+            self.store.done(tid, now=self.now)
+            self.assertFalse(store2.record_notification(
+                tid, "o2", stage="3h", next_notify_at=self.now + timedelta(hours=1),
+                repeat_count=1, fired=True, now=self.now, expected_rev=0,
+            ))
+            self.assertEqual(self.store.get(tid)["status"], "done")
+        finally:
+            store2.close()
 
 
 class TaskCandidateStoreTest(unittest.TestCase):
@@ -776,6 +957,148 @@ class TaskCandidateStoreTest(unittest.TestCase):
             self.assertEqual(legacy.get_candidate(cid)["due_granularity"], "date")
         finally:
             legacy.close()
+
+
+class TaskNotificationMigrationTest(unittest.TestCase):
+    """legacy な task_notifications (lease_owner/lease_until 欠落) のマイグレーション。
+
+    - 旧DBで lease カラムが無くても (片方だけでも両方無くても) initialize で
+      NULL 許容カラムが追加され、既存の通知状態・rev・task 行を保持したまま
+      claim / revalidate / record が使えることを確認する。
+    - 再 initialize しても冪等 (ALTER 失敗せず、状態・rev を維持) であること。
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.now = datetime(2026, 7, 3, 3, 0, tzinfo=UTC)  # JST 12:00
+
+    @staticmethod
+    def _legacy_notif_create(has_lease_owner: bool, has_lease_until: bool) -> str:
+        cols = [
+            "task_id INTEGER PRIMARY KEY",
+            "last_stage TEXT",
+            "last_notified_at TEXT",
+            "next_notify_at TEXT",
+            "snoozed_until TEXT",
+            "repeat_count INTEGER NOT NULL DEFAULT 0",
+        ]
+        if has_lease_owner:
+            cols.append("lease_owner TEXT")
+        if has_lease_until:
+            cols.append("lease_until TEXT")
+        return "CREATE TABLE task_notifications (" + ", ".join(cols) + ")"
+
+    def _make_legacy_db(self, name: str, *, has_lease_owner: bool, has_lease_until: bool) -> str:
+        path = str(Path(self._tmp.name) / name)
+        conn = sqlite3.connect(path)
+        conn.execute(
+            """CREATE TABLE tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, note TEXT,
+                action_hint TEXT, due_at TEXT, due_granularity TEXT,
+                priority TEXT NOT NULL DEFAULT 'normal', status TEXT NOT NULL DEFAULT 'open',
+                source TEXT NOT NULL DEFAULT 'command', created_at TEXT NOT NULL,
+                completed_at TEXT, breakdown_json TEXT NOT NULL DEFAULT '[]'
+            )"""
+        )
+        conn.execute(self._legacy_notif_create(has_lease_owner, has_lease_until))
+        conn.execute(
+            "INSERT INTO tasks (title, status, source, created_at, due_at, due_granularity) "
+            "VALUES (?, 'open', 'command', ?, ?, 'datetime')",
+            ("旧タスク", self.now.isoformat(),
+             (self.now + timedelta(hours=2)).isoformat()),
+        )
+        conn.execute(
+            "INSERT INTO task_notifications "
+            "(task_id, last_stage, last_notified_at, next_notify_at, snoozed_until, repeat_count) "
+            "VALUES (1, '3h', ?, ?, NULL, 3)",
+            (self.now.isoformat(), self.now.isoformat()),
+        )
+        conn.commit()
+        conn.close()
+        return path
+
+    def test_lease_columns_migrated_and_claim_revalidate_record(self) -> None:
+        cases = [
+            ("neither", False, False),
+            ("only_owner", True, False),
+            ("only_until", False, True),
+            ("both", True, True),  # 最新スキーマ (既存挙動を壊さない確認)
+        ]
+        for label, has_owner, has_until in cases:
+            with self.subTest(label=label):
+                path = self._make_legacy_db(
+                    f"legacy_{label}.db", has_lease_owner=has_owner, has_lease_until=has_until
+                )
+                store = TaskStore(path, timezone_name="Asia/Tokyo").initialize()
+                try:
+                    conn = store._require()
+                    cols = {
+                        r["name"] for r in conn.execute(
+                            "PRAGMA table_info(task_notifications)").fetchall()
+                    }
+                    self.assertIn("lease_owner", cols)
+                    self.assertIn("lease_until", cols)
+                    # 既存の通知状態・rev・task 行が保持されている
+                    n = conn.execute(
+                        "SELECT * FROM task_notifications WHERE task_id = 1").fetchone()
+                    self.assertEqual(n["last_stage"], "3h")
+                    self.assertEqual(n["repeat_count"], 3)
+                    self.assertEqual(from_iso(n["next_notify_at"]), self.now)
+                    self.assertIsNone(n["lease_owner"])
+                    self.assertIsNone(n["lease_until"])
+                    self.assertEqual(store.get(1)["title"], "旧タスク")
+                    self.assertEqual(store.get(1)["rev"], 0)
+                    # claim → revalidate → record が一通り動く
+                    claimed = store.claim_due_notifications("o1", self.now)
+                    self.assertEqual([c["id"] for c in claimed], [1])
+                    self.assertTrue(store.revalidate_notification_lease(
+                        1, "o1", 0, lease_seconds=120, now=self.now))
+                    ok = store.record_notification(
+                        1, "o1", stage="1h",
+                        next_notify_at=self.now + timedelta(hours=1),
+                        repeat_count=4, fired=True, now=self.now, expected_rev=0,
+                    )
+                    self.assertTrue(ok)
+                    with store._tx() as conn2:
+                        n2 = conn2.execute(
+                            "SELECT last_stage, repeat_count, lease_owner "
+                            "FROM task_notifications WHERE task_id = 1").fetchone()
+                    self.assertEqual(n2["last_stage"], "1h")
+                    self.assertEqual(n2["repeat_count"], 4)
+                    self.assertIsNone(n2["lease_owner"])  # record で lease 解放
+                finally:
+                    store.close()
+
+    def test_reinitialize_idempotent_after_lease_migration(self) -> None:
+        path = self._make_legacy_db(
+            "legacy_reinit.db", has_lease_owner=False, has_lease_until=False
+        )
+        store = TaskStore(path, timezone_name="Asia/Tokyo").initialize()
+        try:
+            self.assertTrue(store.record_notification(
+                1, "o1", stage="3h", next_notify_at=self.now + timedelta(hours=3),
+                repeat_count=2, fired=True, now=self.now,
+            ))
+        finally:
+            store.close()
+        # 再 initialize しても ALTER 失敗せず、状態と rev が維持される
+        store = TaskStore(path, timezone_name="Asia/Tokyo").initialize()
+        try:
+            with store._tx() as conn:
+                n = conn.execute(
+                    "SELECT last_stage, repeat_count FROM task_notifications WHERE task_id = 1"
+                ).fetchone()
+            self.assertEqual(n["last_stage"], "3h")
+            self.assertEqual(n["repeat_count"], 2)
+            self.assertEqual(store.get(1)["rev"], 0)
+            self.assertEqual(store.get(1)["title"], "旧タスク")
+            # 再初期化後も claim できる (next_notify_at を過ぎた時点で)
+            self.assertEqual(
+                [c["id"] for c in store.claim_due_notifications(
+                    "o1", self.now + timedelta(hours=4))], [1])
+        finally:
+            store.close()
 
 
 if __name__ == "__main__":

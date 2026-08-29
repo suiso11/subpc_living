@@ -67,12 +67,10 @@ class WakeWordDetector:
                     if name in openwakeword.models:
                         model_paths.append(openwakeword.models[name]["model_path"])
                     else:
-                        logger.warning(
-                            f"ウェイクワードモデル '{name}' が見つかりません。"
-                            f" 利用可能: {list(openwakeword.models.keys())}"
-                        )
+                        # モデル名・検索結果は設定情報なので診断へ出さない。
+                        logger.warning("wakeword model unavailable")
                 if not model_paths:
-                    logger.error("有効なウェイクワードモデルがありません")
+                    logger.error("wakeword model unavailable")
                     return False
             # model_paths が空リストなら全プリトレインモデルをロード
 
@@ -88,16 +86,16 @@ class WakeWordDetector:
             self._model = Model(**kwargs)
             self._loaded = True
 
-            # ロードされたモデル名を取得
-            loaded_models = list(self._model.models.keys())
-            logger.info(f"ウェイクワードモデルロード完了: {loaded_models}")
+            # ロード完了の診断にはモデル名・パスを出さない。
+            logger.info("wakeword model load complete")
             return True
 
-        except ImportError:
-            logger.error("openwakeword がインストールされていません: pip install openwakeword")
+        except ImportError as e:
+            logger.error("wakeword model load failed: %s", type(e).__name__)
             return False
         except Exception as e:
-            logger.error(f"ウェイクワードモデルのロードに失敗: {e}")
+            # 例外本文にはパス、provider、モデル一覧などが含まれ得る。
+            logger.error("wakeword model load failed: %s", type(e).__name__)
             return False
 
     @property
@@ -143,7 +141,7 @@ class WakeWordDetector:
         # 閾値を超えたモデルを検索
         for model_name, score in prediction.items():
             if score >= self.threshold:
-                logger.info(f"ウェイクワード検知: {model_name} (score={score:.3f})")
+                logger.info("wakeword detected")
                 # 検知後にモデルをリセット（連続誤検知を防ぐ）
                 self._model.reset()
                 return model_name

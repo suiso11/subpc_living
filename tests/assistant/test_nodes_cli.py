@@ -1,5 +1,6 @@
 """src.assistant.nodes CLI validation tests."""
 
+import copy
 import json
 import subprocess
 import sys
@@ -111,6 +112,96 @@ class NodesCLITest(unittest.TestCase):
         result = _run_cli()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("usage", result.stderr)
+
+
+OPENAI_LOOPBACK_INVENTORY = {
+    "nodes": [
+        {
+            "node_id": "local-node",
+            "role": "always-on",
+            "hostname": "localhost",
+            "providers": [
+                {
+                    "provider_id": "local-openai",
+                    "base_url": "http://localhost:8080/v1",
+                    "model": "local-model",
+                    "local": True,
+                    "provider_kind": "openai_compatible",
+                    "profiles": ["chat"],
+                }
+            ],
+        }
+    ],
+    "default_provider_id": "local-openai",
+    "fallback_provider_ids": [],
+}
+
+
+class NodesOpenAICLITest(unittest.TestCase):
+    def test_openai_compatible_loopback_inventory_validates(self) -> None:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False
+        ) as f:
+            json.dump(OPENAI_LOOPBACK_INVENTORY, f)
+            path = f.name
+
+        result = _run_cli("validate", path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("node local-node", result.stdout)
+        self.assertIn("OK", result.stdout)
+
+    def test_openai_compatible_non_loopback_url_rejected(self) -> None:
+        data = dict(OPENAI_LOOPBACK_INVENTORY)
+        data["nodes"][0]["providers"][0]["base_url"] = "http://main-pc:8080/v1"
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False
+        ) as f:
+            json.dump(data, f)
+            path = f.name
+
+        result = _run_cli("validate", path)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("InvalidNodeInventoryError", result.stderr)
+
+    def test_unknown_provider_kind_rejected(self) -> None:
+        data = dict(OPENAI_LOOPBACK_INVENTORY)
+        data["nodes"][0]["providers"][0]["provider_kind"] = "anthropic"
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False
+        ) as f:
+            json.dump(data, f)
+            path = f.name
+
+        result = _run_cli("validate", path)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("provider_kind", result.stderr)
+
+    def test_blank_provider_kind_normalizes_to_ollama(self) -> None:
+        data = copy.deepcopy(VALID_INVENTORY)
+        data["nodes"][0]["providers"][0]["provider_kind"] = "   "
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False
+        ) as f:
+            json.dump(data, f)
+            path = f.name
+
+        result = _run_cli("validate", path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("node node-a", result.stdout)
+        self.assertIn("OK", result.stdout)
+
+    def test_openai_compatible_local_false_rejected(self) -> None:
+        data = copy.deepcopy(OPENAI_LOOPBACK_INVENTORY)
+        data["nodes"][0]["providers"][0]["local"] = False
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False
+        ) as f:
+            json.dump(data, f)
+            path = f.name
+
+        result = _run_cli("validate", path)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("InvalidNodeInventoryError", result.stderr)
 
 
 if __name__ == "__main__":

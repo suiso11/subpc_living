@@ -62,8 +62,6 @@ class WhisperSTT:
             return
         from faster_whisper import WhisperModel
 
-        dev_str = f"{self.device}:{self.device_index}" if self.device == "cuda" else self.device
-        print(f"[STT] モデル '{self.model_size}' をロード中 (device={dev_str}, compute_type={self.compute_type})...")
         start = time.time()
         self._model = WhisperModel(
             self.model_size,
@@ -72,7 +70,7 @@ class WhisperSTT:
             compute_type=self.compute_type,
         )
         elapsed = time.time() - start
-        print(f"[STT] モデルロード完了 ({elapsed:.1f}秒)")
+        print(f"[STT] model loaded ({elapsed:.1f}s)")
 
     def transcribe(self, audio_data: np.ndarray, sample_rate: int = 16000) -> str:
         """
@@ -113,7 +111,7 @@ class WhisperSTT:
         elapsed = time.time() - start
         text = text.strip()
         if text:
-            print(f"[STT] 認識完了 ({elapsed:.1f}秒): {text[:50]}{'...' if len(text) > 50 else ''}")
+            print(f"[STT] recognition done ({elapsed:.1f}s)")
 
         return text
 

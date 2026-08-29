@@ -23,7 +23,9 @@ def create_screen_context(mode: Optional[str] = None, **kwargs):
         **kwargs: local モードでは ScreenContext にそのまま渡す
                   (analysis_interval / base_url / model / stale_after など)。
                   remote モードではキャプチャも VLM 呼び出しもしないため
-                  base_url / model / analysis_interval は無視し、stale_after のみ引き継ぐ。
+                  base_url / model / analysis_interval は無視し、stale_after と
+                  screen_ingest (明示 bool) のみ引き継ぐ。screen_ingest 未指定時は
+                  RemoteScreenContext が共有 SensorPolicy.screen_ingest を env から解決する。
 
     Returns:
         ScreenContext または RemoteScreenContext (同一の公開インターフェース)。
@@ -35,8 +37,9 @@ def create_screen_context(mode: Optional[str] = None, **kwargs):
     if mode == "remote":
         from src.screen.remote import RemoteScreenContext
         remote_kwargs = {}
-        if "stale_after" in kwargs:
-            remote_kwargs["stale_after"] = kwargs["stale_after"]
+        for key in ("stale_after", "screen_ingest"):
+            if key in kwargs:
+                remote_kwargs[key] = kwargs[key]
         return RemoteScreenContext(**remote_kwargs)
 
     from src.screen.context import ScreenContext
