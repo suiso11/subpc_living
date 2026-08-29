@@ -1,5 +1,6 @@
 {
   "packages": [
     "git:github.com/edxeth/pi-subagents"
-  ]
+  ],
+  "defaultThinkingLevel": "high"
 }
