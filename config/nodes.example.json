@@ -1,0 +1,36 @@
+{
+  "nodes": [
+    {
+      "node_id": "sub-pc",
+      "role": "always-on",
+      "hostname": "localhost",
+      "providers": [
+        {
+          "provider_id": "local-strong",
+          "base_url": "http://localhost:11434",
+          "model": "<sub-pc-model>",
+          "local": true,
+          "provider_kind": "ollama",
+          "profiles": ["chat_auto", "deep_reasoning"]
+        }
+      ]
+    },
+    {
+      "node_id": "main-pc",
+      "role": "interactive",
+      "hostname": "main-pc",
+      "providers": [
+        {
+          "provider_id": "local-fast",
+          "base_url": "http://main-pc:11434",
+          "model": "<main-pc-model>",
+          "local": true,
+          "provider_kind": "ollama",
+          "profiles": ["voice_fast", "task_local"]
+        }
+      ]
+    }
+  ],
+  "default_provider_id": "local-strong",
+  "fallback_provider_ids": ["local-fast"]
+}

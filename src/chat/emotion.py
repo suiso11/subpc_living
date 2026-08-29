@@ -25,7 +25,9 @@ _EMOTION_TO_STYLE = {
     "neutral": "Neutral",
 }
 
-# システムプロンプト末尾へ追加する指示文 (build_messages() で一元的に付与)
+# システムプロンプト末尾へ追加する指示文。
+# ChatSession.build_blocks() が source="emotion" の ContextBlock として生成し、
+# 共有の ContextBuilder 経由で描画される。
 EMOTION_TAG_INSTRUCTION = (
     "応答の冒頭に、応答全体の感情を表すタグを必ず1つだけ付けてください。"
     "形式: [emo:happy]。使える感情: happy / sad / angry / surprise / fear / "

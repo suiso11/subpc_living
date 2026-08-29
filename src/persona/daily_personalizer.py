@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 from src.persona.profile import UserProfile
 
 if TYPE_CHECKING:
-    from src.chat.client import OllamaClient
+    from src.llm.provider import LLMProvider
 
 
 PERSONALIZER_SYSTEM_PROMPT = """\
@@ -61,7 +61,7 @@ class DailyPersonalizer:
         self,
         *,
         project_root: str | Path,
-        llm: "OllamaClient",
+        llm: "LLMProvider",
         profile_path: str | Path = "data/profile/user_profile.json",
         diary_dir: str | Path = "data/diary",
         audit_dir: str | Path = "data/profile/personalization",

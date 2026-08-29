@@ -17,9 +17,10 @@ import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from src.chat.emotion import parse_emotion_tag
+from src.perception.policy import resolve_sensor_policy
 from src.persona.conversation_loop import ConversationLoopStore
 from src.persona.profile import UserProfile
 from src.persona.proactive import ProactiveEngine
@@ -212,6 +213,7 @@ class ProactiveBridge:
         monitor_context: Any = None,
         engine: Optional[ProactiveEngine] = None,
         conversation_store: Optional[ConversationLoopStore] = None,
+        companion_getter: Optional[Callable[[], Any]] = None,
     ) -> None:
         self.bot = bot
         self.state = state
@@ -227,16 +229,22 @@ class ProactiveBridge:
             daily_limit=config.conversation_daily_limit,
             max_backoff_sec=config.conversation_max_backoff_hours * 3600,
         )
-        self.engine = engine or ProactiveEngine(
-            profile=profile,
-            check_interval=config.check_interval,
-            monitor_context=monitor_context,
-            conversation_enabled=config.conversation_enabled,
-            conversation_interval=config.conversation_interval_hours * 3600,
-            conversation_idle=config.conversation_idle_minutes * 60,
-            quiet_hours=config.quiet_hours,
-            conversation_gate=self._can_start_conversation,
-        )
+        if engine is None:
+            proactive_state_path = state_path.with_suffix(state_path.suffix + ".proactive.json")
+            self.engine = ProactiveEngine(
+                profile=profile,
+                check_interval=config.check_interval,
+                monitor_context=monitor_context,
+                conversation_enabled=config.conversation_enabled,
+                conversation_interval=config.conversation_interval_hours * 3600,
+                conversation_idle=config.conversation_idle_minutes * 60,
+                quiet_hours=config.quiet_hours,
+                conversation_gate=self._can_start_conversation,
+                companion_getter=companion_getter,
+                state_path=str(proactive_state_path),
+            )
+        else:
+            self.engine = engine
 
     # --- ライフサイクル ---
 
@@ -281,6 +289,7 @@ class ProactiveBridge:
         now = time.time()
         if normalized in _LATER_COMMANDS:
             self.conversation_store.snooze(channel_id, until=now + 3 * 3600)
+            self.engine.record_rejection("conversation_start")
             return "了解です。少なくとも3時間は、会話のきっかけを送りません。"
         if normalized in _QUIET_TODAY_COMMANDS:
             local_now = datetime.fromtimestamp(now).astimezone()
@@ -291,6 +300,7 @@ class ProactiveBridge:
                 microsecond=0,
             )
             self.conversation_store.snooze(channel_id, until=tomorrow.timestamp())
+            self.engine.record_rejection("conversation_start")
             return "了解です。今日はこのまま静かにしておきます。"
         return None
 
@@ -316,7 +326,7 @@ class ProactiveBridge:
         return {
             "enabled": self.config.conversation_enabled,
             **self.conversation_store.status(self.config.channel_id),
-            "state_error": self.conversation_store.last_error,
+            "state_error": "yes" if self.conversation_store.last_error else "",
         }
 
     # --- コールバック (エンジンのスレッドから呼ばれる) ---
@@ -425,8 +435,29 @@ class ProactiveBridge:
                 pass
 
 
-def _build_monitor_context() -> Any:
-    """MonitorContext を pipeline.py と同様に構築 (失敗時 None)。"""
+def _cleanup_monitor_context(ctx: Any) -> None:
+    """MonitorContext の best-effort stop。クリーンアップ失敗を外へ漏らさない。"""
+    if ctx is None:
+        return
+    try:
+        ctx.stop()
+    except Exception:
+        pass
+
+
+def _build_monitor_context(env: Optional[dict] = None) -> Any:
+    """SensorPolicy.monitor が明示 true のときだけ MonitorContext を構築する。
+
+    canonical 名 (SENSOR_MONITOR_ENABLED) が明示 `true` でない限り、MonitorContext
+    の import・構築・start を一切行わず None を返す (fail closed / 既定オフ)。
+    共有解決器 resolve_sensor_policy を使うため canonical precedence が適用され、
+    false・空・不正値は監視センサーを有効化しない。start が false を返すか例外を
+    投げたときは、構築済み context を best-effort で stop してから None を返す
+    (リソースリーク防止)。start 成功時は stop せず context をそのまま返す。
+    """
+    if not resolve_sensor_policy(env).monitor:
+        return None
+    ctx = None
     try:
         from src.monitor.context import MonitorContext
 
@@ -435,14 +466,18 @@ def _build_monitor_context() -> Any:
             collect_interval=30.0,
         )
         if not ctx.start():
+            _cleanup_monitor_context(ctx)
             return None
         return ctx
-    except Exception as e:
-        print(f"[Discord] proactive monitor 初期化スキップ: {e}")
+    except Exception:
+        _cleanup_monitor_context(ctx)
+        print("[Discord] proactive monitor 初期化スキップ")
         return None
 
 
-def create_proactive_bridge(state: Any, bot: Any) -> Optional[ProactiveBridge]:
+def create_proactive_bridge(
+    state: Any, bot: Any, companion_getter: Optional[Callable[[], Any]] = None
+) -> Optional[ProactiveBridge]:
     """環境変数から ProactiveBridge を構築する。無効なら None。
 
     クラッシュ禁止: 構築に失敗しても None を返して bot を継続させる。
@@ -464,8 +499,8 @@ def create_proactive_bridge(state: Any, bot: Any) -> Optional[ProactiveBridge]:
             profile_path=str(PROJECT_ROOT / "data" / "profile" / "user_profile.json"),
         )
         profile.load()
-    except Exception as e:
-        print(f"[Discord] proactive profile 初期化失敗のため無効化: {e}")
+    except Exception:
+        print("[Discord] proactive profile 初期化失敗のため無効化")
         return None
 
     monitor_context = _build_monitor_context()
@@ -475,4 +510,5 @@ def create_proactive_bridge(state: Any, bot: Any) -> Optional[ProactiveBridge]:
         config=config,
         profile=profile,
         monitor_context=monitor_context,
+        companion_getter=companion_getter,
     )

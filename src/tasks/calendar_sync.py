@@ -41,6 +41,40 @@ def _log(message: str) -> None:
     print(f"[CalendarSync] {message}")
 
 
+def _marker_task_id(event: Any) -> Optional[int]:
+    """マーカー付きイベントからタスク id を取り出す。無効なら None。"""
+    desc = getattr(event, "description", "") or ""
+    idx = desc.find(TASK_MARKER_PREFIX)
+    if idx < 0 or not getattr(event, "event_id", ""):
+        return None
+    tail = desc[idx + len(TASK_MARKER_PREFIX):]
+    digits = ""
+    for ch in tail:
+        if not ch.isdigit():
+            break
+        digits += ch
+    if not digits:
+        return None
+    try:
+        return int(digits)
+    except ValueError:
+        return None
+
+
+def _canonical_marker(owned: list[Any], stored_id: Optional[str]) -> Any:
+    """所有マーカーのうち決定的に正準の1件を選ぶ。
+
+    対応付け済み id がグループ内にあればそれを優先し、無ければ
+    (start, event_id) の辞書順最小を選ぶ。複数インスタンスが同じ結果に
+    収束するため、重複マーカーの削除対象が揺れない。
+    """
+    if stored_id:
+        for ev in owned:
+            if ev.event_id == stored_id:
+                return ev
+    return min(owned, key=lambda ev: (ev.start or "", ev.event_id))
+
+
 # =====================================================================
 # タスク → カレンダー
 # =====================================================================
@@ -141,20 +175,30 @@ class TaskCalendarSync:
     # --- 1 件分の同期。(ok, error) を返す。 ---
 
     def _sync_task(self, task_id: int, event: str) -> tuple[bool, str]:
+        """現在のタスク状態を最優先して同期する (stale な queue イベント対策)。
+
+        queue イベントのラベル (add/update/done) が現在のタスク状態と食い違う
+        場合に備え、必ず先に現在状態を読んでから行動を決める:
+
+        - dropped: 対応付けられたイベントがあれば削除する。
+        - done: open イベントは作らない。既存イベントがあれば完了サマリへ更新する。
+        - open: イベントラベルに関わらず現在の due/イベント状態で再調整する。
+          ただし明示的な drop ラベルは現在状態に対して削除を実行する。
+        """
         task = self.store.get(task_id)
         if task is None:
-            return True, ""  # 既に消えている: 何もしない
+            # ハード削除済み: 対応付けられた event_id を知る術がない。
+            # 残存イベントは pull 側のマーカー整理 (CalendarPullWorker) が掃除する。
+            return True, ""
 
+        status = task.get("status")
         event_id = task.get("calendar_event_id")
         title = task.get("title") or ""
-        due = task.get("due_at")
-        gran = task.get("due_granularity")
-        note = task.get("note") or ""
 
-        if event == "drop":
+        if status == "dropped":
             return self._delete_if_present(task_id, event_id)
 
-        if event == "done":
+        if status == "done":
             if not event_id:
                 return True, ""  # カレンダーに載っていないタスクは何もしない
             res = self.client.update_event(
@@ -168,7 +212,15 @@ class TaskCalendarSync:
                 return True, ""
             return False, res.error
 
-        # add / update
+        # status == "open"
+        if event == "drop":
+            # 明示的な drop セマンティクスは現在状態に従う (現在の対応付けを削除)。
+            return self._delete_if_present(task_id, event_id)
+
+        due = task.get("due_at")
+        gran = task.get("due_granularity")
+        note = task.get("note") or ""
+
         if due is None:
             # 期限が無い → カレンダー対象外。既存イベントがあれば削除。
             return self._delete_if_present(task_id, event_id)
@@ -322,35 +374,84 @@ class CalendarPullWorker:
         return True
 
     def _reconcile_markers(self, events: list[Any]) -> None:
-        """subpc-task: マーカー付きイベントの id を、未対応付けのタスクへ補完する。"""
+        """subpc-task マーカー付きイベントをタスク状態で再調整する。
+
+        crash / queue-drop でタスク→カレンダー同期が失われた場合の回復経路。
+        マーカーイベントをタスク id でグループ化し、現在のタスク状態に従う:
+
+        - タスク不存在 / dropped: 所有マーカーイベントをベストエフォート削除。
+        - done: 正準マーカーを1件残し、必要なら完了サマリへ更新して対応付けを復元。
+        - open: 正準マーカーを1件残し、対応付けを復元 / バックフィル。
+        - 重複マーカーは決定的に1件へ収束させる。
+
+        失敗は握り潰して次のタスクへ進む (best-effort)。イベント本文は
+        一切ログしない。
+        """
         if self.store is None:
             return
+
+        by_task: dict[int, list[Any]] = {}
         for ev in events:
-            desc = ev.description or ""
-            idx = desc.find(TASK_MARKER_PREFIX)
-            if idx < 0 or not ev.event_id:
+            tid = _marker_task_id(ev)
+            if tid is None:
                 continue
-            tail = desc[idx + len(TASK_MARKER_PREFIX):]
-            digits = ""
-            for ch in tail:
-                if ch.isdigit():
-                    digits += ch
-                else:
-                    break
-            if not digits:
-                continue
+            by_task.setdefault(tid, []).append(ev)
+
+        for tid, owned in by_task.items():
             try:
-                task = self.store.get(int(digits))
+                task = self.store.get(tid)
             except Exception:
-                task = None
-            if task is None:
+                continue  # best-effort: 失敗しても他タスクの整理は続ける
+
+            if task is None or task.get("status") == "dropped":
+                self._delete_marker_events(owned)
+                if task is not None:
+                    try:
+                        self.store.clear_calendar_event(tid)
+                    except Exception:
+                        pass
                 continue
-            if not task.get("calendar_event_id") and task.get("status") == "open":
-                try:
-                    self.store.set_calendar_event(int(digits), ev.event_id)
-                    _log(f"backfilled calendar_event_id for task={digits}")
-                except Exception:
-                    pass
+
+            canonical = _canonical_marker(owned, task.get("calendar_event_id"))
+            duplicates = [ev for ev in owned if ev.event_id != canonical.event_id]
+
+            if task.get("status") == "done":
+                if not str(canonical.title or "").startswith("✅"):
+                    self._update_marker_event(
+                        canonical,
+                        summary=f"✅ {task.get('title') or ''}",
+                    )
+            self._restore_mapping(tid, canonical.event_id, task.get("calendar_event_id"))
+            if duplicates:
+                self._delete_marker_events(duplicates)
+
+    def _restore_mapping(self, task_id: int, event_id: str, current: Optional[str]) -> None:
+        if current == event_id:
+            return
+        try:
+            self.store.set_calendar_event(task_id, event_id)
+        except Exception:
+            pass  # best-effort
+
+    def _delete_marker_events(self, events: list[Any]) -> None:
+        if not events:
+            return
+        for ev in events:
+            try:
+                self.client.delete_event(ev.event_id, calendar_id=self.calendar_id)
+            except Exception:
+                pass  # best-effort: 失敗しても残りは処理する
+
+    def _update_marker_event(self, ev: Any, **kwargs: Any) -> None:
+        try:
+            self.client.update_event(
+                ev.event_id,
+                calendar_id=self.calendar_id,
+                timezone=self.timezone,
+                **kwargs,
+            )
+        except Exception:
+            pass  # best-effort
 
     def _write_upcoming(
         self,

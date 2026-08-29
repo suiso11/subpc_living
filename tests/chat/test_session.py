@@ -233,6 +233,26 @@ class StoreMemoryTests(unittest.TestCase):
         self.assertEqual(len(growth.calls), 1)
         self.assertIs(growth.calls[0]["memory_saved"], False)
 
+    def test_both_false_keeps_pair_without_rag_or_growth(self):
+        """両方 False でもインメモリ履歴への追加だけは行う。"""
+        rag = _RecordingRAG()
+        growth = _RecordingGrowth()
+        session = self._make_session(rag=rag, growth_tracker=growth)
+        session.add_user_message("覚えておいて")
+        session.add_assistant_message(
+            "了解しました", store_memory=False, record_growth=False
+        )
+
+        self.assertEqual(
+            session.messages,
+            [
+                {"role": "user", "content": "覚えておいて"},
+                {"role": "assistant", "content": "了解しました"},
+            ],
+        )
+        self.assertEqual(rag.calls, [])
+        self.assertEqual(growth.calls, [])
+
     def test_false_does_not_classify_by_text(self):
         """store_memory=False はテキスト内容に依存しない。
         通常会話文と似た内容でも明示的に False なら保存しない。"""
@@ -255,3 +275,60 @@ class StoreMemoryTests(unittest.TestCase):
 
         self.assertEqual(len(growth.calls), 1)
         self.assertIs(growth.calls[0]["memory_saved"], False)
+
+
+class RollbackLastUserMessageTests(unittest.TestCase):
+    """rollback_last_user_message の回帰テスト (CLI / Voice / Web / Discord の巻き戻し用)。"""
+
+    def _make_session(self):
+        return ChatSession(system_prompt="sys", max_history_turns=20)
+
+    def test_rolls_back_final_user_message_and_returns_true(self):
+        """最終メッセージが user のときだけ原子的に除去して True を返す。"""
+        session = self._make_session()
+        session.add_user_message("保留中の質問")
+        session.add_user_message("最後の質問")
+
+        self.assertIs(session.rollback_last_user_message(), True)
+        self.assertEqual(
+            session.messages,
+            [{"role": "user", "content": "保留中の質問"}],
+        )
+
+    def test_returns_false_when_final_message_is_assistant(self):
+        """最終メッセージが assistant のときは変更せず False を返す。"""
+        session = self._make_session()
+        session.add_user_message("質問")
+        session.add_assistant_message("回答")
+
+        self.assertIs(session.rollback_last_user_message(), False)
+        self.assertEqual(len(session.messages), 2)
+        self.assertEqual(session.messages[-1]["role"], "assistant")
+
+    def test_returns_false_when_history_is_empty(self):
+        """履歴が空のときは変更せず False を返す。"""
+        session = self._make_session()
+        self.assertIs(session.rollback_last_user_message(), False)
+        self.assertEqual(session.messages, [])
+
+    def test_returns_boolean_no_content_leak(self):
+        """戻り値は bool のみで、メッセージ内容や診断文字列を漏らさない。"""
+        session = self._make_session()
+        session.add_user_message("機密内容")
+        result = session.rollback_last_user_message()
+        self.assertIsInstance(result, bool)
+        self.assertNotIn("機密内容", str(result))
+        self.assertEqual(result, True)
+
+    def test_repeated_rollback_is_idempotent_until_non_user(self):
+        """繰り返し呼んでも、user が残る間は真、assistant に出会ったら偽で停止する。"""
+        session = self._make_session()
+        session.add_user_message("質問")
+        session.add_assistant_message("回答")
+        session.add_user_message("追加の質問")
+
+        self.assertIs(session.rollback_last_user_message(), True)
+        self.assertEqual(session.messages[-1]["role"], "assistant")
+        self.assertIs(session.rollback_last_user_message(), False)
+        # 2回目で何も除去されていない
+        self.assertEqual(session.messages[-1]["role"], "assistant")

@@ -1,0 +1,71 @@
+/* subpc_living web theme: dark atmospheric shell with expanded growth instrument. */
+/* Additive layer: tokens.css owns values; style.css owns shared layout. */
+
+body { background-color: var(--color-paper-0); }
+.site-header, .task-header.site-header { color: var(--ink); }
+.site-brand { text-transform: lowercase; }
+.page-label, .eyebrow, .instrument-label { text-transform: uppercase; }
+button:disabled { cursor: not-allowed; }
+
+/* N13: visible command-search pill, built by shell-ui.js. */
+.shell-command-trigger {
+  min-height: 44px;
+  padding: 0 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-secondary);
+  background: var(--color-paper-2);
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  font-family: var(--mono);
+  font-size: .68rem;
+  white-space: nowrap;
+  transition: color var(--dur-fast) var(--ease-standard), border-color var(--dur-fast) var(--ease-standard), background-color var(--dur-fast) var(--ease-standard);
+}
+.shell-command-trigger:hover { color: var(--brass); border-color: var(--line-strong); background: var(--paper-3); }
+.shell-command-trigger kbd { padding: 3px 6px; color: var(--brass); border: 1px solid var(--border-soft); border-radius: 4px; font: inherit; }
+
+.shell-command-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: grid;
+  place-items: start center;
+  padding: min(14vh, 120px) 12px 12px;
+  background: var(--color-overlay);
+  animation: command-crossfade var(--dur-base) var(--ease-standard) both;
+}
+.shell-command-dialog {
+  width: min(680px, 100%);
+  max-height: min(680px, 78vh);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  color: var(--text);
+  background: var(--paper-1);
+  border: 1px solid var(--line-strong);
+  box-shadow: var(--shadow);
+  animation: command-crossfade var(--dur-base) var(--ease-standard) both;
+}
+@keyframes command-crossfade { from { opacity: 0; } to { opacity: 1; } }
+.shell-command-head { padding: 12px; border-bottom: 1px solid var(--border-soft); }
+.shell-command-input { width: 100%; min-height: 48px; padding: 0 14px; color: var(--text); background: var(--paper-0); border: 1px solid var(--line-strong); border-radius: var(--radius-sm); outline: 0; font: inherit; }
+.shell-command-input:focus { box-shadow: var(--focus-ring); }
+.shell-command-list { overflow: auto; padding: 8px; }
+.shell-command-option { width: 100%; min-height: 54px; display: grid; grid-template-columns: 32px minmax(0, 1fr) auto; align-items: center; gap: 10px; padding: 8px 10px; color: var(--text); background: transparent; border: 0; text-align: left; }
+.shell-command-option:hover, .shell-command-option[aria-selected="true"] { color: var(--brass-ink); background: var(--brass); }
+.shell-command-icon { color: var(--brass); text-align: center; }.shell-command-option:hover .shell-command-icon, .shell-command-option[aria-selected="true"] .shell-command-icon { color: var(--brass-ink); }
+.shell-command-copy { min-width: 0; display: flex; flex-direction: column; gap: 2px; }.shell-command-copy strong { font-size: .82rem; font-weight: 500; }.shell-command-copy small { color: var(--text-dim); font-size: .67rem; }.shell-command-option:hover small, .shell-command-option[aria-selected="true"] small { color: var(--color-on-brass-muted); }
+.shell-command-shortcut { color: var(--text-faint); font-family: var(--mono); font-size: .65rem; }.shell-command-option:hover .shell-command-shortcut, .shell-command-option[aria-selected="true"] .shell-command-shortcut { color: var(--brass-ink); }
+.shell-command-empty { padding: 22px; color: var(--text-dim); text-align: center; }.shell-command-foot { display: flex; gap: 14px; padding: 9px 12px; color: var(--text-faint); border-top: 1px solid var(--border-soft); font-family: var(--mono); font-size: .62rem; }.shell-command-foot kbd { color: var(--brass); font: inherit; }.shell-command-open { overflow: hidden !important; }
+
+@media (max-width: 700px) {
+  .shell-command-trigger { width: 44px; min-width: 44px; padding: 0; justify-content: center; font-size: .6rem; }
+  .shell-command-trigger span { display: none; }
+  .shell-command-trigger kbd { font-size: .58rem; }
+  .shell-command-backdrop { align-items: end; padding: 8px; }
+  .shell-command-dialog { max-height: 84dvh; }
+  .shell-command-foot { display: none; }
+}
+@media (prefers-reduced-motion: reduce) { .shell-command-backdrop, .shell-command-dialog { animation: none; } }

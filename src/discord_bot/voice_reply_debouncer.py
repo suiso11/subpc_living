@@ -19,6 +19,7 @@ deterministic to test.
 """
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import Any, Callable, Hashable
 
@@ -29,6 +30,69 @@ class _SpeakerBuffer:
     first_at: float = 0.0
     message: Any = None
     timer: Any = None
+
+
+class VoiceReplyGenerationGate:
+    """Track the active voice-reply generation and cancel in-flight replies on revoke.
+
+    ``activate`` bumps the generation and marks the gate active; callers capture the
+    returned generation and must check ``is_active(generation)`` before any voice-reply
+    side effect. ``revoke`` deactivates the gate, bumps the generation again (so every
+    captured task becomes stale), cancels each tracked asyncio Task, and awaits them with
+    a bounded timeout so it can never hang the caller. ``revoke_sync`` is a best-effort
+    synchronous variant for shutdown paths that cannot await.
+
+    The gate deliberately uses no locks: it is only ever driven from the bot's single
+    asyncio event loop, and ``revoke`` never awaits while holding any lock.
+    """
+
+    def __init__(self, *, revoke_timeout: float = 5.0) -> None:
+        self._generation = 0
+        self._active = False
+        self._tasks: set[asyncio.Task] = set()
+        self._revoke_timeout = max(0.0, float(revoke_timeout))
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    @property
+    def generation(self) -> int:
+        return self._generation
+
+    def activate(self) -> int:
+        """Activate the gate and return the new generation for callers to capture."""
+        self._generation += 1
+        self._active = True
+        return self._generation
+
+    def is_active(self, generation: int) -> bool:
+        """True only while the gate is active AND the caller captured this generation."""
+        return self._active and generation == self._generation
+
+    def track(self, task: asyncio.Task) -> None:
+        """Track an in-flight reply task so a later revoke can cancel it."""
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def revoke(self) -> None:
+        """Deactivate, invalidate captured generations, cancel and bounded-await tasks."""
+        self._active = False
+        self._generation += 1
+        tasks = [task for task in list(self._tasks) if not task.done()]
+        for task in tasks:
+            task.cancel()
+        if not tasks:
+            return
+        await asyncio.wait(tasks, timeout=self._revoke_timeout)
+
+    def revoke_sync(self) -> None:
+        """Best-effort synchronous revoke for shutdown (cancels but does not await)."""
+        self._active = False
+        self._generation += 1
+        for task in list(self._tasks):
+            if not task.done():
+                task.cancel()
 
 
 class VoiceReplyDebouncer:

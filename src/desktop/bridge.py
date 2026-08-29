@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
+import os
 import tempfile
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -15,10 +17,16 @@ from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtNetwork import QAbstractSocket
 from PySide6.QtWebSockets import QWebSocket
 
+from src.perception import create_activity_runtime_from_env, resolve_sensor_policy
+
 from .api import DesktopApi
 from .audio import NativeAudioRecorder
 from .config import DesktopSettings
+from .avatar import resolve_avatar_model
+from .shell import decide_shell_state, overlay_visibility, sensor_provenance
 from .windows import is_autostart_enabled, set_autostart
+
+logger = logging.getLogger(__name__)
 
 
 class _WorkerSignals(QObject):
@@ -61,6 +69,11 @@ class DesktopBridge(QObject):
     autostartChanged = Signal()
     ttsEnabledChanged = Signal()
     ttsVoicesChanged = Signal()
+    companionStateChanged = Signal()
+    overlayShellChanged = Signal()
+    overlayClickThroughChanged = Signal()
+    overlayClickThroughRequested = Signal(bool)
+    mainWindowRequested = Signal()
     toast = Signal(str, str)
     nativeNotification = Signal(str, str)
 
@@ -108,11 +121,23 @@ class DesktopBridge(QObject):
         self._resume_generation = 0
         self._shutting_down = False
         self._notified_due: set[str] = set()
-        self.recorder = NativeAudioRecorder()
+        self._sensor_policy = resolve_sensor_policy(os.environ)
+        self.recorder: NativeAudioRecorder | None = None
+
+        self._activity_runtime = create_activity_runtime_from_env(os.environ, logger=logger)
+        self._overlay_enabled = os.environ.get("DESKTOP_OVERLAY_ENABLED", "").strip().lower() == "true"
+        self._overlay_click_through = False
+        self._avatar_model_cache: dict[str, Any] | None = None
 
         self.reminder_timer = QTimer(self)
         self.reminder_timer.setInterval(60_000)
         self.reminder_timer.timeout.connect(self.loadTasks)
+
+        self.companion_timer = QTimer(self)
+        self.companion_timer.setInterval(5_000)
+        self.companion_timer.timeout.connect(self._companion_tick)
+        if self._activity_runtime is not None:
+            self.companion_timer.start()
 
         self.socket = QWebSocket("SUBPC BUDDY")
         self.socket.connected.connect(self._socket_connected)
@@ -209,6 +234,147 @@ class DesktopBridge(QObject):
     @Property("QVariantList", notify=ttsVoicesChanged)
     def ttsVoices(self) -> list[dict[str, str]]:
         return self._tts_voices
+
+    @Property("QVariantMap", notify=companionStateChanged)
+    def companionState(self) -> dict[str, Any]:
+        return self.api.companion_state(self._activity_runtime)
+
+    def _companion_tick(self) -> None:
+        self.companionStateChanged.emit()
+        self.overlayShellChanged.emit()
+
+    def _stop_companion(self) -> None:
+        """Stop the activity runtime exactly once and disable the companion.
+
+        Clears the runtime reference so the companion payload reports
+        disabled. Stops the companion timer and emits companion/overlay state
+        changes. Idempotent: subsequent calls do not stop the runtime again.
+        """
+        runtime = self._activity_runtime
+        self._activity_runtime = None
+        self.companion_timer.stop()
+        if runtime is not None:
+            runtime.stop()
+        self.companionStateChanged.emit()
+        self.overlayShellChanged.emit()
+
+    @Property(bool, notify=companionStateChanged)
+    def overlayEnabled(self) -> bool:
+        return self._overlay_enabled
+
+    @Property(bool, notify=overlayClickThroughChanged)
+    def overlayClickThrough(self) -> bool:
+        return self._overlay_click_through
+
+    @Property("QVariantMap", notify=overlayShellChanged)
+    def overlayShell(self) -> dict[str, Any]:
+        return self._compute_overlay_shell()
+
+    @Property("QVariantMap", notify=overlayShellChanged)
+    def avatarModel(self) -> dict[str, Any]:
+        """Return resolved avatar model info: {"path": str, "exists": bool}."""
+        if self._avatar_model_cache is None:
+            self._resolve_avatar_model()
+        return self._avatar_model_cache  # type: ignore[return-value]
+
+    @Slot()
+    def refreshAvatarModel(self) -> None:
+        """Recompute the avatar model cache."""
+        self._resolve_avatar_model()
+        self.overlayShellChanged.emit()
+
+    def _resolve_avatar_model(self) -> None:
+        try:
+            project_root = Path(__file__).resolve().parents[2]
+            resolved = resolve_avatar_model(project_root)
+            if resolved is not None:
+                self._avatar_model_cache = {"path": str(resolved), "exists": resolved.is_file()}
+            else:
+                self._avatar_model_cache = {"path": "", "exists": False}
+        except Exception:
+            self._avatar_model_cache = {"path": "", "exists": False}
+
+    def _compute_overlay_shell(self) -> dict[str, Any]:
+        try:
+            payload = self.api.companion_state(self._activity_runtime)
+            shell_state = decide_shell_state(
+                payload.get("state"),
+                has_error=bool(
+                    payload.get("enabled")
+                    and payload.get("consecutive_failures", 0) > 0
+                ),
+            )
+            state_data = payload.get("state") or {}
+            vis = overlay_visibility(
+                shell_state,
+                interruptible=state_data.get("interruptible", True)
+                if payload.get("state")
+                else True,
+            )
+            provenance = sensor_provenance(
+                "activity", payload.get("last_update_at") or 0.0
+            )
+            return {
+                "enabled": self._overlay_enabled,
+                "shell_state": shell_state,
+                "visible": vis["visible"],
+                "shrink": vis["shrink"],
+                "provenance": provenance,
+                "companion": payload,
+            }
+        except Exception:
+            return {
+                "enabled": self._overlay_enabled,
+                "shell_state": "idle",
+                "visible": True,
+                "shrink": True,
+                "provenance": None,
+                "companion": {"enabled": False},
+            }
+
+    @Slot()
+    def openMainFromOverlay(self) -> None:
+        self.mainWindowRequested.emit()
+
+    @Slot(bool)
+    def setOverlayClickThrough(self, enabled: bool) -> None:
+        """Set the overlay click-through desired state.
+
+        Enabling requires the overlay to be enabled; disabling is always
+        allowed. Idempotent: no state or request signal is emitted when the
+        desired state is unchanged or enabling is rejected.
+        """
+        if enabled and not self._overlay_enabled:
+            return
+        if enabled == self._overlay_click_through:
+            return
+        self._overlay_click_through = enabled
+        self.overlayClickThroughChanged.emit()
+        self.overlayClickThroughRequested.emit(enabled)
+
+    def _force_overlay_click_through_off(self) -> None:
+        """Force the click-through desired state off and request the release.
+
+        Called before disabling the overlay or stopping the activity runtime so
+        the window integration releases click-through first. Idempotent.
+        """
+        if not self._overlay_click_through:
+            return
+        self._overlay_click_through = False
+        self.overlayClickThroughChanged.emit()
+        self.overlayClickThroughRequested.emit(False)
+
+    @Slot()
+    def stopOverlayFromOverlay(self) -> None:
+        """Disable the overlay and stop companion activity sensing immediately.
+
+        Forces click-through off first so the window integration releases it
+        before the overlay is disabled. Idempotent; repeated calls and a later
+        shutdown never double-stop the activity runtime.
+        """
+        self._force_overlay_click_through_off()
+        self._overlay_enabled = False
+        self._stop_companion()
 
     @Slot()
     def initialize(self) -> None:
@@ -710,20 +876,38 @@ class DesktopBridge(QObject):
 
     @Slot()
     def startRecording(self) -> None:
+        if not self._sensor_policy.microphone:
+            self.toast.emit(
+                "マイクを開始できません",
+                "マイクは無効です (SENSOR_MICROPHONE_ENABLED=true で有効化)",
+            )
+            return
+        recorder = self.recorder
+        if recorder is None:
+            try:
+                recorder = NativeAudioRecorder()
+            except Exception as exc:
+                logger.warning("microphone construction failed: %s", type(exc).__name__)
+                self.toast.emit("マイクを開始できません", "マイクの準備に失敗しました")
+                return
+            self.recorder = recorder
         try:
-            self.recorder.start()
+            recorder.start()
         except Exception as exc:
-            self.toast.emit("マイクを開始できません", str(exc))
+            logger.warning("microphone start failed: %s", type(exc).__name__)
+            self.toast.emit("マイクを開始できません", "マイクの準備に失敗しました")
             return
         self._recording = True
         self.recordingChanged.emit()
 
     @Slot()
     def stopRecording(self) -> None:
+        recorder = self.recorder
         try:
-            wav = self.recorder.stop()
+            wav = recorder.stop() if recorder is not None else b""
         except Exception as exc:
-            self.toast.emit("録音を処理できません", str(exc))
+            logger.warning("microphone stop failed: %s", type(exc).__name__)
+            self.toast.emit("録音を処理できません", "録音データを処理できませんでした")
             wav = b""
         self._recording = False
         self.recordingChanged.emit()
@@ -783,10 +967,17 @@ class DesktopBridge(QObject):
 
     def shutdown(self) -> None:
         self._shutting_down = True
+        self._force_overlay_click_through_off()
         self.reminder_timer.stop()
+        self._stop_companion()
         self.reconnect_timer.stop()
-        if self.recorder.recording:
-            self.recorder.stop()
+        if self.recorder is not None and self.recorder.recording:
+            try:
+                self.recorder.stop()
+            except Exception as exc:
+                logger.warning("microphone stop failed during shutdown: %s", type(exc).__name__)
         self.socket.close()
         self.api.close()
+        if self._activity_runtime is not None:
+            self._activity_runtime.stop()
         self._remove_audio_temp()

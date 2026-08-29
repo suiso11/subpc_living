@@ -83,6 +83,56 @@ class StaticRouterTest(unittest.TestCase):
         self.assertEqual(decision.provider_id, "local-strong")
         self.assertIn("local-fast=unavailable", decision.reason)
 
+    def make_example_router(self) -> StaticRouter:
+        # config/nodes.example.json 相当: default=local-strong, fallback=local-fastのみ
+        return StaticRouter(
+            self.registry,
+            default_provider_id="local-strong",
+            profile_routes={"voice_fast": "local-fast", "deep": "cloud"},
+            fallback_provider_ids=("local-fast",),
+        )
+
+    def test_default_route_keeps_configured_fallback_order(self) -> None:
+        decision = self.make_example_router().route(Request())
+
+        self.assertEqual(decision.provider_id, "local-strong")
+        self.assertEqual(decision.reason, "default route")
+        self.assertEqual(decision.fallback_provider_ids, ("local-fast",))
+
+    def test_profile_primary_falls_back_to_default_provider(self) -> None:
+        self.fast.available = False
+
+        decision = self.make_example_router().route(
+            Request(profile="voice_fast", privacy="local_only")
+        )
+
+        self.assertEqual(decision.provider_id, "local-strong")
+        self.assertIn("fallback from local-fast", decision.reason)
+        self.assertIn("local-fast=unavailable", decision.reason)
+        self.assertEqual(decision.fallback_provider_ids, ("local-fast",))
+
+    def test_explicit_non_default_provider_falls_back_to_default(self) -> None:
+        self.fast.available = False
+
+        decision = self.make_example_router().route(
+            Request(requested_provider="local-fast", privacy="local_only")
+        )
+
+        self.assertEqual(decision.provider_id, "local-strong")
+        self.assertIn("fallback from local-fast", decision.reason)
+
+    def test_appended_default_still_respects_privacy(self) -> None:
+        router = StaticRouter(
+            self.registry,
+            default_provider_id="cloud",
+            profile_routes={"voice_fast": "local-fast"},
+            fallback_provider_ids=(),
+        )
+        self.fast.available = False
+
+        with self.assertRaises(NoRouteError):
+            router.route(Request(profile="voice_fast", privacy="local_only"))
+
     def test_no_route_and_unknown_explicit_provider_fail_closed(self) -> None:
         self.fast.available = False
         self.strong.available = False

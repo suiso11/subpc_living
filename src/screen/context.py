@@ -12,13 +12,16 @@ VLM 推論は重いため解析間隔は長め (デフォルト 90 秒)。
 (start/stop/is_running/pause/resume/get_state/get_context_text/get_status)。
 """
 import copy
+import logging
 import threading
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 from src.screen.capture import ScreenCapture
 from src.screen.describer import ScreenDescriber
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -47,6 +50,7 @@ class ScreenContext:
         max_failures: int = 5,
         capture: Optional[ScreenCapture] = None,
         describer: Optional[ScreenDescriber] = None,
+        thread_factory: Optional[Callable[..., threading.Thread]] = None,
     ):
         """
         Args:
@@ -57,6 +61,7 @@ class ScreenContext:
             max_failures: 連続失敗がこの回数に達したら自動 pause する
             capture: ScreenCapture の差し替え (テスト用)。None なら既定を生成
             describer: ScreenDescriber の差し替え (テスト用)。None なら既定を生成
+            thread_factory: 解析スレッド生成用ファクトリ (テスト用)。None なら threading.Thread
         """
         self.capture = capture or ScreenCapture()
         self.describer = describer or ScreenDescriber(base_url=base_url, model=model)
@@ -67,30 +72,112 @@ class ScreenContext:
         self._state = ScreenState()
         self._state_lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
+        self._thread_factory = thread_factory or threading.Thread
         self._running = False
         self._paused = False
+        self._stop_pending = False
 
     def start(self) -> bool:
-        """キャプチャ可否を確認し、バックグラウンド解析を開始"""
-        if not self.capture.is_available():
+        """キャプチャ可否を確認し、バックグラウンド解析を開始
+
+        前回スレッドがまだ生存中 (stop の join がタイムアウトした等) の場合は
+        重複起動を防ぐため False を返し、新規スレッドを生成しない。
+        死亡が確認できたスレッドだけを置き換えて再起動する。
+
+        可用性チェック・スレッド生成・スレッド起動の失敗は生例外を外に出さず
+        False を返して部分状態を後始末する。ただし start が例外を投げてもスレッドが
+        生存した場合 (部分起動) は True を返し、生存スレッドの所有権を破棄せず保持
+        して二重起動を防ぐ。False を返すときは生存スレッドを保持しない
+        (False は常に非生存を意味する)。
+        """
+        try:
+            if not self.capture.is_available():
+                return False
+        except Exception:
             return False
 
-        self._running = True
-        self._paused = False
-        self._thread = threading.Thread(target=self._analysis_loop, daemon=True)
-        self._thread.start()
-        return True
+        thread = self._thread
+        if thread is not None:
+            try:
+                if thread.is_alive():
+                    return False
+            except Exception:
+                return False
 
-    def stop(self):
-        """停止"""
-        self._running = False
-        if self._thread:
-            self._thread.join(timeout=5)
+        try:
+            thread = self._thread_factory(target=self._analysis_loop, daemon=True)
+        except Exception:
             self._thread = None
+            self._running = False
+            self._paused = False
+            self._stop_pending = False
+            return False
+
+        try:
+            thread.start()
+        except Exception:
+            try:
+                alive = thread.is_alive()
+            except Exception:
+                alive = False
+            if alive:
+                self._running = True
+                self._paused = False
+                self._stop_pending = False
+                self._thread = thread
+                return True
+            self._running = False
+            self._paused = False
+            self._stop_pending = False
+            self._thread = None
+            return False
+        if thread.is_alive():
+            self._running = True
+            self._paused = False
+            self._stop_pending = False
+            self._thread = thread
+            return True
+        self._running = False
+        self._paused = False
+        self._stop_pending = False
+        self._thread = None
+        return False
+
+    def stop(self) -> None:
+        """停止。join がタイムアウトしてもスレッド所有権は保持する。
+
+        capture/describe がブロック中で join がタイムアウトした場合は _thread を
+        保持したままにし、重複再起動を防ぐ (_stop_pending を立てる)。
+        スレッドの死亡が確認できた時点で所有権を解放する (その後 start() で再起動可能)。
+        何度呼んでも安全 (冪等)。
+        """
+        self._running = False
+        thread = self._thread
+        if thread is None:
+            return
+        thread.join(timeout=5)
+        if thread.is_alive():
+            self._stop_pending = True
+        else:
+            self._thread = None
+            self._stop_pending = False
 
     @property
     def is_running(self) -> bool:
-        return self._running
+        """所有するスレッドが実際に生存しているときだけ True。
+
+        予期せぬスレッド死亡や停止中 (join タイムアウト) の状態を
+        「稼働中」として報告しない。
+        """
+        if not self._running:
+            return False
+        thread = self._thread
+        if thread is None:
+            return False
+        try:
+            return thread.is_alive()
+        except Exception:
+            return False
 
     def pause(self) -> None:
         """解析を一時停止"""
@@ -134,7 +221,10 @@ class ScreenContext:
         return "\n".join(lines)
 
     def get_status(self) -> dict:
-        """API レスポンス用の状態辞書"""
+        """API レスポンス用の状態辞書
+
+        失敗メタデータは固定キー (bool) のみ。例外内容やパス等の可変情報は含めない。
+        """
         state = self.get_state()
         age = (time.time() - state.captured_at) if state.captured_at > 0 else None
         return {
@@ -147,6 +237,8 @@ class ScreenContext:
             "analysis_count": state.analysis_count,
             "consecutive_failures": state.consecutive_failures,
             "model": self.describer.model,
+            "stop_pending": self._stop_pending,
+            "thread_alive": self._thread.is_alive() if self._thread else False,
         }
 
     # --- 内部: バックグラウンド解析 ---
@@ -200,7 +292,7 @@ class ScreenContext:
 
         if should_pause and not self._paused:
             self._paused = True
-            print(
-                f"⚠️  Screen: {self.max_failures}回連続で描写に失敗したため"
-                f"自動的に一時停止しました (resume で再開)"
+            logger.warning(
+                "Screen: %s回連続で描写に失敗したため自動的に一時停止しました (resume で再開)",
+                self.max_failures,
             )

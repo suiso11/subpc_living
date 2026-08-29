@@ -5,12 +5,12 @@ from typing import Any
 
 import httpx
 
-from src.chat.client import OllamaClient
+from src.chat.client import OllamaClient, OllamaResponseError
 from src.llm.errors import ProviderRequestError, ProviderTimeoutError
 
 
 class OllamaProvider:
-    """OllamaClientへ委譲し、通信例外だけを共通形式へ変換する。"""
+    """OllamaClientへ委譲し、通信例外と応答解析例外 (OllamaResponseError) を共通形式へ変換する。"""
 
     def __init__(
         self,
@@ -75,11 +75,15 @@ class OllamaProvider:
             )
         except httpx.TimeoutException as exc:
             raise ProviderTimeoutError(
-                self.provider_id, "generate", "request timed out"
+                self.provider_id, "generate", f"request timed out: {exc!r}"
             ) from exc
         except httpx.HTTPError as exc:
             raise ProviderRequestError(
-                self.provider_id, "generate", "request failed"
+                self.provider_id, "generate", f"request failed: {exc!r}"
+            ) from exc
+        except OllamaResponseError as exc:
+            raise ProviderRequestError(
+                self.provider_id, "generate", f"invalid response: {exc}"
             ) from exc
 
     def generate_stream(
@@ -105,11 +109,15 @@ class OllamaProvider:
             )
         except httpx.TimeoutException as exc:
             raise ProviderTimeoutError(
-                self.provider_id, "generate_stream", "request timed out"
+                self.provider_id, "generate_stream", f"request timed out: {exc!r}"
             ) from exc
         except httpx.HTTPError as exc:
             raise ProviderRequestError(
-                self.provider_id, "generate_stream", "request failed"
+                self.provider_id, "generate_stream", f"request failed: {exc!r}"
+            ) from exc
+        except OllamaResponseError as exc:
+            raise ProviderRequestError(
+                self.provider_id, "generate_stream", f"invalid response: {exc}"
             ) from exc
 
     @property

@@ -27,6 +27,7 @@ from zoneinfo import ZoneInfo
 import discord
 
 from src.discord_bot.task_ui import make_due_summary, parse_due
+from src.tasks.formatting import format_short_due
 from src.tasks.prioritizer import format_focus_decision
 from src.tasks.store import VALID_PRIORITY
 
@@ -70,9 +71,7 @@ def _due_label(due_at: Optional[datetime], granularity: Optional[str], tz: ZoneI
     if due_at is None:
         return "期限なし"
     local = due_at.astimezone(tz)
-    if granularity == "date":
-        return local.strftime("%-m/%-d")
-    return local.strftime("%-m/%-d %H:%M")
+    return format_short_due(local, with_time=granularity != "date")
 
 
 def format_due_input(due_at: Optional[datetime], granularity: Optional[str], tz: ZoneInfo) -> str:
@@ -80,9 +79,7 @@ def format_due_input(due_at: Optional[datetime], granularity: Optional[str], tz:
     if due_at is None:
         return ""
     local = due_at.astimezone(tz)
-    if granularity == "date":
-        return local.strftime("%-m/%-d")
-    return local.strftime("%-m/%-d %H:%M")
+    return format_short_due(local, with_time=granularity != "date")
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -260,7 +257,7 @@ def build_board_embed(
         description=build_board_description(tasks, tz, now, limit=limit),
         color=0x5865F2,
     )
-    updated = now.astimezone(tz).strftime("%-m/%-d %H:%M")
+    updated = format_short_due(now.astimezone(tz), with_time=True)
     embed.set_footer(text=f"更新 {updated} · 未完了 {len(tasks)} 件")
     return embed
 

@@ -16,6 +16,10 @@ _SHORT_REPEAT_PATTERN = re.compile(r"(.{1,12})\1{12,}", re.DOTALL)
 _DEGENERATE_FALLBACK = "出力が乱れたので止めました。もう一度、短く言い直してください。"
 
 
+class OllamaResponseError(RuntimeError):
+    """Ollama応答のJSON decode・スキーマ抽出に失敗したときの例外。"""
+
+
 class OllamaClient:
     """Ollama APIクライアント"""
 
@@ -149,7 +153,12 @@ class OllamaClient:
             request_kwargs["timeout"] = timeout
         resp = self._client.post("/api/chat", **request_kwargs)
         resp.raise_for_status()
-        raw = resp.json()["message"]["content"]
+        try:
+            raw = resp.json()["message"]["content"]
+            if not isinstance(raw, str):
+                raise TypeError(f"message.content is {type(raw).__name__}, expected str")
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise OllamaResponseError(f"invalid /api/chat response: {exc!r}") from exc
         return self._sanitize_response(raw)
 
     def generate_stream(
@@ -190,12 +199,29 @@ class OllamaClient:
             resp.raise_for_status()
             for line in resp.iter_lines():
                 if line:
-                    data = json.loads(line)
-                    if not data.get("done", False):
-                        token = data.get("message", {}).get("content", "")
-                        if not token:
-                            continue
-
+                    try:
+                        data = json.loads(line)
+                        done = data["done"]
+                        if not isinstance(done, bool):
+                            raise TypeError(
+                                f"done is {type(done).__name__}, expected bool"
+                            )
+                        token = "" if done else data["message"]["content"]
+                        if not isinstance(token, str):
+                            raise TypeError(
+                                f"message.content is {type(token).__name__}, expected str"
+                            )
+                    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+                        raise OllamaResponseError(
+                            f"invalid /api/chat stream chunk: {exc!r}"
+                        ) from exc
+                    if done:
+                        self._last_stats = {
+                            "total_duration": data.get("total_duration", 0),
+                            "eval_count": data.get("eval_count", 0),
+                            "eval_duration": data.get("eval_duration", 0),
+                        }
+                    elif token:
                         # <think> ブロック除去ロジック
                         if in_think:
                             think_buf += token
@@ -222,12 +248,6 @@ class OllamaClient:
                                     yield after
                         else:
                             yield token
-                    else:
-                        self._last_stats = {
-                            "total_duration": data.get("total_duration", 0),
-                            "eval_count": data.get("eval_count", 0),
-                            "eval_duration": data.get("eval_duration", 0),
-                        }
 
     def generate_stream_queue(
         self,

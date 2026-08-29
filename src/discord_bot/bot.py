@@ -20,9 +20,11 @@ import re
 import subprocess
 import sys
 import threading
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -34,8 +36,14 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.audio.tts_factory import all_tts_voices, backend_name, create_tts_backend
-from src.chat.client import OllamaClient
-from src.chat.config import ChatConfig
+from src.assistant.contracts import AssistantRequest
+from src.assistant.service import AssistantService
+from src.chat.config import (
+    ChatConfig,
+    resolve_local_api_key,
+    resolve_local_base_url,
+    validate_local_provider_kind,
+)
 from src.chat.emotion import parse_emotion_tag
 from src.chat.session import ChatSession
 from src.chat.web_search import WebSearchContext, create_web_search_context
@@ -46,6 +54,7 @@ from src.discord_bot.training import (
     parse_correction,
 )
 from src.discord_bot.proactive_bridge import ProactiveBridge, create_proactive_bridge, rewrite_message
+from src.companion.contracts import CompanionState
 from src.discord_bot.task_ui import (
     TASK_PREFIX_RE,
     TaskConfirmView,
@@ -57,21 +66,42 @@ from src.discord_bot.task_ui import (
     validate_extraction,
 )
 from src.discord_bot.task_board import TaskBoardManager, TaskBoardView, TaskModal
-from src.discord_bot.voice_reply_debouncer import VoiceReplyDebouncer
+from src.discord_bot.voice_reply_debouncer import (
+    VoiceReplyDebouncer,
+    VoiceReplyGenerationGate,
+)
 from src.discord_bot.terminal import DiscordTerminal
 from src.discord_bot.voice_stt import DiscordVoiceSTT, VoiceSTTConfig, VoiceSTTError
-from src.discord_bot.voice_tts import VoiceTTSConfig, VoiceTTSError, VoiceTTSPlayer
+from src.discord_bot.voice_tts import (
+    VoiceTTSConfig,
+    VoiceTTSError,
+    VoiceTTSPlayer,
+    safe_tts_last_error,
+)
 from src.screen.context import ScreenContext
 from src.screen import create_screen_context
 from src.diary.collector import DiaryCollector
 from src.diary.service import DailyDiaryResult, DailyDiaryService
 from src.integrations.google_calendar import GoogleCalendarMCPClient
 from src.persona.daily_personalizer import DailyPersonalizer, PersonalizationResult
+from src.perception import (
+    ActivityRuntime,
+    companion_state_payload,
+    create_activity_runtime_from_env,
+)
+from src.perception.policy import CANONICAL_ENV_NAMES, parse_opt_in
 from src.service.healthcheck import HealthChecker
 from src.tasks.reminder import TaskReminderEngine, parse_quiet_hours
+from src.tasks.formatting import format_short_due
 from src.tasks.prioritizer import PriorityController, format_focus_decision
 from src.tasks.store import TaskStore
 from src.growth.tracker import GrowthTracker
+from src.llm.contracts import GenerationOptions
+from src.llm.provider import LLMProvider
+from src.llm.providers.local_openai import LocalOpenAICompatibleProvider
+from src.llm.providers.ollama import OllamaProvider
+from src.llm.registry import ProviderRegistry
+from src.llm.routing.static import StaticRouter
 
 from src.service.log_setup import setup_logging
 logger = setup_logging("subpc-discord")
@@ -82,6 +112,69 @@ VOICE_TRANSCRIPT_RE = re.compile(
     r"^\[\d{2}:\d{2}:\d{2}\]\s+(?P<speaker>.+?):\s*(?P<text>.+)$", re.DOTALL
 )
 MAX_DISCORD_MESSAGE = 1900
+
+# voice STT/TTS の予期しない例外に対する固定フォールバック文言。生の例外
+# テキスト・パス・端末情報を slash reply へ載せない。
+VOICE_STT_ERROR_FALLBACK = "voice STT 操作中にエラーが発生しました。"
+VOICE_TTS_ERROR_FALLBACK = "voice TTS 操作中にエラーが発生しました。"
+TTS_ERROR_FALLBACK = "TTS でエラーが発生しました。"
+# 通話 transcript へのLLM返信失敗時の固定フォールバック文言。生の例外テキスト・
+# transcript・パス・URL・モデル名・トークン情報を reply へ載せない。
+VOICE_LLM_ERROR_FALLBACK = "音声への返信を生成できませんでした。"
+
+# Companion activity (オプトイン)。Web と同じ create_activity_runtime_from_env を
+# 使い、起動済みの runtime をモジュール変数で保持して終了時に stop する。
+activity_runtime: ActivityRuntime | None = None
+
+
+def start_companion_activity_runtime() -> None:
+    """COMPANION_ACTIVITY_ENABLED=true のときだけ companion activity を起動する。
+
+    create_activity_runtime_from_env へ委譲し、結果をモジュール変数に保持する。
+    false / 設定不正 / 起動失敗なら None のまま (companion 機能のみ無効)。
+    """
+    global activity_runtime
+    if activity_runtime is not None:
+        return
+    activity_runtime = create_activity_runtime_from_env(os.environ, logger=logger)
+    if activity_runtime is not None:
+        logger.info("[Discord] companion activity started")
+    else:
+        logger.info(
+            "[Discord] companion activity disabled "
+            "(COMPANION_ACTIVITY_ENABLED=true で有効化)"
+        )
+
+
+def stop_companion_activity_runtime() -> None:
+    """起動済みの companion activity runtime を停止する (未起動なら何もしない)。"""
+    global activity_runtime
+    if activity_runtime is not None:
+        activity_runtime.stop()
+        activity_runtime = None
+
+
+def companion_status_line(runtime: ActivityRuntime | None) -> str:
+    """privacy-safe な companion 状態を status_text 用の1行にする。
+
+    プロセス名・PID・アプリ分類・window title・エラー本文・生サンプル/イベントは
+    companion_state_payload が既に除外する。
+    """
+    return f"companion: {companion_state_payload(runtime)}\n"
+
+
+def _companion_state() -> CompanionState | None:
+    """companion activity の現在状態を返す (ゲート判定専用)。
+
+    失敗しても None を返し、companion 未オプトイン時や runtime 未起動時は None。
+    """
+    runtime = activity_runtime
+    if runtime is None:
+        return None
+    try:
+        return runtime.state
+    except Exception:
+        return None
 
 
 def load_env_file(path: Path) -> None:
@@ -157,6 +250,49 @@ def parse_float(value: str | None, default: float) -> float:
         return default
 
 
+# screen_capture の opt-in は共有 SensorPolicy の canonical 名で統一する。
+# Discord 固有の legacy 名 (DISCORD_SCREEN_CONTEXT_ENABLED) は canonical 未設定時のみ
+# 参照する互換 alias として残す。
+DISCORD_SCREEN_CAPTURE_CANONICAL_ENV = CANONICAL_ENV_NAMES["screen_capture"]
+DISCORD_SCREEN_CAPTURE_LEGACY_ENV = "DISCORD_SCREEN_CONTEXT_ENABLED"
+
+# 通話 transcript 由来ターンの学習ログ保存は、通常の学習ログ
+# (DISCORD_TRAINING_LOG_ENABLED) とは別の明示 opt-in。既定 false / fail closed。
+DISCORD_VOICE_TRAINING_LOG_ENV = "DISCORD_VOICE_TRAINING_LOG_ENABLED"
+VOICE_TRAINING_SOURCE = "discord_voice_transcript"
+
+
+def discord_screen_capture_enabled(env: Mapping[str, str] | None = None) -> bool:
+    """Discord の screen_capture opt-in を共有 SensorPolicy 規約で判定する。
+
+    canonical 名 (SENSOR_SCREEN_CAPTURE_ENABLED) が存在すればその値が確定で、
+    false / 空 / 不正値は Discord 固有の legacy 名 (DISCORD_SCREEN_CONTEXT_ENABLED)
+    の true を上書きする (fail closed)。canonical 未設定のときだけ Discord-local
+    legacy を参照する。Web の legacy (WEB_SCREEN_CONTEXT_ENABLED) は Discord を
+    有効化しない。共有解決器 resolve_sensor_policy は Web legacy を screen_capture
+    へ反映するため、Discord ではここで独立解決する。判定は create_screen_context より
+    前に行い、無効時は何も構築しない。
+    """
+    resolved = os.environ if env is None else env
+    canonical = resolved.get(DISCORD_SCREEN_CAPTURE_CANONICAL_ENV)
+    if canonical is not None:
+        return parse_opt_in(canonical)
+    return parse_opt_in(resolved.get(DISCORD_SCREEN_CAPTURE_LEGACY_ENV))
+
+
+def discord_voice_training_log_enabled(env: Mapping[str, str] | None = None) -> bool:
+    """通話 transcript 由来ターンの学習ログ保存 opt-in を判定する。
+
+    DISCORD_VOICE_TRAINING_LOG_ENABLED の明示 true のみ True。既定 false /
+    fail closed (false・空・不正値・未設定は False)。通常の学習ログ
+    (DISCORD_TRAINING_LOG_ENABLED) とは独立で、通話 transcript 由来ターンの保存
+    には両方が true である必要がある。TTS 読み上げ・チャンネル投稿はこの値に
+    関係なく動作し、record_auto_reply の保存だけがスキップされる。
+    """
+    resolved = os.environ if env is None else env
+    return parse_opt_in(resolved.get(DISCORD_VOICE_TRAINING_LOG_ENV))
+
+
 def clean_output(text: str, limit: int = 3500) -> str:
     text = ANSI_RE.sub("", text).strip()
     if len(text) <= limit:
@@ -210,6 +346,21 @@ class DiscordLLMProfile:
     repeat_penalty: float
     num_ctx: int
     num_predict: int | None = None
+    # ローカルbackend種別: "ollama" (既定) / "openai_compatible"。
+    # 値は ChatConfig.validate_local_provider_kind と同一規約で正規化済み。
+    provider_kind: str = "ollama"
+    # openai_compatible の実 base URL (loopback検証済み)。Ollama では空のまま
+    # ollama_base_url を使う。
+    local_base_url: str = ""
+    # APIキーの環境変数名のみ。キー値は保持・ログ・キャッシュキーに載せない。
+    api_key_env: str = ""
+
+    @property
+    def backend_base_url(self) -> str:
+        """Provider構築・キャッシュ分離に使う実 base URL (kind 別に解決済み)。"""
+        if self.provider_kind == "openai_compatible":
+            return self.local_base_url
+        return self.ollama_base_url
 
     @classmethod
     def from_config(
@@ -231,9 +382,20 @@ class DiscordLLMProfile:
         if suffix:
             system_prompt = f"{system_prompt.rstrip()}\n{suffix}"
 
+        # backend 正規化: ChatConfig の kind 検証・loopback URL 検証・key env 名解決を
+        # 再利用する (キー値は解決しない)。profile override が明示しなければ config 値を継承。
+        resolver = SimpleNamespace(
+            local_provider_kind=raw.get("provider_kind", config.local_provider_kind),
+            ollama_base_url=str(raw.get("ollama_base_url", config.ollama_base_url)),
+            local_base_url=str(raw.get("local_base_url", config.local_base_url) or ""),
+            local_api_key_env=str(raw.get("api_key_env", config.local_api_key_env) or ""),
+        )
+        kind = validate_local_provider_kind(resolver)
+        resolved_base_url = resolve_local_base_url(resolver)
+
         return cls(
             name=name,
-            ollama_base_url=str(raw.get("ollama_base_url", config.ollama_base_url)),
+            ollama_base_url=resolver.ollama_base_url,
             model=str(raw.get("model", config.model)),
             system_prompt=system_prompt,
             max_history_turns=_coerce_int(
@@ -249,14 +411,62 @@ class DiscordLLMProfile:
             ),
             num_ctx=_coerce_int(raw.get("num_ctx", config.num_ctx), config.num_ctx),
             num_predict=_coerce_optional_int(raw.get("num_predict", config.num_predict), config.num_predict),
+            provider_kind=kind,
+            local_base_url=resolved_base_url,
+            api_key_env=resolver.local_api_key_env,
         )
+
+
+def _resolve_profile_api_key(profile: DiscordLLMProfile) -> str | None:
+    """ChatConfig の key env 名解決を再利用して、実行時にキーを解決する。
+
+    プロファイルは env 名のみ保持し、キー値はキャッシュキー・status・ログに
+    載せない。Ollama / env 未指定 / 未設定時は None (keyless)。
+    """
+    if profile.provider_kind != "openai_compatible":
+        return None
+    return resolve_local_api_key(
+        SimpleNamespace(
+            local_provider_kind=profile.provider_kind,
+            local_api_key_env=profile.api_key_env,
+        )
+    )
+
+
+def _backend_reachability(health: dict, kind: str) -> str:
+    """``check_all`` 結果から選択backendの到達性を返す (URL・キーは含めない)。
+
+    HealthChecker の selected-provider モードでは、Ollama は ``checks["ollama"]``、
+    openai_compatible は ``checks["local_provider"]`` にプローブ結果が入る。
+    その status (``ok`` / ``error`` / ``unknown``) をそのまま使い、プローブ結果が
+    無いときは ``unconfigured`` を返す。
+    """
+    checks = health.get("checks") if isinstance(health, dict) else None
+    if not isinstance(checks, dict):
+        return "unconfigured"
+    check = (
+        checks.get("ollama")
+        if kind == "ollama"
+        else checks.get("local_provider")
+    )
+    if not isinstance(check, dict):
+        return "unconfigured"
+    status = check.get("status")
+    if status in ("ok", "error", "unknown"):
+        return status
+    return "unconfigured"
 
 
 @dataclass
 class DiscordConsoleState:
     config: ChatConfig | None = None
-    llm: OllamaClient | None = None
-    llm_clients: dict[tuple[str, str], OllamaClient] = field(default_factory=dict)
+    llm: LLMProvider | None = None
+    provider_registry: ProviderRegistry | None = None
+    assistant_services: dict[str, AssistantService] = field(default_factory=dict)
+    _llm_providers: dict[tuple[str, str, str, str, str], LLMProvider] = field(
+        default_factory=dict
+    )
+    _profile_cache_lock: threading.RLock = field(default_factory=threading.RLock)
     llm_profiles: dict[str, DiscordLLMProfile] = field(default_factory=dict)
     channel_profile_map: dict[int, str] = field(default_factory=dict)
     tts: Any | None = None
@@ -272,6 +482,7 @@ class DiscordConsoleState:
     allow_terminal: bool = False
     tts_lock: threading.Lock = field(default_factory=threading.Lock)
     training_log: DiscordTrainingLog | None = None
+    voice_training_log_enabled: bool = False
     growth_tracker: GrowthTracker | None = None
     terminal: DiscordTerminal | None = None
     diary_enabled: bool = False
@@ -290,6 +501,7 @@ class DiscordConsoleState:
     voice_reply_debounce_ms: int = 3000
     voice_reply_debounce_max_ms: int = 10000
     voice_reply_debouncer: Any | None = None
+    voice_reply_gate: VoiceReplyGenerationGate | None = None
     proactive_bridge: ProactiveBridge | None = None
     screen_context: ScreenContext | None = None
     task_store: TaskStore | None = None
@@ -311,6 +523,7 @@ class DiscordConsoleState:
         self.llm_profiles = self._load_llm_profiles()
         self.channel_profile_map = self._load_channel_profile_map()
         self.llm = self._llm_for_profile(self.llm_profiles["default"])
+        self._initialize_profile_caches()
         self.allowed_user_ids = parse_id_set(os.environ.get("DISCORD_ALLOWED_USER_IDS"))
         self.allowed_channel_ids = parse_id_set(os.environ.get("DISCORD_ALLOWED_CHANNEL_IDS"))
         self.auto_reply_channel_ids = parse_id_set(os.environ.get("DISCORD_AUTO_REPLY_CHANNEL_IDS"))
@@ -345,17 +558,10 @@ class DiscordConsoleState:
             system_prompt=self.config.system_prompt,
             growth_tracker=self.growth_tracker,
         )
+        # 通話 transcript 由来ターンの学習ログ保存は別 opt-in (既定 false / fail closed)。
+        self.voice_training_log_enabled = discord_voice_training_log_enabled()
         self.web_search = create_web_search_context(self.config)
-        if parse_bool(os.environ.get("DISCORD_SCREEN_CONTEXT_ENABLED"), default=False):
-            try:
-                # SCREEN_CONTEXT_MODE (local|remote) でローカル/リモートを切替
-                screen = create_screen_context()
-                if screen.start():
-                    self.screen_context = screen
-                else:
-                    logger.warning("[Discord] screen context unavailable; continuing without it")
-            except Exception as e:
-                logger.error("[Discord] screen context init failed: %s", e)
+        self._init_screen_context()
         terminal_workdir = Path(
             os.environ.get("DISCORD_TERMINAL_WORKDIR", str(PROJECT_ROOT))
         ).expanduser()
@@ -380,6 +586,12 @@ class DiscordConsoleState:
             os.environ.get("DIARY_PERSONALIZATION_MIN_CONFIDENCE"),
             default=0.72,
         )
+        # Discord voice STT は管理コンテナとして常に構築する。実 receive / STT の
+        # 構築・開始 (/voice join|start) は二重ゲート: (1) 既存設定
+        # DISCORD_VOICE_STT_ENABLED=true と (2) 共有 SensorPolicy のマイク gate
+        # (SENSOR_MICROPHONE_ENABLED=true)。両方 true のときだけ接続し、どちらか
+        # が false なら接続前に却下する。さらに /voice start の明示実行が必要
+        # (自動起動はしない)。screen 政策で voice STT が自動起動することはない。
         self.voice_stt = DiscordVoiceSTT(
             VoiceSTTConfig.from_env(PROJECT_ROOT, timezone=self.diary_timezone)
         )
@@ -394,6 +606,7 @@ class DiscordConsoleState:
         self.voice_reply_debounce_max_ms = _coerce_int(
             os.environ.get("DISCORD_VOICE_REPLY_DEBOUNCE_MAX_MS"), 10000
         )
+        self.voice_reply_gate = VoiceReplyGenerationGate()
         self.tasks_reminder_enabled = parse_bool(
             os.environ.get("TASKS_REMINDER_ENABLED"), default=True
         )
@@ -511,6 +724,37 @@ class DiscordConsoleState:
             self.diary_service = None
             self.daily_personalizer = None
 
+    def _init_screen_context(self) -> None:
+        """canonical SensorPolicy の screen_capture 有効時だけ ScreenContext を構築・start する。
+
+        判定は create_screen_context より前に行い、無効時は構築も start もしない。
+        canonical 名 (SENSOR_SCREEN_CAPTURE_ENABLED) が存在すればその値が確定で、
+        false / 空 / 不正値は Discord 固有の legacy 名 (DISCORD_SCREEN_CONTEXT_ENABLED)
+        の true を上書きする。Web の legacy (WEB_SCREEN_CONTEXT_ENABLED) は Discord を
+        有効化しない。start 失敗・構築失敗は screen 機能だけ無効化して続行する。
+        """
+        if not discord_screen_capture_enabled():
+            return
+        try:
+            # SCREEN_CONTEXT_MODE (local|remote) でローカル/リモートを切替
+            screen = create_screen_context()
+            try:
+                started = screen.start()
+            except Exception:
+                logger.error("[Discord] screen context start failed")
+                started = False
+            if started:
+                self.screen_context = screen
+                return
+            # start が false / 例外で失敗した場合のみ、破棄前に best-effort で stop する。
+            try:
+                screen.stop()
+            except Exception as e:
+                logger.error("[Discord] screen context cleanup failed: %s", type(e).__name__)
+            logger.warning("[Discord] screen context unavailable; continuing without it")
+        except Exception:
+            logger.error("[Discord] screen context init failed")
+
     def start_calendar_sync(self, profile: Any = None) -> None:
         """タスク→カレンダー同期ワーカーとカレンダー→bot pull ワーカーを起動する。
 
@@ -598,10 +842,14 @@ class DiscordConsoleState:
             self.proactive_bridge.stop()
         if self.screen_context is not None:
             self.screen_context.stop()
+        if self.voice_reply_gate is not None:
+            self.voice_reply_gate.revoke_sync()
+        if self.voice_reply_debouncer is not None:
+            self.voice_reply_debouncer.cancel_all()
         if self.voice_stt is not None:
             self.voice_stt.close()
-        for client in set(self.llm_clients.values()):
-            client.close()
+        if self.provider_registry is not None:
+            self.provider_registry.close()
 
     def is_allowed(self, interaction: discord.Interaction) -> bool:
         if self.allowed_user_ids and interaction.user.id not in self.allowed_user_ids:
@@ -619,22 +867,56 @@ class DiscordConsoleState:
             return False
         return True
 
+    @staticmethod
+    def _is_valid_aware_datetime(value: Any) -> bool:
+        """Return whether ``value`` is a safely comparable aware datetime."""
+        if not isinstance(value, datetime) or value.tzinfo is None:
+            return False
+        try:
+            return value.utcoffset() is not None
+        except Exception:
+            return False
+
     def is_allowed_voice_transcript_message(
         self,
         message: discord.Message,
         *,
         bot_user_id: int | None,
     ) -> bool:
-        if bot_user_id is None or message.author.id != bot_user_id:
+        """Apply the complete, fail-closed admission gate for STT transcripts.
+
+        Discord may deliver a transcript created by an earlier STT session after
+        a stop/restart.  Keep the existing bot/author/channel/content checks,
+        but require the message timestamp to belong to the currently listening
+        STT session before admitting it to the reply pipeline.
+        """
+        try:
+            if bot_user_id is None or message.author.id != bot_user_id:
+                return False
+            stt = self.voice_stt
+            gate = self.voice_reply_gate
+            if stt is None or stt.transcript_channel_id is None:
+                return False
+            if not stt.listening or gate is None or not gate.active:
+                return False
+            started_at = stt.started_at
+            created_at = message.created_at
+            if not self._is_valid_aware_datetime(started_at):
+                return False
+            if not self._is_valid_aware_datetime(created_at):
+                return False
+            if not created_at >= started_at:
+                return False
+            channel_ids = self._message_channel_ids(message)
+            if stt.transcript_channel_id not in channel_ids:
+                return False
+            if not (channel_ids & self.auto_reply_channel_ids):
+                return False
+            return self.extract_voice_transcript_text(message.content) is not None
+        except Exception:
+            # Admission is deliberately fail closed for malformed Discord data
+            # or unexpected state/property failures.
             return False
-        if self.voice_stt is None or self.voice_stt.transcript_channel_id is None:
-            return False
-        channel_ids = self._message_channel_ids(message)
-        if self.voice_stt.transcript_channel_id not in channel_ids:
-            return False
-        if not (channel_ids & self.auto_reply_channel_ids):
-            return False
-        return self.extract_voice_transcript_text(message.content) is not None
 
     @staticmethod
     def extract_voice_transcript(content: str) -> tuple[str, str] | None:
@@ -723,14 +1005,75 @@ class DiscordConsoleState:
             mapping[channel_id] = profile_name
         return mapping
 
-    def _llm_for_profile(self, profile: DiscordLLMProfile) -> OllamaClient:
-        key = (profile.ollama_base_url, profile.model)
-        if key not in self.llm_clients:
-            self.llm_clients[key] = OllamaClient(
-                base_url=profile.ollama_base_url,
-                model=profile.model,
-            )
-        return self.llm_clients[key]
+    def _initialize_profile_caches(self) -> None:
+        """全LLM profileのProviderとAssistantServiceを先行構築してキャッシュを固定する。
+
+        メッセージ受付前に単一スレッドで呼ぶことで、同一非default profileへの
+        並行初回要求でもProvider/Service生成が競合しない。同一endpoint/modelの
+        provider共有は _llm_for_profile の既存挙動をそのまま使う。
+        """
+        for profile in self.llm_profiles.values():
+            self._service_for_profile(profile)
+
+    def _llm_for_profile(self, profile: DiscordLLMProfile) -> LLMProvider:
+        # キャッシュキーは profile 名・backend kind・base URL・model・auth env 名で
+        # 分離する。キー値 (secret) は含めない。profile 名をキーに含めることで
+        # provider.provider_id が registry 経路 (profile 名) と一致し、エラーや
+        # ログがアクティブな profile を正しく特定する。同一 profile への再呼び出し
+        # はキャッシュで共有し、別 profile は provider を共有しない。
+        key = (
+            profile.provider_kind,
+            profile.backend_base_url,
+            profile.model,
+            profile.api_key_env,
+            profile.name,
+        )
+        with self._profile_cache_lock:
+            if self.provider_registry is None:
+                self.provider_registry = ProviderRegistry()
+            if profile.name in self.provider_registry:
+                provider = self.provider_registry.get(profile.name).provider
+                self._llm_providers.setdefault(key, provider)
+                return provider
+            if key not in self._llm_providers:
+                if profile.provider_kind == "openai_compatible":
+                    self._llm_providers[key] = LocalOpenAICompatibleProvider(
+                        model=profile.model,
+                        base_url=profile.backend_base_url,
+                        provider_id=profile.name,
+                        api_key=_resolve_profile_api_key(profile),
+                    )
+                else:
+                    self._llm_providers[key] = OllamaProvider(
+                        base_url=profile.backend_base_url,
+                        model=profile.model,
+                        provider_id=profile.name,
+                    )
+            provider = self._llm_providers[key]
+            self.provider_registry.register(profile.name, provider, local=True)
+            return provider
+
+    def _service_for_profile(self, profile: DiscordLLMProfile) -> AssistantService:
+        with self._profile_cache_lock:
+            if profile.name not in self.assistant_services:
+                self._llm_for_profile(profile)
+                assert self.provider_registry is not None
+                self.assistant_services[profile.name] = AssistantService(
+                    self.provider_registry,
+                    StaticRouter(
+                        self.provider_registry,
+                        default_provider_id=profile.name,
+                    ),
+                    options=GenerationOptions(
+                        temperature=profile.temperature,
+                        top_p=profile.top_p,
+                        top_k=profile.top_k,
+                        repeat_penalty=profile.repeat_penalty,
+                        num_ctx=profile.num_ctx,
+                        num_predict=profile.num_predict,
+                    ),
+                )
+            return self.assistant_services[profile.name]
 
     def profile_for_channel_ids(self, channel_ids: set[int]) -> DiscordLLMProfile:
         for channel_id in channel_ids:
@@ -758,6 +1101,13 @@ class DiscordConsoleState:
         user_id: int,
     ) -> str:
         return f"discord-ephemeral:{guild_id or 0}:{channel_id or 0}:{user_id}"
+
+    def _conversation_id_for_session(self, session: ChatSession) -> str:
+        with self.sessions_lock:
+            for key, current_session in self.sessions.items():
+                if current_session is session:
+                    return key
+        return session.session_id
 
     def _session_for_key(
         self,
@@ -852,6 +1202,12 @@ class DiscordConsoleState:
     ) -> None:
         if self.training_log is None or self.config is None:
             return
+        if source == VOICE_TRAINING_SOURCE and not self.voice_training_log_enabled:
+            logger.info(
+                "[Discord] voice transcript turn skipped from training log "
+                "(DISCORD_VOICE_TRAINING_LOG_ENABLED=true で有効化)"
+            )
+            return
         profile = self.profile_for_channel_ids(self._message_channel_ids(message))
         self.training_log.record_turn(
             guild_id=message.guild.id if message.guild else None,
@@ -916,6 +1272,7 @@ class DiscordConsoleState:
                 ),
             },
         ]
+        # 修正候補は呼び出し側指定の temperature を使うため Provider を直接呼ぶ。
         return llm.generate(
             messages,
             temperature=temperature,
@@ -961,22 +1318,26 @@ class DiscordConsoleState:
         """(clean_text, emotion) を返す。履歴・トレーニングにはタグ除去後のテキストを保存する。"""
         if self.llm is None or self.config is None:
             raise RuntimeError("LLM is not initialized")
-        llm = self._llm_for_profile(profile)
+        service = self._service_for_profile(profile)
         with lock:
             session.add_user_message(prompt)
             try:
-                response = llm.generate(
-                    session.build_messages(),
-                    temperature=profile.temperature,
-                    top_p=profile.top_p,
-                    top_k=profile.top_k,
-                    repeat_penalty=profile.repeat_penalty,
-                    num_ctx=profile.num_ctx,
-                    num_predict=profile.num_predict,
+                request = AssistantRequest(
+                    text=prompt,
+                    conversation_id=self._conversation_id_for_session(session),
+                    channel="discord",
+                    profile="chat_auto",
+                    privacy="local_only",
+                    requested_provider=profile.name,
                 )
+                response, _preview = service.respond(
+                    request,
+                    session.build_blocks(),
+                    base_system=session.system_prompt,
+                )
+                response = response.text
             except Exception:
-                if session._messages and session._messages[-1]["role"] == "user":
-                    session._messages.pop()
+                session.rollback_last_user_message()
                 raise
             # 感情タグを分離。履歴には clean text のみ格納する。
             if self.config.emotion_tag_enabled:
@@ -984,6 +1345,51 @@ class DiscordConsoleState:
             else:
                 emotion = "neutral"
             session.add_assistant_message(response)
+            return response, emotion
+
+    def ask_voice_transcript(
+        self,
+        session: ChatSession,
+        lock: threading.Lock,
+        profile: DiscordLLMProfile,
+        prompt: str,
+    ) -> tuple[str, str]:
+        """音声transcriptのLLM生成をセッション履歴から切り離して実行する。
+
+        セッションロック下で prompt を user メッセージとして一時追加し、要求
+        (request context) の構築と生成にだけ使う。正常・例外・キャンセルにかかわらず
+        finally で必ず除去するため、音声ターンは永続履歴・RAG・成長台帳へ一切
+        書き込まれない。履歴コミットは呼び出し側 (handle_voice_reply) が世代チェック後に
+        別途行う。返り値は (clean_text, emotion)。
+        """
+        if self.llm is None or self.config is None:
+            raise RuntimeError("LLM is not initialized")
+        service = self._service_for_profile(profile)
+        with lock:
+            session._messages.append({"role": "user", "content": prompt})
+            try:
+                request = AssistantRequest(
+                    text=prompt,
+                    conversation_id=self._conversation_id_for_session(session),
+                    channel="discord",
+                    profile="chat_auto",
+                    privacy="local_only",
+                    requested_provider=profile.name,
+                )
+                response, _preview = service.respond(
+                    request,
+                    session.build_blocks(),
+                    base_system=session.system_prompt,
+                )
+                response = response.text
+            finally:
+                # 一時追加した user メッセージを必ず除去する (例外・キャンセルでも残さない)。
+                session.rollback_last_user_message()
+            # 感情タグを分離。履歴には残さないので clean text のみを返す。
+            if self.config.emotion_tag_enabled:
+                emotion, response = parse_emotion_tag(response)
+            else:
+                emotion = "neutral"
             return response, emotion
 
     def synthesize(
@@ -1045,6 +1451,7 @@ class DiscordConsoleState:
                 num_ctx=profile.num_ctx,
                 num_predict=profile.num_predict,
             )
+        # 通知言い換えは関数側が生成引数を受け取るため Provider を直接呼ぶ。
         return rewrite_message(
             self.llm, system_prompt=system_prompt, message=message, **gen_kwargs
         )
@@ -1059,6 +1466,7 @@ class DiscordConsoleState:
             {"role": "user", "content": user_text},
         ]
         try:
+            # JSON抽出は固定の生成引数を使うため Provider を直接呼ぶ。
             raw = self.llm.generate(
                 messages,
                 temperature=0.0,
@@ -1107,18 +1515,53 @@ class DiscordConsoleState:
 
     def status_text(self) -> str:
         assert self.config is not None
-        checker = HealthChecker(ollama_url=self.config.ollama_base_url)
-        health = checker.check_all(include_web=False)
-        llm_ok = self.llm.is_available() if self.llm is not None else False
+        default_profile = self.llm_profiles.get("default")
+        kind = (
+            default_profile.provider_kind
+            if default_profile is not None
+            else getattr(self.config, "local_provider_kind", "ollama")
+        )
+        probe_url = (
+            default_profile.backend_base_url
+            if default_profile is not None
+            else getattr(self.config, "ollama_base_url", "http://localhost:11434")
+        )
+        # selected-provider モード: default profile の backend kind/base を
+        # HealthChecker に渡して実プローブする。Ollama は checks["ollama"]、
+        # openai_compatible は checks["local_provider"] (/api/tags ではなく
+        # /models) に結果が入る。Ollama /api/tags に繋がる include_ollama は
+        # 渡さない。URL・キーは出力しない。
+        checker = HealthChecker(ollama_url=probe_url)
+        health = checker.check_all(
+            include_web=False,
+            provider_kind=kind,
+            provider_url=probe_url,
+            provider_api_key=(
+                _resolve_profile_api_key(default_profile)
+                if default_profile is not None
+                else None
+            ),
+        )
+        backend_status = _backend_reachability(health, kind)
         tts_loaded = self.tts is not None and self.tts.is_loaded()
         with self.sessions_lock:
             session_count = len(self.sessions)
-        default_profile = self.llm_profiles.get("default")
+        model = (
+            default_profile.model
+            if default_profile is not None
+            else self.config.model
+        )
         return (
             f"status: {health['status']}\n"
-            f"ollama: {'ok' if llm_ok else 'ng'}\n"
-            f"model: {default_profile.model if default_profile else self.config.model}\n"
-            f"llm_profiles: {', '.join(sorted(self.llm_profiles))}\n"
+            f"backend: {kind} {backend_status}\n"
+            f"model: {model}\n"
+            # 後方互換: Ollama backend のときだけ実プローブ結果の legacy 行を残す
+            + (
+                f"ollama (legacy): {backend_status}\n"
+                if kind == "ollama"
+                else ""
+            )
+            + f"llm_profiles: {', '.join(sorted(self.llm_profiles))}\n"
             f"channel_profile_map: {len(self.channel_profile_map)}\n"
             f"sessions: {session_count}\n"
             f"tts_loaded: {tts_loaded}\n"
@@ -1142,6 +1585,7 @@ class DiscordConsoleState:
             f"proactive_conversation: "
             f"{self.proactive_bridge.conversation_status() if self.proactive_bridge else 'disabled'}\n"
             f"service_control: {self.allow_service_control}\n"
+            f"{companion_status_line(activity_runtime)}"
             f"{self.training_log.summary_text() if self.training_log else 'training_log: unavailable'}\n"
             f"checks: {health['checks']}"
         )
@@ -1453,6 +1897,7 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
 
     @bot.event
     async def setup_hook() -> None:
+        start_companion_activity_runtime()
         if board_manager.enabled:
             # 再起動後もボードのボタン/Selectを生かすため、永続Viewを登録する。
             bot.add_view(TaskBoardView(board_manager))
@@ -1495,9 +1940,11 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
         if not proactive_started:
             proactive_started = True
             try:
-                state.proactive_bridge = create_proactive_bridge(state, bot)
-            except Exception as e:
-                logger.error("[Discord] proactive 初期化失敗 (proactiveなしで続行): %s", e)
+                state.proactive_bridge = create_proactive_bridge(
+                    state, bot, companion_getter=_companion_state
+                )
+            except Exception:
+                logger.error("[Discord] proactive 初期化失敗 (proactiveなしで続行)")
                 state.proactive_bridge = None
             if state.proactive_bridge is not None:
                 state.proactive_bridge.start()
@@ -1741,44 +2188,107 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
         except discord.HTTPException as e:
             logger.error("[Discord] task confirm send failed: %s", e)
 
-    async def handle_voice_reply(message: discord.Message, transcript_text: str) -> None:
-        """通話 transcript (デバウンス後の結合テキスト) に1回だけLLM返信する。"""
+    async def handle_voice_reply(message: discord.Message, transcript_text: str, generation: int) -> None:
+        """通話 transcript (デバウンス後の結合テキスト) に1回だけLLM返信する。
+
+        ``generation`` は on_flush 時に捕捉したゲート世代。revoke 済み (gate 非アクティブ
+        または世代不一致) なら、LLM・履歴コミット・返信・学習・TTS・リアクションの
+        副作用を一切行わない。
+
+        LLM 生成は ask_voice_transcript でセッション履歴と切り離して実行し (一時追加 →
+        必ず除去)、生成返却後に await を挟まず世代を同期再チェックしてから、user+assistant
+        をセッションロック下でコミットする。revoke/キャンセルされた to_thread はローカルの
+        推論を最後まで走らせられるが、このコミットより先へは進めないため、履歴・外部状態を
+        変更できない。
+        """
+        gate = state.voice_reply_gate
+
+        def _active() -> bool:
+            return gate is not None and gate.is_active(generation)
+
+        if not _active():
+            return
+        session, lock, profile = state.get_message_session(message)
         async with message.channel.typing():
             try:
                 response, emotion = await asyncio.to_thread(
-                    state.ask_message_text,
-                    message,
+                    state.ask_voice_transcript,
+                    session,
+                    lock,
+                    profile,
                     transcript_text,
                 )
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
-                await message.reply(f"LLM error: `{e}`", mention_author=False)
+                logger.error(
+                    "[Discord] voice reply LLM failed: %s", type(e).__name__
+                )
+                if not _active():
+                    return
+                await message.reply(VOICE_LLM_ERROR_FALLBACK, mention_author=False)
                 return
+            # 生成返却後・コミット前に世代を同期再チェックする。ここから履歴コミットまで
+            # await を挟まないため revoke は割り込めない。キャンセル済み to_thread は
+            # CancelledError でこの先へ到達しない。
+            if not _active():
+                return
+            with lock:
+                session.add_user_message(transcript_text)
+                session.add_assistant_message(response, store_memory=False, record_growth=False)
+        if not _active():
+            return
         reply_messages = []
         for chunk in split_message(response):
+            if not _active():
+                return
             sent = await message.reply(chunk, mention_author=False)
             reply_messages.append(sent)
+        if not _active():
+            return
         state.record_auto_reply(
             message,
             response,
             reply_messages,
             user_text=transcript_text,
-            source="discord_voice_transcript",
+            source=VOICE_TRAINING_SOURCE,
         )
         if state.voice_tts is not None:
+            if not _active():
+                return
             # 通話由来の質問には音声でも返す (接続中のみ、失敗しても無視)
-            asyncio.create_task(state.voice_tts.autoread(response, emotion=emotion))
+            autoread_task = asyncio.create_task(
+                state.voice_tts.autoread(response, emotion=emotion)
+            )
+            gate.track(autoread_task)
         if reply_messages:
             for reaction in (GOOD_REACTION, BAD_REACTION):
+                if not _active():
+                    return
                 try:
                     await reply_messages[0].add_reaction(reaction)
                 except discord.HTTPException as e:
                     logger.warning("[Discord] feedback reaction failed: %s", e)
 
+    def _schedule_voice_reply(message: Any, text: str) -> None:
+        """on_flush 用: 現在のゲート世代を捕捉し、返信タスクを生成して追跡する。
+
+        タスクは gate に追跡されるため、/voice stop|leave や終了時の revoke で
+        キャンセル対象になる。生成をまたいだ revoke でも、世代不一致チェックで
+        副作用を中止できる。
+        """
+        gate = state.voice_reply_gate
+        if gate is None:
+            return
+        generation = gate.generation
+        task = asyncio.create_task(handle_voice_reply(message, text, generation))
+        gate.track(task)
+
     # 断片ごとの即返信を避け、同じ話者の後続断片が落ち着いてから1回だけ返信する。
     voice_reply_debouncer = VoiceReplyDebouncer(
         debounce_ms=state.voice_reply_debounce_ms,
         max_ms=state.voice_reply_debounce_max_ms,
-        on_flush=lambda msg, txt: asyncio.create_task(handle_voice_reply(msg, txt)),
+        on_flush=_schedule_voice_reply,
     )
     state.voice_reply_debouncer = voice_reply_debouncer
 
@@ -1792,25 +2302,13 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
             return
 
         if transcript is not None:
+            # is_allowed_voice_transcript_message が author/channel/content と
+            # listening/active/current-session timestamp を一括判定済み。
+            # ここから先は admitted transcript だけを debouncer に渡す。
             speaker, transcript_text = transcript
-            # 通話でも「タスク:」プレフィックスは確認なしで即登録する。
-            task_match = TASK_PREFIX_RE.match(transcript_text.strip())
-            if task_match and state.task_store is not None:
-                await register_quick_task(message, task_match.group("body"), source="voice")
-                return
-            # 「予定〜入れて」も通話から直接 Google Calendar に登録する。
-            event_reply = await asyncio.to_thread(
-                state.try_register_event_text, transcript_text.strip()
-            )
-            if event_reply is not None:
-                await message.reply(event_reply, mention_author=False)
-                if state.voice_tts is not None:
-                    try:
-                        asyncio.create_task(state.voice_tts.autoread(event_reply))
-                    except Exception:
-                        pass
-                return
-            # 話者ごとにバッファし、デバウンス満了で結合テキストを1回返信する。
+            # 通話由来の「タスク:」「予定〜入れて」直接登録は撤去し、受け入れた
+            # transcript は全てデバウンス → LLM返信パイプラインへ通す。
+            # テキストチャット側の直接登録経路は従来どおり維持する。
             voice_reply_debouncer.submit(speaker, message, transcript_text)
             return
 
@@ -2041,8 +2539,8 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
         await interaction.response.defer(thinking=True)
         try:
             wav = await asyncio.to_thread(state.synthesize, text, voice, speed)
-        except Exception as e:
-            await interaction.followup.send(f"TTS error: `{e}`", ephemeral=True)
+        except Exception:
+            await interaction.followup.send(TTS_ERROR_FALLBACK, ephemeral=True)
             return
         file_obj = io.BytesIO(wav)
         await interaction.followup.send(
@@ -2065,8 +2563,8 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
         except VoiceSTTError as e:
             await interaction.followup.send(f"voice STT error: {e}", ephemeral=True)
             return
-        except Exception as e:
-            await interaction.followup.send(f"voice STT error: `{e}`", ephemeral=True)
+        except Exception:
+            await interaction.followup.send(VOICE_STT_ERROR_FALLBACK, ephemeral=True)
             return
         await interaction.followup.send(text)
 
@@ -2076,6 +2574,8 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
         interaction: discord.Interaction,
         transcript_channel: discord.TextChannel | None = None,
     ) -> None:
+        # voice STT の第2ゲート: 設定 (DISCORD_VOICE_STT_ENABLED) に加え、この
+        # スラッシュコマンドの明示実行でのみ開始する (自動起動はしない)。
         if not await require_allowed(interaction, state):
             return
         if state.voice_stt is None:
@@ -2090,9 +2590,13 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
         except VoiceSTTError as e:
             await interaction.followup.send(f"voice STT error: {e}", ephemeral=True)
             return
-        except Exception as e:
-            await interaction.followup.send(f"voice STT error: `{e}`", ephemeral=True)
+        except Exception:
+            await interaction.followup.send(VOICE_STT_ERROR_FALLBACK, ephemeral=True)
             return
+        # STT 開始成功時のみ voice reply ゲートを開く。以降の transcript のみが
+        # LLM 返信へ進み、stop/leave で revoke される。
+        if state.voice_reply_gate is not None:
+            state.voice_reply_gate.activate()
         await interaction.followup.send(text)
 
     @voice_group.command(name="stop", description="通話チャンネルのSTTを停止します")
@@ -2104,9 +2608,14 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
             return
         await interaction.response.defer(thinking=True)
         try:
+            # STT 停止より先に、未送信のデバウンス破棄と進行中返信の revoke を完了させる。
+            if state.voice_reply_debouncer is not None:
+                state.voice_reply_debouncer.cancel_all()
+            if state.voice_reply_gate is not None:
+                await state.voice_reply_gate.revoke()
             text = await state.voice_stt.stop()
-        except Exception as e:
-            await interaction.followup.send(f"voice STT error: `{e}`", ephemeral=True)
+        except Exception:
+            await interaction.followup.send(VOICE_STT_ERROR_FALLBACK, ephemeral=True)
             return
         await interaction.followup.send(text)
 
@@ -2119,9 +2628,14 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
             return
         await interaction.response.defer(thinking=True)
         try:
+            # STT 退出より先に、未送信のデバウンス破棄と進行中返信の revoke を完了させる。
+            if state.voice_reply_debouncer is not None:
+                state.voice_reply_debouncer.cancel_all()
+            if state.voice_reply_gate is not None:
+                await state.voice_reply_gate.revoke()
             text = await state.voice_stt.leave()
-        except Exception as e:
-            await interaction.followup.send(f"voice STT error: `{e}`", ephemeral=True)
+        except Exception:
+            await interaction.followup.send(VOICE_STT_ERROR_FALLBACK, ephemeral=True)
             return
         await interaction.followup.send(text)
 
@@ -2150,8 +2664,8 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
         except VoiceTTSError as e:
             await interaction.followup.send(f"voice TTS error: {e}", ephemeral=True)
             return
-        except Exception as e:
-            await interaction.followup.send(f"voice TTS error: `{e}`", ephemeral=True)
+        except Exception:
+            await interaction.followup.send(VOICE_TTS_ERROR_FALLBACK, ephemeral=True)
             return
         await interaction.followup.send(
             f"読み上げました ({duration:.1f}秒): {text[:100]}{'...' if len(text) > 100 else ''}"
@@ -2193,7 +2707,7 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
             status_lines += (
                 f"\nvoice_tts_autoread: {state.voice_tts.autoread_enabled}"
                 f"\nvoice_tts_played: {state.voice_tts.played_count}"
-                f"\nvoice_tts_last_error: {state.voice_tts.last_error or '-'}"
+                f"\nvoice_tts_last_error: {safe_tts_last_error(state.voice_tts.last_error)}"
             )
         await interaction.response.send_message(
             f"```text\n{clean_output(status_lines, 1800)}\n```",
@@ -2214,11 +2728,7 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
             due_str = "期限なし"
         else:
             local = due.astimezone(tz)
-            due_str = (
-                local.strftime("%-m/%-d")
-                if task["due_granularity"] == "date"
-                else local.strftime("%-m/%-d %H:%M")
-            )
+            due_str = format_short_due(local, with_time=task["due_granularity"] != "date")
         prio = {"high": "[高]", "low": "[低]", "normal": ""}.get(task["priority"], "")
         line = f"#{task['id']} {prio}{task['title']} (期限: {due_str})"
         if task["action_hint"]:
@@ -2332,7 +2842,7 @@ def build_bot(state: DiscordConsoleState) -> commands.Bot:
                 f"タスク #{task_id} が見つからないか、すでに完了/削除済みです。", ephemeral=True
             )
             return
-        until_str = until.astimezone(_tasks_tz()).strftime("%-m/%-d %H:%M")
+        until_str = format_short_due(until.astimezone(_tasks_tz()), with_time=True)
         await interaction.response.send_message(f"タスク #{task_id} を {until_str} まで先送りしました。")
         state.refresh_task_board()
 
@@ -2638,6 +3148,7 @@ def main() -> None:
     try:
         bot.run(token)
     finally:
+        stop_companion_activity_runtime()
         state.close()
 
 

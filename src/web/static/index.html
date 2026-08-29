@@ -12,7 +12,7 @@
   <link rel="manifest" href="/static/manifest.json">
   <link rel="stylesheet" href="/static/tokens.css">
   <link rel="stylesheet" href="/static/style.css">
-  <link rel="stylesheet" href="/static/hallmark-theme.css">
+  <link rel="stylesheet" href="/static/theme.css">
 </head>
 <body>
   <div class="app">
@@ -70,6 +70,14 @@
       </section>
 
       <aside class="support-rail" aria-label="会話の補助情報">
+        <section class="companion-panel" id="companion-panel" aria-label="コンパニオンの活動状態" hidden>
+          <div class="companion-head">
+            <span class="companion-mark" id="companion-mark" aria-hidden="true"></span>
+            <span class="companion-title">コンパニオン</span>
+            <span class="companion-status" id="companion-status" role="status" aria-live="polite">—</span>
+          </div>
+          <p class="companion-meta" id="companion-meta" hidden></p>
+        </section>
         <section class="growth-panel" id="growth-panel" aria-label="育ちメーター" title="会話で増えた思い出や学びの量です。モデルの性能値ではありません。">
           <div class="growth-head"><div class="growth-title"><span class="growth-mark">✦</span><span>育ちメーター</span><span class="growth-level" id="growth-level">Lv.1</span></div><div class="growth-score"><strong id="growth-points">—</strong> pt <span class="growth-delta" id="growth-delta" hidden></span></div></div>
           <div class="growth-progress" role="progressbar" aria-label="次のレベルまで" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="growth-progress-bar"></span></div>

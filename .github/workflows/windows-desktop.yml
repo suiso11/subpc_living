@@ -5,19 +5,30 @@ on:
   push:
     paths:
       - "src/desktop/**"
+      - "src/perception/**"
       - "tests/test_desktop_*.py"
       - "requirements-desktop.txt"
       - "subpc-desktop.spec"
+      - "scripts/run_desktop.py"
       - "scripts/build_windows_desktop.ps1"
       - ".github/workflows/windows-desktop.yml"
   pull_request:
     paths:
       - "src/desktop/**"
+      - "src/perception/**"
       - "tests/test_desktop_*.py"
       - "requirements-desktop.txt"
       - "subpc-desktop.spec"
+      - "scripts/run_desktop.py"
       - "scripts/build_windows_desktop.ps1"
       - ".github/workflows/windows-desktop.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-desktop-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -40,7 +51,7 @@ jobs:
       - name: Test native client and load QML
         env:
           QT_QPA_PLATFORM: offscreen
-        run: python -m unittest tests.test_desktop_api tests.test_desktop_contract tests.test_desktop_qml -v
+        run: python -m unittest discover -s tests -p "test_desktop_*.py" -v
 
       - name: Build Windows executable
         run: pyinstaller --noconfirm --clean subpc-desktop.spec

@@ -1,6 +1,7 @@
 pragma ComponentBehavior: Bound
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Controls as QQC2
 import QtQuick.Layouts
 import "."
 
@@ -159,7 +160,7 @@ Item {
     Dialog {
         id: eventDialog
         property string eventId: ""
-        anchors.centerIn: Overlay.overlay
+        anchors.centerIn: QQC2.Overlay.overlay
         width: Math.min(500, page.width - 40)
         modal: true
         standardButtons: Dialog.NoButton

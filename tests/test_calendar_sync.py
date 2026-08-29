@@ -26,6 +26,8 @@ class FakeCalendarClient:
         self.next_event_id = "evt-1"
         self.create_fail_times = 0  # 最初の N 回 create を失敗させる
         self.range_events = []
+        self.delete_raise_ids = set()  # 指定 event_id の delete を例外で失敗させる
+        self.update_raise_ids = set()  # 指定 event_id の update を例外で失敗させる
 
     def create_event(self, **kwargs):
         self.calls.append(("create", kwargs))
@@ -37,10 +39,16 @@ class FakeCalendarClient:
 
     def update_event(self, event_id, **kwargs):
         self.calls.append(("update", event_id, kwargs))
+        if event_id in self.update_raise_ids:
+            self.update_raise_ids.discard(event_id)
+            raise RuntimeError("boom update")
         return CalendarMutationResult(ok=True, event_id=event_id)
 
     def delete_event(self, event_id, **kwargs):
         self.calls.append(("delete", event_id, kwargs))
+        if event_id in self.delete_raise_ids:
+            self.delete_raise_ids.discard(event_id)
+            raise RuntimeError("boom delete")
         return CalendarMutationResult(ok=True, event_id=event_id)
 
     def list_events_range(self, start_date, end_date, **kwargs):
@@ -140,12 +148,14 @@ class TaskCalendarSyncTest(unittest.TestCase):
     def test_done_updates_summary_to_check(self):
         tid = self._add(due_at=datetime.now(UTC) + timedelta(hours=3), due_granularity="datetime")
         self.store.set_calendar_event(tid, "evt-existing")
+        self.store.done(tid)
         self.sync._sync_task(tid, "done")
         self.assertEqual(self.client.kinds(), ["update"])
         self.assertTrue(self.client.calls[0][2]["summary"].startswith("✅"))
 
     def test_done_without_event_is_noop(self):
         tid = self._add(due_at=datetime.now(UTC) + timedelta(hours=3), due_granularity="datetime")
+        self.store.done(tid)
         self.sync._sync_task(tid, "done")
         self.assertEqual(self.client.calls, [])
 
@@ -155,6 +165,37 @@ class TaskCalendarSyncTest(unittest.TestCase):
         self.sync._sync_task(tid, "drop")
         self.assertEqual(self.client.kinds(), ["delete"])
         self.assertIsNone(self.store.get(tid)["calendar_event_id"])
+
+    def test_stale_add_after_done_updates_summary_not_creates(self):
+        # done 済みタスクへの遅延 add: open イベントは作らず、既存イベントを完了サマリへ
+        tid = self._add(due_at=datetime.now(UTC) + timedelta(hours=3), due_granularity="datetime")
+        self.store.set_calendar_event(tid, "evt-existing")
+        self.store.done(tid)
+        self.sync._sync_task(tid, "add")
+        self.assertEqual(self.client.kinds(), ["update"])
+        self.assertTrue(self.client.calls[0][2]["summary"].startswith("✅"))
+
+    def test_stale_add_after_done_without_event_is_noop(self):
+        # done 済みで mapping 無し: open イベントを絶対に作らない
+        tid = self._add(due_at=datetime.now(UTC) + timedelta(hours=3), due_granularity="datetime")
+        self.store.done(tid)
+        self.sync._sync_task(tid, "add")
+        self.assertEqual(self.client.calls, [])
+
+    def test_stale_add_after_drop_deletes_event(self):
+        # dropped 済みタスクへの遅延 add: 現在状態 (dropped) に従いイベントを削除
+        tid = self._add(due_at=datetime.now(UTC) + timedelta(hours=3), due_granularity="datetime")
+        self.store.set_calendar_event(tid, "evt-existing")
+        self.store.drop(tid)
+        self.sync._sync_task(tid, "add")
+        self.assertEqual(self.client.kinds(), ["delete"])
+        self.assertIsNone(self.store.get(tid)["calendar_event_id"])
+
+    def test_stale_done_label_on_open_task_reconciles_open(self):
+        # open タスクへの遅延 done: 状態に従い通常の open イベントを作成
+        tid = self._add(due_at=datetime.now(UTC) + timedelta(hours=3), due_granularity="datetime")
+        self.sync._sync_task(tid, "done")
+        self.assertEqual(self.client.kinds(), ["create"])
 
     def test_clearing_due_deletes_event(self):
         tid = self._add(due_at=datetime.now(UTC) + timedelta(hours=3), due_granularity="datetime")
@@ -319,6 +360,113 @@ class CalendarPullWorkerTest(unittest.TestCase):
         )
         worker.run_once(now=self.now)
         self.assertEqual(store.set_calls, [(7, "own7")])
+
+    def _reconcile_worker(self, store):
+        return CalendarPullWorker(
+            calendar_client=self.client,
+            profile=None,
+            store=store,
+            timezone=self.tz,
+            upcoming_path=self.upcoming,
+        )
+
+    def test_lost_terminal_queue_recovery_for_done_task(self):
+        # done 済みだが mapping が失われ、open サマリのマーカーが残っている
+        store = make_store()
+        tid = store.add(
+            "掃除",
+            due_at=datetime(2026, 7, 4, 10, 0, tzinfo=UTC),
+            due_granularity="datetime",
+        )
+        store.done(tid)
+        self.client.range_events = [
+            self._ev(
+                "📋 掃除",
+                "2026-07-04T09:30:00+09:00",
+                desc=f"subpc-task:{tid}",
+                eid="lost1",
+            ),
+        ]
+        self._reconcile_worker(store).run_once(now=self.now)
+        # マーカーは保持され、完了サマリへ更新、対応付けが復元される
+        updates = [c for c in self.client.calls if c[0] == "update"]
+        self.assertEqual(len(updates), 1)
+        self.assertTrue(updates[0][2]["summary"].startswith("✅"))
+        self.assertEqual(store.get(tid)["calendar_event_id"], "lost1")
+        # マーカーは upcoming へ取り込まれない
+        with open(self.upcoming, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(data["events"], [])
+
+    def test_missing_task_orphan_marker_deleted(self):
+        store = make_store()
+        self.client.range_events = [
+            self._ev("残骸", "2026-07-04T10:00:00+09:00", desc="subpc-task:99999", eid="orphan1"),
+        ]
+        self._reconcile_worker(store).run_once(now=self.now)
+        self.assertEqual([c[1] for c in self.client.calls if c[0] == "delete"], ["orphan1"])
+
+    def test_dropped_task_orphan_marker_deleted_and_cleared(self):
+        store = make_store()
+        tid = store.add(
+            "破棄",
+            due_at=datetime(2026, 7, 4, 10, 0, tzinfo=UTC),
+            due_granularity="datetime",
+        )
+        store.set_calendar_event(tid, "drop-orphan")
+        store.drop(tid)
+        self.client.range_events = [
+            self._ev("📋 破棄", "2026-07-04T09:30:00+09:00", desc=f"subpc-task:{tid}", eid="drop-orphan"),
+        ]
+        self._reconcile_worker(store).run_once(now=self.now)
+        self.assertEqual([c[1] for c in self.client.calls if c[0] == "delete"], ["drop-orphan"])
+        self.assertIsNone(store.get(tid)["calendar_event_id"])
+
+    def test_duplicate_markers_converge_to_stored_mapping(self):
+        # 二つの同期インスタンスが二重作成した想定。対応付け済み id を正準に残す
+        store = make_store()
+        tid = store.add(
+            "二重",
+            due_at=datetime(2026, 7, 4, 10, 0, tzinfo=UTC),
+            due_granularity="datetime",
+        )
+        store.set_calendar_event(tid, "evtA")
+        self.client.range_events = [
+            self._ev("📋 二重", "2026-07-04T09:30:00+09:00", desc=f"subpc-task:{tid}", eid="evtB"),
+            self._ev("📋 二重", "2026-07-04T10:00:00+09:00", desc=f"subpc-task:{tid}", eid="evtA"),
+        ]
+        self._reconcile_worker(store).run_once(now=self.now)
+        self.assertEqual([c[1] for c in self.client.calls if c[0] == "delete"], ["evtB"])
+        self.assertEqual(store.get(tid)["calendar_event_id"], "evtA")
+
+    def test_duplicate_markers_backfill_deterministic_when_no_mapping(self):
+        # mapping が無い場合も (start, event_id) 辞書順最小へ決定的に収束する
+        store = make_store()
+        tid = store.add(
+            "二重2",
+            due_at=datetime(2026, 7, 4, 10, 0, tzinfo=UTC),
+            due_granularity="datetime",
+        )
+        self.client.range_events = [
+            self._ev("📋 二重2", "2026-07-04T10:00:00+09:00", desc=f"subpc-task:{tid}", eid="z-2"),
+            self._ev("📋 二重2", "2026-07-04T09:00:00+09:00", desc=f"subpc-task:{tid}", eid="a-1"),
+        ]
+        self._reconcile_worker(store).run_once(now=self.now)
+        self.assertEqual([c[1] for c in self.client.calls if c[0] == "delete"], ["z-2"])
+        self.assertEqual(store.get(tid)["calendar_event_id"], "a-1")
+
+    def test_reconcile_error_does_not_abort_other_markers(self):
+        # 片方の削除が失敗しても、残りのマーカー整理は続行される (best-effort)
+        store = make_store()
+        self.client.delete_raise_ids = {"orph-x"}
+        self.client.range_events = [
+            self._ev("残骸1", "2026-07-04T10:00:00+09:00", desc="subpc-task:998", eid="orph-x"),
+            self._ev("残骸2", "2026-07-04T11:00:00+09:00", desc="subpc-task:999", eid="orph-y"),
+        ]
+        ok = self._reconcile_worker(store).run_once(now=self.now)
+        self.assertTrue(ok)
+        deletes = [c[1] for c in self.client.calls if c[0] == "delete"]
+        self.assertIn("orph-y", deletes)  # 失敗を挟んでも他は処理される
 
     def test_write_upcoming_atomic_and_shaped(self):
         self.client.range_events = [self._ev("A", "2026-07-04T14:00:00+09:00", eid="a")]

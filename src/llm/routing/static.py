@@ -49,7 +49,13 @@ class StaticRouter:
             primary_reason = "default route"
 
         candidates: list[str] = []
-        for provider_id in (primary_id, *self.fallback_provider_ids):
+        # primaryがdefault以外のときは、設定fallbackの後にdefaultを最終候補へ追加する。
+        # default routeでは重複排除により既存の候補順序がそのまま保たれる。
+        for provider_id in (
+            primary_id,
+            *self.fallback_provider_ids,
+            self.default_provider_id,
+        ):
             if provider_id not in candidates:
                 candidates.append(provider_id)
 

@@ -9,6 +9,7 @@ import json
 import asyncio
 import base64
 import hashlib
+import queue
 import socket
 import secrets
 import subprocess
@@ -29,9 +30,13 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, FileResponse
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.chat.client import OllamaClient
+from src.assistant.contracts import AssistantRequest
+from src.assistant.factory import build_local_service
+from src.assistant.nodes import build_node_service, NodeInventory, ProviderSpec
+from src.assistant.service import AssistantService
+from src.assistant.stream_queue import stream_to_queue
 from src.chat.session import ChatSession
-from src.chat.config import ChatConfig
+from src.chat.config import ChatConfig, validate_local_provider_kind
 from src.chat.emotion import EmotionTagStreamFilter, emotion_to_sbv2_style
 from src.chat.web_search import WebSearchContext, create_web_search_context
 from src.audio.tts_factory import backend_name, create_tts_backend
@@ -41,6 +46,15 @@ from src.memory.rag import RAGRetriever
 from src.vision.context import VisionContext
 from src.screen.context import ScreenContext
 from src.screen import create_screen_context
+from src.perception import (
+    ActivityRuntime,
+    SensorPolicy,
+    create_activity_source,
+    create_activity_runtime_from_env,
+    companion_state_payload,
+    resolve_sensor_policy,
+)
+from src.perception.bootstrap import sensor_error_code, sensor_error_code_from_name
 from src.monitor.context import MonitorContext
 from src.persona.profile import UserProfile
 from src.persona.summarizer import ConversationSummarizer
@@ -49,9 +63,12 @@ from src.service.healthcheck import HealthChecker
 from src.service.idle import IdleManager, create_idle_manager
 from src.discord_bot.task_ui import parse_due, parse_snooze, split_quick_input
 from src.tasks.store import TaskStore
+from src.tasks.formatting import format_short_due
 from src.tasks.chat_editor import TaskChatEditor
 from src.tasks import extractor as task_extractor
 from src.growth.tracker import GrowthTracker
+from src.llm.provider import LLMProvider
+from src.llm.registry import ProviderRegistry
 from src.service.log_setup import setup_logging, DEFAULT_LOG_DIR
 from src.chat import history_admin
 
@@ -60,19 +77,25 @@ logger = setup_logging("subpc-web")
 
 # --- グローバル状態 ---
 config: ChatConfig = None
-llm: OllamaClient = None
+llm: LLMProvider = None
+assistant_service: AssistantService = None
+provider_registry: ProviderRegistry = None
 tts = None
 stt: WhisperSTT = None
 rag: RAGRetriever = None
 vision: VisionContext = None
 screen: Optional[ScreenContext] = None
 monitor: MonitorContext = None
+# 共有 SensorPolicy (P0-3)。lifespan で一度だけ解決し、env 名・値・token は
+# 公開しない。各センサーの構築・start はこの policy の boolean でのみ gate する。
+sensor_policy: Optional[SensorPolicy] = None
 profile: UserProfile = None
 summarizer: ConversationSummarizer = None
 preloader: SessionPreloader = None
 web_search: Optional[WebSearchContext] = None
 sessions: dict[str, ChatSession] = {}
 idle_manager: Optional[IdleManager] = None
+activity_runtime: Optional[ActivityRuntime] = None
 task_store: Optional[TaskStore] = None
 task_chat_editor = TaskChatEditor()
 growth_tracker: Optional[GrowthTracker] = None
@@ -80,6 +103,18 @@ tasks_timezone: str = "Asia/Tokyo"
 task_calendar_sync = None  # TaskCalendarSync | None (Webで作ったタスクをカレンダーへ push)
 calendar_client = None  # GoogleCalendarMCPClient | None (イベント CRUD 用)
 tasks_calendar_id: str = "primary"
+# 選択中ローカルProviderの追跡 (P0-2.4)。ChatConfig の resolved id /
+# NodeInventory の default_provider_id を起動時に保持し、status / health は
+# ハードコードされた "ollama" ではなくこの id 経由で判定する。
+primary_provider_id: Optional[str] = None
+primary_provider_kind: str = "ollama"
+# 選択中ローカルProviderの実 base URL。lifespan で解決し、外部へ出力・ログしない。
+# None のときは未設定 (reachability = "unconfigured") としてプローブしない。
+primary_provider_base_url: Optional[str] = None
+# 選択中ローカルProviderの API キー環境変数名のみ。キー値は保持しない。
+# lifespan で ChatConfig / NodeInventory default spec から解決し、各 health/status
+# プローブ時に os.environ から実行時解決する。env 名自体も外部へ出力・ログしない。
+primary_provider_api_key_env: Optional[str] = None
 UPCOMING_PATH = PROJECT_ROOT / "data" / "calendar" / "upcoming.json"
 
 # 低温度 Web 抽出の資源上限。本流の num_ctx/num_predict とは独立に小さく抑える。
@@ -98,6 +133,134 @@ def get_local_ip() -> str:
         return ip
     except Exception:
         return "127.0.0.1"
+
+
+def _inventory_provider_spec(
+    inventory, provider_id: str
+) -> Optional[ProviderSpec]:
+    """NodeInventory から provider_id に対応する ProviderSpec を返す。
+
+    見つからない場合は ``None``。
+    """
+    for spec in inventory.providers():
+        if spec.provider_id == provider_id:
+            return spec
+    return None
+
+
+def _inventory_provider_kind(inventory, provider_id: str) -> str:
+    """NodeInventory の provider_id に対応する ``provider_kind`` を返す。
+
+    見つからない場合は従来既定の ``"ollama"`` を返す (安全側)。
+    """
+    spec = _inventory_provider_spec(inventory, provider_id)
+    return spec.provider_kind if spec is not None else "ollama"
+
+
+def _selected_provider_entry() -> tuple[Optional[str], Optional[LLMProvider]]:
+    """選択中ローカルProviderの (provider_id, provider) を解決する。
+
+    追跡中の ``primary_provider_id`` を優先し、未設定の単一Provider構成では
+    後方互換のため ``"ollama"``、最後に登録済みの最初のProviderへフォールバック
+    する。registry が無ければ ``(None, None)`` を返す。
+    """
+    if provider_registry is None:
+        return None, None
+    if primary_provider_id is not None and primary_provider_id in provider_registry:
+        entry = provider_registry.get(primary_provider_id)
+        return entry.provider_id, entry.provider
+    if "ollama" in provider_registry:
+        entry = provider_registry.get("ollama")
+        return entry.provider_id, entry.provider
+    for entry in provider_registry.entries():
+        return entry.provider_id, entry.provider
+    return None, None
+
+
+def _reachability_status(check: Optional[dict]) -> str:
+    """Providerヘルスチェック辞書から到達可能性を正規化する。
+
+    ``ok`` / ``error`` / ``unknown`` はそのまま返し、チェックが無い・
+    ``skip`` など到達判定できない場合は ``"unconfigured"`` を返す。
+    """
+    if check is None:
+        return "unconfigured"
+    status = check.get("status")
+    if status in ("ok", "error", "unknown"):
+        return status
+    return "unconfigured"
+
+
+def _provider_reachability_from_checks(result: dict) -> str:
+    """``check_all`` の結果から選択中Providerの到達可能性を抽出する。
+
+    選択backend (``primary_provider_kind``) に応じて ``checks["ollama"]`` か
+    ``checks["local_provider"]`` を使う。未設定 (base_url 未解決) のときは
+    ネットワークプローブせず ``"unconfigured"`` を返す。
+    """
+    if not primary_provider_kind or not primary_provider_base_url:
+        return "unconfigured"
+    check_key = "ollama" if primary_provider_kind == "ollama" else "local_provider"
+    return _reachability_status(result["checks"].get(check_key))
+
+
+def _default_provider_api_key_env(config, spec=None) -> Optional[str]:
+    """NodeInventory の default spec / ChatConfig から API キー env 名を選ぶ。
+
+    spec (inventory の default spec) を優先し、無ければ ``config.local_api_key_env``
+    を使う。env 名のみを返し、キー値は解決しない。空なら ``None``。
+    """
+    if spec is not None:
+        env_name = getattr(spec, "api_key_env", "") or ""
+    else:
+        env_name = getattr(config, "local_api_key_env", "") or ""
+    return env_name.strip() or None
+
+
+def _resolve_primary_provider_api_key() -> Optional[str]:
+    """選択中ローカルProviderの API キーを実行時に解決する。
+
+    追跡中の env 名のみを参照し、キー値はグローバル・cache・status に保持しない。
+    Ollama / env 名未指定 / 環境変数が未設定・空のときは ``None`` (keyless)。
+    """
+    if primary_provider_kind != "openai_compatible":
+        return None
+    env_name = primary_provider_api_key_env
+    if not env_name:
+        return None
+    return os.environ.get(env_name) or None
+
+
+def _log_llm_startup_status(llm, *, provider_id, provider_kind, model) -> None:
+    """起動時のLLM availabilityを真実に沿ってログする。
+
+    openai_compatible の ``is_available()`` は lifecycle-only (closed でない限り
+    True) で到達性を検証しない。そのため ``"LLM OK"`` とは断言せず、設定済みで
+    あることと、到達性は ``/api/health`` と generation で確認する旨だけをログ
+    する。Ollama は probe-based ``is_available()`` の従来動作を維持する。
+    """
+    if llm is None:
+        logger.warning("Providerが1つも登録されていません。")
+        return
+    if provider_kind == "openai_compatible":
+        if not llm.is_available():
+            logger.warning(
+                "LLM (provider: %s) が利用可能な状態にありません。", provider_id
+            )
+            return
+        logger.info(
+            "LLM configured (provider: %s, model: %s); reachability checked by health/generation",
+            provider_id,
+            model,
+        )
+        return
+    if not llm.is_available():
+        logger.warning(
+            "LLM (provider: %s) に接続できません。チャット機能は使用不可です。",
+            provider_id,
+        )
+        return
+    logger.info("✅ LLM OK (provider: %s, model: %s)", provider_id, model)
 
 
 @lru_cache(maxsize=1)
@@ -135,10 +298,281 @@ def get_secure_web_url() -> str:
     return ""
 
 
+def _sensor_error_response(message: str, exc: Exception, status_code: int = 500) -> JSONResponse:
+    """センサー関連エラーの固定レスポンス。
+
+    例外の本文・パス・URL・token・デバイス名・画像/テキスト内容は露出せず、
+    allowlist の固定コード (timeout / invalid_input / unavailable / internal_error)
+    だけを ``error_type`` に載せる。例外クラス名そのものは外部 JSON へ載せない
+    (HTTP 意味は維持)。
+    """
+    return JSONResponse(
+        {"error": message, "error_type": sensor_error_code(exc)},
+        status_code=status_code,
+    )
+
+
+def _safe_get_status(ctx) -> Optional[dict]:
+    """センサー status 取得の安全ラッパー。
+
+    例外時は型名のみログし None を返す。例外本文・内部状態は外部へ露出しない。
+    """
+    try:
+        return ctx.get_status()
+    except Exception as e:
+        logger.warning("sensor status unavailable: %s", type(e).__name__)
+        return None
+
+
+# センサー status の allowlist。bool / タイムスタンプ / ソース種別のみを許容し、
+# カメラデバイスID・VLM モデル名・描写テキスト・生の context 文字列・パス・
+# last_error など、未認証 Web API から露出させない派生/生情報を除外する。
+VISION_STATUS_ALLOWLIST = (
+    "running",
+    "paused",
+    "stop_pending",
+    "thread_alive",
+    "user_present",
+    "emotion_detection",
+)
+
+SCREEN_STATUS_ALLOWLIST = (
+    "running",
+    "paused",
+    "stop_pending",
+    "thread_alive",
+    "captured_at",
+    "age_seconds",
+    "source",
+)
+
+# センサー status の allowlist (Monitor)。bool / タイムスタンプのみを許容し、
+# メトリクス集計値 (CPU/メモリ/GPU/ディスク)・プロセス数・レコード数・設定値
+# (collect_interval)・DB パス・エラー・本文テキストなど、未認証 Web API から
+# 露出させない派生/生情報を除外する。source は常に固定 "monitor"。
+MONITOR_STATUS_ALLOWLIST = (
+    "running",
+    "last_collected",
+)
+
+
+def _sensor_disabled_response() -> JSONResponse:
+    """廃止した生/デバッグセンサー出力の固定レスポンス。
+
+    404 (未公開) としてデータを一切返さない。403 は「認証/許可」を暗示するため
+    同意・認証と混同させる 403 は使わず、単に非公開であることを返す。
+    ボディは固定文言のみで、センサー内容は含めない。
+    """
+    return JSONResponse(
+        {"error": "deprecated", "detail": "このエンドポイントは廃止されました。"},
+        status_code=404,
+    )
+
+
+def _microphone_enabled() -> bool:
+    """共有 SensorPolicy.microphone が明示 true のときだけマイク入力を許可する。
+
+    未解決 (None)・false・不正値は False (fail closed)。env 名・値は直接読まず、
+    lifespan で resolve 済みの frozen な policy の boolean のみを使う。
+    """
+    return sensor_policy is not None and sensor_policy.microphone
+
+
+def _microphone_denied_response() -> JSONResponse:
+    """マイク入力が許可されていないときの固定レスポンス (permission-denied)。
+
+    センサー内容・policy・env 情報は一切含めず、固定文言のみを返す (403)。
+    """
+    return JSONResponse(
+        {"error": "forbidden", "detail": "マイク入力は許可されていません。"},
+        status_code=403,
+    )
+
+
+def _stt_usable() -> bool:
+    """STT が利用可能か (engine ロード済み かつ マイク policy 有効)。
+
+    マイク入力は engine の有無と policy の両方が必要で、どちらか不足なら False
+    (fail closed)。env 名・値は露出しない。
+    """
+    return stt is not None and stt.is_loaded() and _microphone_enabled()
+
+
+def _filter_sensor_status(status: Optional[dict], allowlist: tuple[str, ...]) -> dict:
+    """センサー status を allowlist のキーのみに絞る。
+
+    未公開のキーが status に存在しても、外部へは一切載せない (fail closed)。
+    """
+    if not status:
+        return {}
+    return {key: status[key] for key in allowlist if key in status}
+
+
+def _minimized_status(ctx, allowlist: tuple[str, ...]) -> Optional[dict]:
+    """status 取得を安全ラップし、allowlist のみに絞って返す。
+
+    例外時は None。生例外・内部状態は外部へ露出しない。
+    """
+    status = _safe_get_status(ctx)
+    if not status:
+        return None
+    return _filter_sensor_status(status, allowlist)
+
+
+def _minimized_monitor_status(ctx) -> Optional[dict]:
+    """Monitor status を allowlist のみに絞り、source を固定 "monitor" で返す。
+
+    例外時は None。生例外・内部状態は外部へ露出しない。
+    """
+    status = _minimized_status(ctx, MONITOR_STATUS_ALLOWLIST)
+    if status is None:
+        return None
+    status["source"] = "monitor"
+    return status
+
+
+def _start_companion_activity_runtime() -> Optional[ActivityRuntime]:
+    """オプトインの活動収集ランタイムを起動する。
+
+    env 読取と ActivityRuntime 生成は src.perception.bootstrap の
+    create_activity_runtime_from_env へ委譲する。数値設定不正や起動失敗は
+    companion 機能だけを無効化し、Web 起動は続行する。
+    """
+    global activity_runtime
+    activity_runtime = create_activity_runtime_from_env(os.environ, logger=logger)
+    return activity_runtime
+
+
+def _init_vision_from_policy(policy: Optional[SensorPolicy]) -> Optional[VisionContext]:
+    """policy.camera が有効のときだけ VisionContext を構築・start して返す。
+
+    無効時は構築も start もせず None (fail closed)。カメラが開けなくても例外は
+    伝播せず None にして Web 起動を続行する。
+    """
+    if policy is None or not policy.camera:
+        logger.info("Vision disabled (set SENSOR_CAMERA_ENABLED=true)")
+        return None
+    logger.info("[5/7] Vision init...")
+    try:
+        emotion_model = str(PROJECT_ROOT / "models" / "vision" / "emotion-ferplus-8.onnx")
+        vctx = VisionContext(
+            camera_id=0,
+            analysis_interval=2.0,
+            emotion_model_path=emotion_model,
+        )
+        try:
+            started = vctx.start()
+        except Exception as e:
+            logger.warning("Vision start failed (continue): %s", type(e).__name__)
+            started = False
+        if started:
+            time.sleep(1.0)
+            status = vctx.get_status()
+            emotion_str = "enabled" if status["emotion_detection"] else "face-only"
+            logger.info("Vision OK (camera, emotion: %s)", emotion_str)
+            return vctx
+        # start が false / 例外で失敗した場合のみ、破棄前に best-effort で stop する。
+        try:
+            vctx.stop()
+        except Exception as e:
+            logger.warning("Vision cleanup failed: %s", type(e).__name__)
+        logger.warning("Vision: camera open failed (continue without Vision)")
+        return None
+    except Exception as e:
+        logger.warning("Vision init failed (continue): %s", type(e).__name__)
+        return None
+
+
+def _init_screen_from_policy(
+    policy: Optional[SensorPolicy],
+    *,
+    config,
+    primary_provider_kind: str,
+) -> Optional[ScreenContext]:
+    """policy.screen_capture が有効のときだけ ScreenContext を構築・start して返す。
+
+    従来の legacy env (WEB_SCREEN_CONTEXT_ENABLED) はここでは読まず、共有
+    SensorPolicy 解決器が既に screen_capture へ反映済みの boolean だけを使う。
+    ScreenDescriber は Ollama /api/chat 前提のため Ollama backend 時のみ作成する。
+    """
+    if policy is None or not policy.screen_capture:
+        logger.info("Screen disabled (set SENSOR_SCREEN_CAPTURE_ENABLED=true)")
+        return None
+    logger.info("[+] Screen init...")
+    if primary_provider_kind != "ollama":
+        logger.warning("Screen: only available with Ollama backend; skipping")
+        return None
+    try:
+        sctx = create_screen_context(
+            analysis_interval=90.0,
+            base_url=config.ollama_base_url,
+            model=config.model,
+        )
+        try:
+            started = sctx.start()
+        except Exception as e:
+            logger.warning("Screen start failed (continue): %s", type(e).__name__)
+            started = False
+        if started:
+            status = sctx.get_status()
+            mode = status.get("mode", "local")
+            detail = (
+                f"VLM: {status['model']}, interval: {status['analysis_interval']:.0f}s"
+                if mode == "local"
+                else "remote: reading data/screen/latest.json"
+            )
+            logger.info("Screen OK (%s)", detail)
+            return sctx
+        # start が false / 例外で失敗した場合のみ、破棄前に best-effort で stop する。
+        try:
+            sctx.stop()
+        except Exception as e:
+            logger.warning("Screen cleanup failed: %s", type(e).__name__)
+        logger.warning("Screen: capture failed (DISPLAY unset? continue without Screen)")
+        return None
+    except Exception as e:
+        logger.warning("Screen init failed (continue): %s", type(e).__name__)
+        return None
+
+
+def _init_monitor_from_policy(policy: Optional[SensorPolicy]) -> Optional[MonitorContext]:
+    """policy.monitor が有効のときだけ MonitorContext を構築・start して返す。
+
+    既定はオフ。無効時は構築も start もせず None。
+    """
+    if policy is None or not policy.monitor:
+        logger.info("Monitor disabled (set SENSOR_MONITOR_ENABLED=true)")
+        return None
+    logger.info("[6/7] Monitor init...")
+    try:
+        mctx = MonitorContext(
+            db_path=str(PROJECT_ROOT / "data" / "metrics" / "system_metrics.db"),
+            collect_interval=30.0,
+        )
+        try:
+            started = mctx.start()
+        except Exception as e:
+            logger.warning("Monitor start failed (continue): %s", type(e).__name__)
+            started = False
+        if started:
+            logger.info("Monitor OK (metrics collection started)")
+            return mctx
+        # start が false / 例外で失敗した場合のみ、破棄前に best-effort で stop する。
+        try:
+            mctx.stop()
+        except Exception as e:
+            logger.warning("Monitor cleanup failed: %s", type(e).__name__)
+        logger.warning("Monitor start failed (continue without Monitor)")
+        return None
+    except Exception as e:
+        logger.warning("Monitor init failed (continue): %s", type(e).__name__)
+        return None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """サーバー起動/終了時の処理"""
-    global config, llm, tts, stt, rag, vision, screen, monitor, profile, summarizer, preloader, web_search, idle_manager, task_store, growth_tracker, tasks_timezone, task_calendar_sync, calendar_client, tasks_calendar_id
+    global config, llm, assistant_service, provider_registry, tts, stt, rag, vision, screen, monitor, profile, summarizer, preloader, web_search, idle_manager, task_store, growth_tracker, tasks_timezone, task_calendar_sync, calendar_client, tasks_calendar_id, activity_runtime, primary_provider_id, primary_provider_kind, primary_provider_base_url, primary_provider_api_key_env, sensor_policy
 
     logger.info("Web UI サーバー起動中...")
 
@@ -159,6 +593,12 @@ async def lifespan(app: FastAPI):
     config_path = PROJECT_ROOT / "config" / "chat_config.json"
     config = ChatConfig.load(config_path)
     web_search = create_web_search_context(config)
+
+    # 共有 SensorPolicy を一度だけ解決する (P0-3)。以降のセンサー gate は
+    # この frozen な policy の boolean のみを使い、env を直接読まない。
+    sensor_policy = resolve_sensor_policy()
+    # 生JPEGは保持しない運用のため、レガシー latest.jpg があれば best-effort で消す。
+    _remove_legacy_latest_jpg()
     tasks_timezone = os.environ.get("DIARY_TIMEZONE", "Asia/Tokyo").strip() or "Asia/Tokyo"
     try:
         growth_tracker = GrowthTracker(
@@ -214,23 +654,81 @@ async def lifespan(app: FastAPI):
             task_calendar_sync = None
 
     # LLM 初期化
-    logger.info("[1/6] Ollama 接続確認...")
-    llm = OllamaClient(base_url=config.ollama_base_url, model=config.model)
-    if not llm.is_available():
-        logger.warning("Ollamaに接続できません。チャット機能は使用不可です。")
+    logger.info("[1/6] LLM 接続確認...")
+    # 選択backend の実 base URL を毎回の起動で安全に再解決する (未設定へ戻す)。
+    primary_provider_base_url = None
+    # API キーは env 名のみを追跡し、キー値は保持しない。env 名も起動時に再解決する。
+    primary_provider_api_key_env = None
+    # Opt-in multi-node inventory wiring
+    _subpc_inventory_path = os.environ.get("SUBPC_NODE_INVENTORY", "").strip()
+    if _subpc_inventory_path:
+        try:
+            _inventory = NodeInventory.load(_subpc_inventory_path)
+            assistant_service, provider_registry = build_node_service(_inventory)
+            primary_provider_id = _inventory.default_provider_id
+            _default_spec = _inventory_provider_spec(
+                _inventory, primary_provider_id
+            )
+            if _default_spec is not None:
+                primary_provider_kind = _default_spec.provider_kind
+                primary_provider_base_url = _default_spec.base_url
+                primary_provider_api_key_env = _default_provider_api_key_env(
+                    config, _default_spec
+                )
+            else:
+                primary_provider_kind = "ollama"
+                primary_provider_base_url = None
+                primary_provider_api_key_env = _default_provider_api_key_env(
+                    config, None
+                )
+            logger.info("✅ Multi-node inventory loaded from %s", _subpc_inventory_path)
+        except Exception as e:
+            logger.warning(
+                "SUBPC_NODE_INVENTORY load failed, falling back to single-provider: %s", e
+            )
+            assistant_service, provider_registry = build_local_service(config)
+            primary_provider_id = config.resolved_local_provider_id()
+            primary_provider_kind = validate_local_provider_kind(config)
+            primary_provider_base_url = config.resolved_local_base_url()
+            primary_provider_api_key_env = _default_provider_api_key_env(config, None)
     else:
-        logger.info("✅ Ollama OK (model: %s)", config.model)
+        assistant_service, provider_registry = build_local_service(config)
+        primary_provider_id = config.resolved_local_provider_id()
+        primary_provider_kind = validate_local_provider_kind(config)
+        primary_provider_base_url = config.resolved_local_base_url()
+        primary_provider_api_key_env = _default_provider_api_key_env(config, None)
+    def _primary_llm(reg, primary_provider_id=None):
+        """既定のLLMプロバイダを安全に解決する。
+
+        追跡中の primary_provider_id を優先し、'ollama' が無いInventory構成
+        (local-strong等) では登録済みの最初のローカルProviderへフォールバックする。
+        """
+        if primary_provider_id and primary_provider_id in reg:
+            return reg.get(primary_provider_id).provider
+        if "ollama" in reg:
+            return reg.get("ollama").provider
+        for entry in reg.entries():
+            return entry.provider
+        return None
+
+    llm = _primary_llm(provider_registry, primary_provider_id)
+    _log_llm_startup_status(
+        llm,
+        provider_id=primary_provider_id,
+        provider_kind=primary_provider_kind,
+        model=getattr(llm, "model", config.model),
+    )
     if web_search is not None:
         logger.info("✅ Web検索 ON (auto=%s, max_results=%s)", config.web_search_auto, config.web_search_max_results)
 
     # STT 初期化
-    logger.info("[2/7] STT 初期化...")
+    logger.info("[2/7] STT init...")
     try:
         stt = WhisperSTT(model_size="auto", language="ja", device="auto")
         stt.load()
-        logger.info("✅ STT OK (model: %s, device: %s)", stt.model_size, stt.device)
+        logger.info("STT OK (model: %s, device: %s)", stt.model_size, stt.device)
     except Exception as e:
-        logger.warning("STT ロード失敗: %s", e)
+        logger.warning("STT load failed: %s", type(e).__name__)
         stt = None
 
     # TTS 初期化
@@ -265,72 +763,21 @@ async def lifespan(app: FastAPI):
         rag = None
         logger.warning("RAG 無効 (WEB_RAG_ENABLED=false)")
 
-    # Vision 初期化 (Phase 5)
-    logger.info("[5/7] Vision (映像入力) 初期化...")
-    try:
-        emotion_model = str(PROJECT_ROOT / "models" / "vision" / "emotion-ferplus-8.onnx")
-        vision = VisionContext(
-            camera_id=0,
-            analysis_interval=2.0,
-            emotion_model_path=emotion_model,
-        )
-        if vision.start():
-            import time
-            time.sleep(1.0)
-            status = vision.get_status()
-            emotion_str = "有効" if status["emotion_detection"] else "顔検出のみ"
-            logger.info("✅ Vision OK (カメラ起動, 感情推定: %s)", emotion_str)
-        else:
-            logger.warning("カメラを開けません (Visionなしで続行)")
-            vision = None
-    except Exception as e:
-        logger.warning("Vision 初期化失敗 (Visionなしで続行): %s", e)
-        vision = None
+    # Vision 初期化 (Phase 5)。policy.camera が有効のときだけ構築・startする。
+    vision = _init_vision_from_policy(sensor_policy)
 
-    # Screen 初期化 (画面認識: スクリーンショット → VLM描写)
-    # デフォルト無効。WEB_SCREEN_CONTEXT_ENABLED=true のときだけ起動する。
-    if os.environ.get("WEB_SCREEN_CONTEXT_ENABLED", "").lower() == "true":
-        logger.info("[+] Screen (画面認識) 初期化...")
-        try:
-            # SCREEN_CONTEXT_MODE (local|remote) でローカル/リモートを切替
-            screen = create_screen_context(
-                analysis_interval=90.0,
-                base_url=config.ollama_base_url,
-                model=config.model,
-            )
-            if screen.start():
-                status = screen.get_status()
-                mode = status.get("mode", "local")
-                detail = (
-                    f"VLM: {status['model']}, 解析間隔: {status['analysis_interval']:.0f}秒"
-                    if mode == "local"
-                    else "remote: data/screen/latest.json を読取"
-                )
-                logger.info("✅ Screen OK (%s)", detail)
-            else:
-                logger.warning("画面をキャプチャできません (DISPLAY未設定? Screenなしで続行)")
-                screen = None
-        except Exception as e:
-            logger.warning("Screen 初期化失敗 (Screenなしで続行): %s", e)
-            screen = None
-    else:
-        screen = None
+    # Screen 初期化 (画面認識: スクリーンショット → VLM描写)。
+    # 既定無効。共有 SensorPolicy.screen_capture でのみ有効化 (legacy の
+    # WEB_SCREEN_CONTEXT_ENABLED は解決器経由でのみ効く)。
+    screen = _init_screen_from_policy(
+        sensor_policy,
+        config=config,
+        primary_provider_kind=primary_provider_kind,
+    )
 
-    # Monitor 初期化 (Phase 6)
-    logger.info("[6/7] Monitor (PCログ収集) 初期化...")
-    try:
-        monitor = MonitorContext(
-            db_path=str(PROJECT_ROOT / "data" / "metrics" / "system_metrics.db"),
-            collect_interval=30.0,
-        )
-        if monitor.start():
-            logger.info("✅ Monitor OK (メトリクス収集開始)")
-        else:
-            logger.warning("Monitor 起動失敗 (Monitorなしで続行)")
-            monitor = None
-    except Exception as e:
-        logger.warning("Monitor 初期化失敗 (Monitorなしで続行): %s", e)
-        monitor = None
+    # Monitor 初期化 (Phase 6)。既定オフ。policy.monitor が有効のときだけ
+    # 構築・startする。
+    monitor = _init_monitor_from_policy(sensor_policy)
 
     # Persona 初期化 (Phase 7)
     logger.info("[7/7] Persona (パーソナライズ) 初期化...")
@@ -369,6 +816,17 @@ async def lifespan(app: FastAPI):
         idle_manager = None
         logger.info("IdleManager 無効 (IDLE_MANAGER_ENABLED=true で明示的に有効化)")
 
+    # Companion 活動収集 (オプトイン)。false または設定不正・起動失敗なら
+    # companion 機能だけ無効化して Web 起動は続行する。
+    activity_runtime = _start_companion_activity_runtime()
+    if activity_runtime is not None:
+        logger.info("Companion activity OK (companion state API enabled)")
+    else:
+        logger.info("Companion activity disabled (set COMPANION_ACTIVITY_ENABLED=true)")
+
+    # Screen ingest の受付世代を有効化する。シャットダウン側で revoke される。
+    _start_ingest_generation()
+
     local_ip = get_local_ip()
     logger.info("✅ サーバー起動完了! PC: http://localhost:8000 / スマホ: http://%s:8000", local_ip)
 
@@ -387,10 +845,24 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
 
+    # Screen ingest: 受付 revoke (cancel より先) → 保持 Future の cancel + bounded await →
+    # safe なときだけ ownership 解除。実行中 worker はシャットダウン後 latest.json を書けない。
+    try:
+        await _stop_ingest_describe()
+    except Exception as e:
+        logger.warning("screen ingest stop failed: %s", type(e).__name__)
+
     # 応答後の候補抽出タスクを停止してから共有クライアント/DBを閉じる。
     pending_candidates = list(_candidate_offer_tasks)
     if pending_candidates:
         await asyncio.gather(*pending_candidates, return_exceptions=True)
+
+    # Companion 活動ランタイムを共有リソースを閉じる前に停止する。
+    if activity_runtime is not None:
+        try:
+            activity_runtime.stop()
+        except Exception as e:
+            logger.warning("activity runtime stop failed: %s", type(e).__name__)
 
     # 終了処理
     # IdleManager 停止
@@ -410,16 +882,30 @@ async def lifespan(app: FastAPI):
                 except Exception:
                     pass
     if monitor is not None:
-        monitor.stop()
+        try:
+            monitor.stop()
+        except Exception as e:
+            logger.warning("monitor stop failed: %s", type(e).__name__)
     if vision is not None:
-        vision.stop()
+        try:
+            vision.stop()
+        except Exception as e:
+            logger.warning("vision stop failed: %s", type(e).__name__)
     if screen is not None:
-        screen.stop()
+        try:
+            screen.stop()
+        except Exception as e:
+            logger.warning("screen stop failed: %s", type(e).__name__)
     if task_calendar_sync is not None:
         task_calendar_sync.stop()
     if task_store is not None:
         task_store.close()
-    llm.close()
+    if provider_registry is not None:
+        provider_registry.close()
+    # レガシー latest.jpg は保持しない運用のため、終了時に best-effort で削除する。
+    _remove_legacy_latest_jpg()
+    # グローバル policy を安全に戻す (次回起動時に再解決する)。
+    sensor_policy = None
     logger.info("サーバーを終了しました。")
 
 
@@ -516,13 +1002,38 @@ async def _watchdog_loop() -> None:
 async def health():
     """ヘルスチェック (systemd watchdog / 外部監視用)"""
     checker = HealthChecker(
-        ollama_url=config.ollama_base_url if config else "http://localhost:11434",
+        ollama_url=(
+            primary_provider_base_url
+            or (config.ollama_base_url if config else "http://localhost:11434")
+        ),
     )
-    result = checker.check_all(include_web=False)
+    if primary_provider_kind and primary_provider_base_url:
+        # 選択中ローカルProviderの実 backend kind/base を selected-provider モードで
+        # プローブする。Ollama は checks["ollama"]、openai_compatible は
+        # checks["local_provider"] に出力される。URL・キーは出力しない。
+        result = checker.check_all(
+            provider_kind=primary_provider_kind,
+            provider_url=primary_provider_base_url,
+            provider_api_key=_resolve_primary_provider_api_key(),
+            include_web=False,
+        )
+        reachability = _provider_reachability_from_checks(result)
+    else:
+        # 未設定 (base_url 未解決) はプローブせず unconfigured とする。
+        result = {"status": "unconfigured", "checks": {}}
+        reachability = "unconfigured"
+
+    _pid, _selected = _selected_provider_entry()
 
     # モジュール稼働状況を追加
     result["modules"] = {
-        "ollama": llm is not None and llm.is_available() if llm else False,
+        # 後方互換: 選択中ローカルProviderの到達性を表すエイリアス。
+        # reachability が ok のときだけ True にする (is_available は使わない)。
+        "ollama": reachability == "ok",
+        "local_provider": reachability == "ok",
+        "provider_id": _pid,
+        "provider_kind": primary_provider_kind,
+        "provider_reachability": reachability,
         "tts": tts is not None and tts.is_loaded(),
         "stt": stt is not None and stt.is_loaded(),
         "rag": rag is not None,
@@ -531,7 +1042,38 @@ async def health():
         "persona": profile is not None,
         "growth": growth_tracker is not None,
         "idle_manager": idle_manager is not None and idle_manager.is_running,
+        "companion": activity_runtime is not None and activity_runtime.is_running,
     }
+
+    # プロバイダレベルの最小情報 (URL・キー・モデル・内部統計は含まない)
+    try:
+        providers_list = []
+        check_key = "ollama" if primary_provider_kind == "ollama" else "local_provider"
+        selected_check = result.get("checks", {}).get(check_key)
+        if provider_registry is not None:
+            for entry in provider_registry.entries():
+                pid = entry.provider_id
+                try:
+                    lifecycle_available = bool(entry.provider.is_available())
+                except Exception:
+                    lifecycle_available = False
+                entry_payload = {
+                    "provider_id": pid,
+                    "provider_kind": primary_provider_kind,
+                    "local": entry.local,
+                    "available": lifecycle_available,
+                    "error": None,
+                }
+                if pid == _pid:
+                    # 選択中Providerの available は lifecycle (is_available) ではなく
+                    # 到達性 (reachability) で決める。ok 以外は False。
+                    entry_payload["available"] = reachability == "ok"
+                    if isinstance(selected_check, dict) and selected_check.get("status") == "error":
+                        entry_payload["error"] = selected_check.get("message")
+                providers_list.append(entry_payload)
+        result["providers"] = providers_list
+    except Exception:
+        result["providers"] = []
 
     status_code = 200 if result["status"] == "ok" else 503
     return JSONResponse(content=result, status_code=status_code)
@@ -781,26 +1323,43 @@ async def game_claim(request: Request):
 @app.get("/api/status")
 async def status():
     """システム状態"""
+    _pid, _selected = _selected_provider_entry()
+    if primary_provider_kind and primary_provider_base_url:
+        checker = HealthChecker(ollama_url=primary_provider_base_url)
+        result = checker.check_all(
+            provider_kind=primary_provider_kind,
+            provider_url=primary_provider_base_url,
+            provider_api_key=_resolve_primary_provider_api_key(),
+            include_web=False,
+        )
+        reachability = _provider_reachability_from_checks(result)
+    else:
+        reachability = "unconfigured"
     return {
-        "ollama": llm.is_available() if llm else False,
-        "model": config.model if config else None,
+        # 後方互換: 選択中ローカルProviderの到達性を表すエイリアス。
+        # reachability が ok のときだけ True (is_available は使わない)。
+        "ollama": reachability == "ok",
+        "local_provider": reachability == "ok",
+        "provider_id": _pid,
+        "provider_kind": primary_provider_kind,
+        "provider_reachability": reachability,
         "tts": tts is not None and tts.is_loaded(),
         "tts_backend": backend_name(tts),
         "tts_voice": tts.voice if tts else None,
         "tts_voices": tts.list_ja_voices() if tts else {},
-        "stt": stt is not None and stt.is_loaded(),
-        "stt_model": stt.model_size if stt else None,
+        "stt": _stt_usable(),
         "secure_web_url": get_secure_web_url(),
         "rag": rag is not None,
         "rag_stats": rag.get_stats() if rag else None,
         "vision": vision is not None and vision.is_running,
-        "vision_status": vision.get_status() if vision else None,
+        "vision_status": _minimized_status(vision, VISION_STATUS_ALLOWLIST),
         "monitor": monitor is not None and monitor.is_running,
-        "monitor_status": monitor.get_status() if monitor else None,
+        "monitor_status": _minimized_monitor_status(monitor) if monitor else None,
         "persona": profile is not None,
         "persona_status": preloader.get_status() if preloader else None,
         "growth": growth_tracker is not None,
         "idle_manager": idle_manager.get_status() if idle_manager else None,
+        "companion": activity_runtime is not None,
         "tasks": task_store is not None,
         "tasks_timezone": tasks_timezone,
     }
@@ -877,10 +1436,7 @@ async def tasks_preview(request: Request):
     due_display = None
     if result["due_at"] is not None:
         local_due = result["due_at"].astimezone(tz)
-        if result["due_granularity"] == "date":
-            due_display = local_due.strftime("%-m/%-d")
-        else:  # datetime
-            due_display = local_due.strftime("%-m/%-d %H:%M")
+        due_display = format_short_due(local_due, with_time=result["due_granularity"] != "date")
     
     return JSONResponse({
         "title": result["title"],
@@ -1394,7 +1950,14 @@ async def synthesize(request: Request):
 
     # 同期的なTTS処理をスレッドで実行
     loop = asyncio.get_event_loop()
-    wav_data = await loop.run_in_executor(None, tts.synthesize, text)
+    try:
+        wav_data = await loop.run_in_executor(None, tts.synthesize, text)
+    except Exception as e:
+        logger.warning("TTS synthesis failed: %s", type(e).__name__)
+        return JSONResponse(
+            {"error": _TTS_ERROR_MESSAGE, "error_type": _INTERNAL_ERROR_CODE},
+            status_code=500,
+        )
 
     return Response(
         content=wav_data,
@@ -1425,6 +1988,8 @@ async def set_voice(request: Request):
 @app.post("/api/stt")
 async def stt_transcribe(request: Request):
     """音声データを受け取ってSTTでテキストに変換"""
+    if not _microphone_enabled():
+        return _microphone_denied_response()
     if stt is None:
         return JSONResponse({"error": "STT not available"}, status_code=503)
 
@@ -1443,7 +2008,7 @@ async def stt_transcribe(request: Request):
 
         return {"text": text}
     except Exception as e:
-        return JSONResponse({"error": f"STT error: {e}"}, status_code=500)
+        return _sensor_error_response("STT error", e)
 
 
 def _decode_wav_bytes(wav_bytes: bytes) -> "np.ndarray":
@@ -1509,7 +2074,7 @@ def _decode_webm_bytes(webm_bytes: bytes) -> "np.ndarray":
             timeout=30,
         )
         if result.returncode != 0:
-            raise RuntimeError(f"ffmpeg error: {result.stderr.decode()[:200]}")
+            raise RuntimeError("ffmpeg decode failed")
 
         audio = np.frombuffer(result.stdout, dtype=np.int16).astype(np.float32) / 32768.0
         return audio
@@ -1519,31 +2084,32 @@ def _decode_webm_bytes(webm_bytes: bytes) -> "np.ndarray":
 
 @app.get("/api/vision/status")
 async def vision_status():
-    """映像入力の状態"""
+    """映像入力の状態 (privacy-safe, allowlist のみ)。
+
+    返すのは bool / タイムスタンプ類のみ。カメラデバイス情報・感情ラベル・
+    解析カウントなどの生/派生情報は含めない。
+    """
     if vision is None:
         return {"enabled": False}
-    return {"enabled": True, **vision.get_status()}
+    try:
+        return {
+            "enabled": True,
+            **_filter_sensor_status(vision.get_status(), VISION_STATUS_ALLOWLIST),
+        }
+    except Exception as e:
+        return _sensor_error_response("Vision status unavailable", e)
 
 
 @app.get("/api/vision/snapshot")
 async def vision_snapshot():
-    """現在のカメラ画像をJPEGで取得"""
-    if vision is None or not vision.is_running:
-        return JSONResponse({"error": "Vision not available"}, status_code=503)
-
-    jpeg = vision.camera.get_jpeg(quality=75)
-    if jpeg is None:
-        return JSONResponse({"error": "No frame available"}, status_code=503)
-
-    return Response(content=jpeg, media_type="image/jpeg")
+    """廃止: 生カメラ画像 (JPEG) は未認証公開しない (固定404, データなし)。"""
+    return _sensor_disabled_response()
 
 
 @app.get("/api/vision/context")
 async def vision_context_text():
-    """現在の映像コンテキストテキスト（デバッグ用）"""
-    if vision is None:
-        return {"context": "", "enabled": False}
-    return {"context": vision.get_context_text(), "enabled": True, **vision.get_status()}
+    """廃止: デバッグ用映像コンテキストテキストは未認証公開しない (固定404, データなし)。"""
+    return _sensor_disabled_response()
 
 
 # --- Screen API (画面認識) ---
@@ -1556,27 +2122,153 @@ MAX_INGEST_BYTES = 8 * 1024 * 1024  # 8MB
 
 # ingest 用 VLM describer (遅延生成 / テストで差し替え可能)。
 screen_ingest_describer = None
-# 描写の単一飛行制御: 描写実行中に来た ingest は画像保存のみで描写はスキップ。
+# 描写の単一飛行 + シャットダウン世代ゲート (すべて _ingest_describe_lock で保護)。
 _ingest_describe_lock = threading.Lock()
-_ingest_describing = False
+# 現在実行中 worker の世代。None のとき実行中 worker なし (単一飛行)。
+_ingest_active_generation: Optional[int] = None
+# run_in_executor で提出した Future の保持。シャットダウンで cancel / bounded await する。
+_ingest_future: Optional[asyncio.Future] = None
+# 現在の受付世代。lifespan 起動で +1 して有効化、シャットダウンで +1 して revoke する。
+_ingest_generation: int = 0
+# 結果の受け付け可否。シャットダウンで False にし、実行中 worker の書き込みを revoke する。
+_ingest_accepting: bool = True
+# 実行中 worker の完了通知 (世代ごと)。_describe_ingested の finally でのみ set される。
+# asyncio の run_in_executor Future が done (cancel 済み含む) でも下位 worker が継続中
+# のことがあるため、シャットダウンはこの Event を bounded wait して完了を判定する。
+# 提出より先に登録され、提出失敗時は除去される (_stop は常に Event を見つけられる)。
+_ingest_done_events: dict[int, threading.Event] = {}
+# シャットダウン時の bounded await 上限。
+_INGEST_STOP_TIMEOUT = 5.0
 
 
-def _atomic_write_bytes(path: Path, data: bytes) -> None:
-    tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "wb") as f:
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+def _ingest_tmp_path() -> Path:
+    """latest.json と同じディレクトリの tmp パスを返す (アトミック書き込み用)。"""
+    return SCREEN_LATEST_JSON.with_name(SCREEN_LATEST_JSON.name + ".tmp")
 
 
-def _atomic_write_text(path: Path, text: str) -> None:
-    tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+def _unlink_ingest_tmp(path: Path) -> None:
+    """revoke / 準備失敗時に tmp を best-effort で破棄する (失敗は黙って無視)。"""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _remove_legacy_latest_jpg() -> None:
+    """レガシー latest.jpg を best-effort で削除する。
+
+    生JPEGは永続化しない運用のため、過去に保存された latest.jpg があれば
+    起動・停止・無効状態で削除を試みる。失敗してもパス・エラーを外部へ露出せず
+    黙って無視する。
+    """
+    try:
+        if SCREEN_LATEST_JPG.exists():
+            SCREEN_LATEST_JPG.unlink()
+    except OSError:
+        pass
+
+
+def _ingest_results_accepted(generation: int) -> bool:
+    """``generation`` の worker が結果を受け付け可能か。
+
+    シャットダウン (受付 revoke) 後は False になり、実行中 worker が latest.json を
+    書き込めなくなる。fail closed。
+    """
+    with _ingest_describe_lock:
+        return _ingest_accepting and generation == _ingest_generation
+
+
+def _start_ingest_generation() -> None:
+    """受付世代を新しく有効化する (lifespan 起動時に呼ぶ)。"""
+    global _ingest_generation, _ingest_accepting
+    with _ingest_describe_lock:
+        _ingest_generation += 1
+        _ingest_accepting = True
+
+
+def _submit_ingest_describe(loop, jpeg: bytes, received_at: float) -> bool:
+    """単一飛行で executor へ描写を提出し、Future を保持する。
+
+    受付 revoke (シャットダウン) 後は、Event/Future・単一飛行状態を一切登録する
+    前に固定の内部エラー (外部へは 503 + ``unavailable`` 固定) で拒否する。これに
+    より revoke 後の受信で ``described`` が true になることはなく、終了中の
+    ownership を汚さない。実行中 worker があるときは False (この受信では描写を
+    スキップ)。完了 Event は提出より先に世代へ登録し、提出 (``run_in_executor``)
+    が失敗したときは登録と単一飛行状態を原子的に解除して例外を再送出する
+    (固定 503 化は呼び出し側)。
+    """
+    global _ingest_active_generation, _ingest_future, _ingest_done_events
+    with _ingest_describe_lock:
+        # 受付 revoke 済み: 何も登録せずに拒否する (fail closed)。ConnectionError は
+        # 外部向け固定コード "unavailable" へ写像され、本文・型名は露出しない。
+        if not _ingest_accepting:
+            raise ConnectionError("screen ingest not accepting")
+        if _ingest_active_generation is not None:
+            return False
+        generation = _ingest_generation
+        _ingest_active_generation = generation
+        # worker は提出と同時に走り出すため、完了 Event は提出より先に登録する。
+        # 提出失敗時はここで除去する (worker 未生成なので set されない)。
+        _ingest_done_events[generation] = threading.Event()
+        try:
+            fut = loop.run_in_executor(
+                None, _describe_ingested, jpeg, received_at, generation
+            )
+        except BaseException:
+            _ingest_done_events.pop(generation, None)
+            _ingest_active_generation = None
+            raise
+        _ingest_future = fut
+    return True
+
+
+async def _stop_ingest_describe(timeout: float = _INGEST_STOP_TIMEOUT) -> None:
+    """シャットダウン時の ingest 描写停止。
+
+    1. 受付世代を revoke して、実行中 worker の latest.json 書き込みを cancel より先に止める
+    2. 保持済み Future を条件付きでキャンセル (Future が無くても完了判定は Event が権威)
+    3. 実行中 worker 本体の完了 Event を bounded wait (オフループ) する
+    4. Event が set されたときだけ ownership (単一飛行 / 保持 Future / 完了 Event) を解除する
+
+    完了の権威は active generation とその Event であり、Future は補助情報に過ぎない。
+    Future が None (提出直後の窓や barrier 相当) でも Event を bounded wait して
+    完了を待つ。``run_in_executor`` Future の done (cancel 済み含む) は下位 worker の
+    完了を保証しないため、完了判定には worker 本体の finally でのみ set される Event を
+    使う。タイムアウト時は ownership を保持し、restart / 新規 ingest が実行中の旧
+    worker と重ならないようにする。Event 待ちは lock の外 (オフループ) で行い
+    deadlock しない。
+    """
+    global _ingest_generation, _ingest_accepting, _ingest_active_generation, _ingest_future
+    global _ingest_done_events
+    with _ingest_describe_lock:
+        _ingest_accepting = False
+        _ingest_generation += 1
+        fut = _ingest_future
+        generation = _ingest_active_generation
+        event = _ingest_done_events.get(generation) if generation is not None else None
+    if fut is not None and not fut.done():
+        fut.cancel()
+    if generation is None:
+        # 実行中 worker なし → 何も待たず完了。
+        return
+    if event is not None:
+        try:
+            loop = asyncio.get_running_loop()
+            completed = await loop.run_in_executor(None, event.wait, timeout)
+        except Exception:
+            completed = False
+    else:
+        # active 世代に完了 Event が無い → 完了を Event で確認できないため ownership は
+        # 解除しない (fail safe)。worker の finally は Event set と active 解除を同一の
+        # lock 区間で行うため、この状態は本来到達しない防御分岐。
+        completed = False
+    if completed:
+        with _ingest_describe_lock:
+            if _ingest_active_generation == generation:
+                _ingest_active_generation = None
+                _ingest_future = None
+            _ingest_done_events.pop(generation, None)
+    # 未完了 (タイムアウト) なら ownership を保持したまま返る。
 
 
 def _get_ingest_describer():
@@ -1590,35 +2282,94 @@ def _get_ingest_describer():
     return screen_ingest_describer
 
 
-def _describe_ingested(jpeg: bytes, received_at: float) -> None:
-    """受信画像を VLM で 1 回描写し latest.json をアトミック書き込み。失敗はログのみ。"""
-    global _ingest_describing
+def _commit_ingest_result(generation: int, payload: dict) -> bool:
+    """最新結果をアトミックにコミットする。
+
+    latest.json.tmp への書き込み (open/write/flush/fsync) は lock の外で行い、
+    lock 区間では受付確認と os.replace だけを実行する。これにより lock をブロッキング
+    なファイル I/O の間保持しない (revoke / ``_stop`` が詰まらない)。
+
+    strict ordering: revoke (``_ingest_accepting=False`` + 世代前進) が replace より先に
+    lock を取れば最終受付確認が失敗して replace は抑止され tmp は破棄される。replace が
+    先に完了すれば revoke はコミット完了後に続き、書き込み済み結果は残る。どちらの順序
+    でも revoke 済み世代のコミットは起こらない (fail closed)。
+    """
+    tmp = _ingest_tmp_path()
     try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False))
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception:
+        _unlink_ingest_tmp(tmp)
+        raise
+    with _ingest_describe_lock:
+        if not (_ingest_accepting and generation == _ingest_generation):
+            _unlink_ingest_tmp(tmp)
+            return False
+        try:
+            os.replace(tmp, SCREEN_LATEST_JSON)
+        except Exception:
+            _unlink_ingest_tmp(tmp)
+            raise
+        return True
+
+
+def _describe_ingested(jpeg: bytes, received_at: float, generation: int) -> None:
+    """受信画像を VLM で 1 回描写し latest.json をアトミック書き込み。失敗はログのみ。
+
+    generation gate: 提出時点の世代が現在の受付世代と一致しない (シャットダウンで
+    revoke 済み) ときは描写・書き込みを行わない。実行中 worker は自分の世代と一致する
+    ときだけ単一飛行 / 保持 Future を後始末する (古い worker が新しい worker の
+    ownership を消さない)。最終 acceptance check とコミットは ``_commit_ingest_result``
+    が lock 下で原子的に行い、revoke と競合しない。
+    """
+    global _ingest_active_generation, _ingest_future, _ingest_done_events
+    try:
+        if not _ingest_results_accepted(generation):
+            logger.warning("screen ingest: シャットダウンにより描写を破棄")
+            return
         describer = _get_ingest_describer()
         description = describer.describe(jpeg)
-        if description:
-            payload = {
-                "description": description,
-                "captured_at": received_at,
-                "described_at": time.time(),
-                "source": "remote",
-            }
-            _atomic_write_text(SCREEN_LATEST_JSON, json.dumps(payload, ensure_ascii=False))
-        else:
+        if not description:
             logger.warning("screen ingest: 描写が空でした (次の ingest で再試行)")
+            return
+        payload = {
+            "description": description,
+            "captured_at": received_at,
+            "described_at": time.time(),
+            "source": "remote",
+        }
+        if not _commit_ingest_result(generation, payload):
+            logger.warning("screen ingest: シャットダウンにより描写結果を破棄")
     except Exception as e:
-        logger.warning("screen ingest describe failed: %s", e)
+        logger.warning("screen ingest describe failed: %s", type(e).__name__)
     finally:
         with _ingest_describe_lock:
-            _ingest_describing = False
+            ev = _ingest_done_events.get(generation)
+            if ev is not None:
+                ev.set()
+            if _ingest_active_generation == generation:
+                _ingest_active_generation = None
+                _ingest_future = None
+                _ingest_done_events.pop(generation, None)
 
 
 def _read_ingest_status() -> dict:
-    """latest.json の内容と鮮度を返す (ファイル無し/壊れは available=False)。"""
+    """ingest 受信状況を返す (privacy-safe)。
+
+    screen_ingest が無効のときは {"enabled": False} を返し、latest.json の古い
+    描写を available として露出しない。有効時のみ latest.json の鮮度と出所を返す。
+    env 名・token 値は含めず、token_configured boolean は ingest 有効時のみ残す。
+    VLM 描写テキスト (description) ・生JPEG (latest.jpg) は含めない・保持しない。
+    """
+    if sensor_policy is None or not sensor_policy.screen_ingest:
+        _remove_legacy_latest_jpg()
+        return {"enabled": False}
     token_configured = bool(os.environ.get("SCREEN_INGEST_TOKEN"))
     info = {
+        "enabled": True,
         "token_configured": token_configured,
-        "jpg_exists": SCREEN_LATEST_JPG.exists(),
         "available": False,
     }
     try:
@@ -1627,10 +2378,9 @@ def _read_ingest_status() -> dict:
             captured_at = float(data.get("captured_at") or 0.0)
             info.update({
                 "available": True,
-                "description": data.get("description", ""),
                 "captured_at": captured_at,
                 "described_at": data.get("described_at"),
-                "source": data.get("source", "remote"),
+                "source": "remote",
                 "age_seconds": (time.time() - captured_at) if captured_at > 0 else None,
             })
     except Exception:
@@ -1640,28 +2390,46 @@ def _read_ingest_status() -> dict:
 
 @app.get("/api/screen/status")
 async def screen_status():
-    """画面認識の状態 (local/remote いずれも)。remote の latest.json 鮮度も返す。"""
+    """画面認識の状態 (privacy-safe, allowlist のみ)。
+
+    local (自機キャプチャ) は bool / タイムスタンプ / ソース種別のみを返し、
+    VLM 描写テキスト・モデル名は含めない。remote (ingest) の鮮度も同様。
+    """
     result: dict = {"enabled": screen is not None}
     if screen is not None:
-        result["context"] = screen.get_context_text()
-        result.update(screen.get_status())
+        try:
+            result["source"] = "local"
+            result.update(
+                _filter_sensor_status(screen.get_status(), SCREEN_STATUS_ALLOWLIST)
+            )
+        except Exception as e:
+            return _sensor_error_response("Screen status unavailable", e)
     # リモート push (ingest) の受信状況は screen コンテキストの有無に関わらず返す
     result["ingest"] = _read_ingest_status()
     return result
 
 
+@app.get("/api/screen/context")
+async def screen_context_text():
+    """廃止: デバッグ用画面コンテキストテキストは未認証公開しない (固定404, データなし)。"""
+    return _sensor_disabled_response()
+
+
 @app.post("/api/screen/ingest")
 async def screen_ingest(request: Request):
-    """メインPC のキャプチャエージェントから生 JPEG を受信して保存・描写する。
+    """メインPC のキャプチャエージェントから生 JPEG を受信して描写する。
 
-    認証: env SCREEN_INGEST_TOKEN と X-Screen-Token ヘッダの一致 (compare_digest)。
-          env 未設定なら常に 403 (安全側デフォルト)。
+    認証: 共有 SensorPolicy.screen_ingest が有効で、かつ env SCREEN_INGEST_TOKEN と
+          X-Screen-Token ヘッダが一致すること (compare_digest)。policy が無効のときは
+          token があっても body を読まずに 403 (安全側デフォルト)。
     ボディ: 生 JPEG バイト (Content-Type: image/jpeg)。上限 8MB。
     レスポンス: 200 {"ok": true, "described": <この受信で描写を開始したか>}
     """
+    if sensor_policy is None or not sensor_policy.screen_ingest:
+        return JSONResponse({"error": "forbidden"}, status_code=403)
     token = os.environ.get("SCREEN_INGEST_TOKEN")
     if not token:
-        return JSONResponse({"error": "ingest disabled (SCREEN_INGEST_TOKEN unset)"}, status_code=403)
+        return JSONResponse({"error": "forbidden"}, status_code=403)
     provided = request.headers.get("X-Screen-Token", "")
     if not secrets.compare_digest(provided, token):
         return JSONResponse({"error": "forbidden"}, status_code=403)
@@ -1680,21 +2448,21 @@ async def screen_ingest(request: Request):
 
     received_at = time.time()
     try:
+        # 生JPEGは保存せず、describer へ bytes を渡す。latest.json 出力用の
+        # ディレクトリだけ用意する。
         SCREEN_DIR.mkdir(parents=True, exist_ok=True)
-        _atomic_write_bytes(SCREEN_LATEST_JPG, body)
     except Exception as e:
-        return JSONResponse({"error": f"save failed: {e}"}, status_code=500)
+        return _sensor_error_response("screen ingest save failed", e)
 
-    # 単一飛行: 描写実行中でなければ開始 (実行中なら画像保存のみでスキップ)
-    global _ingest_describing
-    started = False
-    with _ingest_describe_lock:
-        if not _ingest_describing:
-            _ingest_describing = True
-            started = True
-    if started:
-        loop = asyncio.get_event_loop()
-        loop.run_in_executor(None, _describe_ingested, body, received_at)
+    # 単一飛行で executor へ提出し Future を保持する (実行中なら描写はスキップ)。
+    # 提出が失敗したら単一飛行状態は原子的に解除され、固定 503 を返す (生例外は露出しない)。
+    loop = asyncio.get_event_loop()
+    try:
+        started = _submit_ingest_describe(loop, body, received_at)
+    except Exception as e:
+        return _sensor_error_response(
+            "screen ingest describe submit failed", e, status_code=503
+        )
 
     return {"ok": True, "described": started}
 
@@ -1703,26 +2471,34 @@ async def screen_ingest(request: Request):
 
 @app.get("/api/monitor/status")
 async def monitor_status():
-    """PCモニターの状態"""
+    """PCモニターの状態 (privacy-safe, allowlist のみ)。
+
+    bool / タイムスタンプ / source (固定 "monitor") のみを返し、CPU/メモリ/GPU/
+    ディスク等のメトリクス集計値・プロセス数・レコード数・DB パス・エラー・
+    本文テキストは含めない。
+    """
     if monitor is None:
         return {"enabled": False}
-    return {"enabled": True, **monitor.get_status()}
+    try:
+        return {
+            "enabled": True,
+            "source": "monitor",
+            **_filter_sensor_status(monitor.get_status(), MONITOR_STATUS_ALLOWLIST),
+        }
+    except Exception as e:
+        return _sensor_error_response("Monitor status unavailable", e)
 
 
 @app.get("/api/monitor/context")
 async def monitor_context_text():
-    """現在のPCモニターコンテキストテキスト（デバッグ用）"""
-    if monitor is None:
-        return {"context": "", "enabled": False}
-    return {"context": monitor.get_context_text(), "enabled": True}
+    """廃止: デバッグ用PCモニターコンテキストテキストは未認証公開しない (固定404, データなし)。"""
+    return _sensor_disabled_response()
 
 
 @app.get("/api/monitor/summary")
 async def monitor_summary(minutes: int = 60):
-    """直近N分のメトリクスサマリー"""
-    if monitor is None:
-        return JSONResponse({"error": "Monitor not available"}, status_code=503)
-    return monitor.get_recent_summary(minutes=minutes)
+    """廃止: 直近N分のメトリクスサマリーは未認証公開しない (固定404, データなし)。"""
+    return _sensor_disabled_response()
 
 
 # --- Persona API (Phase 7) ---
@@ -1804,6 +2580,22 @@ async def idle_status():
     if idle_manager is None:
         return {"enabled": False}
     return {"enabled": True, **idle_manager.get_status()}
+
+
+# --- Companion API ---
+
+def _companion_state_payload() -> dict:
+    """GET /api/companion/state のレスポンス (読み取り専用・privacy-safe)。
+
+    src.perception.bootstrap の共通 helper へ委譲する。
+    """
+    return companion_state_payload(activity_runtime)
+
+
+@app.get("/api/companion/state")
+async def companion_state():
+    """コンパニオン活動状態 (読み取り専用)。未オプトイン時は enabled=false。"""
+    return _companion_state_payload()
 
 
 # --- ログ管理 API ---
@@ -1917,6 +2709,23 @@ async def history_session_delete(filename: str):
 
 # --- WebSocket チャット ---
 
+# ストリーミング失敗の中立なエラーメッセージ。URL・APIキーなど秘密情報を
+# クライアントへ露出しない (詳細はサーバーログのみに残す)。
+_STREAM_TIMEOUT_MESSAGE = "応答の生成がタイムアウトしました。もう一度お試しください。"
+_STREAM_EMPTY_MESSAGE = "応答を生成できませんでした。もう一度お試しください。"
+_STREAM_ERROR_MESSAGE = "応答の生成に失敗しました。もう一度お試しください。"
+_TTS_ERROR_MESSAGE = "TTS error"
+_INTERNAL_ERROR_CODE = "internal_error"
+
+
+class _StreamError(Exception):
+    """ストリーミング失敗。中立なユーザー向けメッセージと内部詳細を保持する。"""
+
+    def __init__(self, message: str, *, detail: BaseException | None = None) -> None:
+        super().__init__(message)
+        self.detail = detail
+
+
 def _extraction_enabled() -> bool:
     """TASKS_CHAT_EXTRACTION_ENABLED は既定 true。無効化は "false" のみ。"""
     val = os.environ.get("TASKS_CHAT_EXTRACTION_ENABLED", "").strip().lower()
@@ -1963,7 +2772,7 @@ def _extraction_timeout_seconds() -> float:
 
 
 def _extract_task_candidates(user_text: str) -> list[dict]:
-    """人格会話とは分離した低温度JSON抽出。失敗時は空配列。"""
+    """人格会話とは分離した低温度JSON抽出。生成設定を保つためServiceを通さない。"""
     if not _extraction_enabled() or task_store is None or llm is None or config is None:
         return []
     # 秘密らしい文字列をモデルへ渡さない。抽出後タイトルもvalidatorで再検査する。
@@ -2130,8 +2939,8 @@ async def _send_direct_chat_reply(
     session.add_assistant_message(reply, store_memory=store_memory)
     try:
         session.save()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("session save failed: %s", type(e).__name__)
     await websocket.send_json({"type": "token", "content": reply})
     await websocket.send_json({"type": "done", "full_text": reply})
     if want_tts and tts is not None:
@@ -2144,9 +2953,11 @@ async def _send_direct_chat_reply(
                 "data": base64.b64encode(wav_data).decode("ascii"),
             })
         except Exception as e:
+            logger.warning("TTS synthesis failed: %s", type(e).__name__)
             await websocket.send_json({
                 "type": "error",
-                "message": f"TTS error: {e}",
+                "message": _TTS_ERROR_MESSAGE,
+                "error_type": _INTERNAL_ERROR_CODE,
             })
 
 
@@ -2160,6 +2971,12 @@ def _effective_system_prompt(cfg) -> str:
     if callable(fn):
         return fn()
     return cfg.system_prompt
+
+
+def _start_assistant_stream(request, blocks, *, base_system):
+    """経路選択からQueue worker開始までを同期的に行う。"""
+    stream = assistant_service.respond_stream(request, blocks, base_system=base_system)
+    return stream_to_queue(stream)
 
 
 def _new_chat_session() -> ChatSession:
@@ -2196,13 +3013,23 @@ def _messages_for_resume(session: ChatSession) -> list[dict]:
     return out
 
 
+def _new_web_session_id() -> str:
+    """衝突耐性のある新規WebチャットセッションIDを返す。
+
+    可読性のため ``web_`` プレフィックスとミリ秒時刻を残しつつ、同一ミリ秒でも
+    衝突しないよう stdlib ``secrets`` の乱数サフィックスを付与する。ユーザー/IP等
+    からは導出しない (nonsecret)。
+    """
+    return f"web_{int(time.time() * 1000)}_{secrets.token_hex(4)}"
+
+
 @app.get("/api/chat/resume")
 async def chat_resume(session_id: str | None = None):
     """直近の会話を引き継ぐためのセッション情報を返す。
 
     - session_id 指定かつ安全: そのIDで復元 (不在なら空セッション、新IDは発行しない)
       不正ID: 400
-    - 指定なし: 最新の有効履歴を引き継ぐ。無ければ新しい web_<ms> ID を発行
+    - 指定なし: 最新の有効履歴を引き継ぐ。無ければ新しい web_<ms>_<rand> ID を発行
     """
     history_dir = _history_dir_path()
 
@@ -2220,8 +3047,8 @@ async def chat_resume(session_id: str | None = None):
             session = get_or_create_session(str(latest_id))
             return {"session_id": session.session_id, "messages": _messages_for_resume(session)}
 
-    # 保存IDも履歴も無い初回 → 新ID発行
-    new_id = f"web_{int(time.time() * 1000)}"
+    # 保存IDも履歴も無い初回 → 新ID発行 (衝突耐性)
+    new_id = _new_web_session_id()
     return {"session_id": new_id, "messages": []}
 
 
@@ -2263,7 +3090,7 @@ def get_or_create_session(session_id: str) -> ChatSession:
             sessions[session_id] = session
             return session
         except Exception as e:
-            logger.warning("session load failed for %s: %s", session_id, e)
+            logger.warning("session load failed: %s", type(e).__name__)
 
     session = _new_chat_session()
     session.session_id = session_id
@@ -2292,6 +3119,7 @@ async def websocket_chat(websocket: WebSocket):
 
     try:
         while True:
+            queue_stream = None
             raw = await websocket.receive_text()
             data = json.loads(raw)
             inference_started = False
@@ -2315,6 +3143,12 @@ async def websocket_chat(websocket: WebSocket):
             if msg_type == "audio_message":
                 audio_b64 = data.get("data", "")
                 audio_format = data.get("format", "wav")
+                if not _microphone_enabled():
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "マイク入力は許可されていません。",
+                    })
+                    continue
                 if not audio_b64 or stt is None:
                     await websocket.send_json({
                         "type": "error",
@@ -2374,7 +3208,8 @@ async def websocket_chat(websocket: WebSocket):
                         inference_started = False
                     await websocket.send_json({
                         "type": "error",
-                        "message": f"STT error: {e}",
+                        "message": "STT error",
+                        "error_type": sensor_error_code(e),
                     })
                     continue
 
@@ -2425,7 +3260,7 @@ async def websocket_chat(websocket: WebSocket):
 
             session = get_or_create_session(session_id)
             session.add_user_message(user_text)
-            messages = session.build_messages()
+            blocks = session.build_blocks()
 
             # ストリーミング応答生成
             loop = asyncio.get_event_loop()
@@ -2437,29 +3272,40 @@ async def websocket_chat(websocket: WebSocket):
 
             try:
                 # queue ベースのリアルタイムストリーミング
-                token_queue = llm.generate_stream_queue(
-                    messages,
-                    temperature=config.temperature,
-                    top_p=config.top_p,
-                    top_k=config.top_k,
-                    repeat_penalty=config.repeat_penalty,
-                    num_ctx=config.num_ctx,
-                    num_predict=config.num_predict,
+                # _start_assistant_stream内でassistant_service.respond_stream(
+                # request, blocks)とQueue worker開始を同じthread上で行う。
+                request = AssistantRequest(
+                    text=user_text,
+                    conversation_id=session_id,
+                    channel="web",
+                    privacy="local_only",
                 )
+                queue_stream = await asyncio.to_thread(
+                    _start_assistant_stream, request, blocks,
+                    base_system=session.system_prompt,
+                )
+                token_queue = queue_stream.queue
 
                 while True:
                     try:
                         token = await asyncio.get_event_loop().run_in_executor(
                             None, token_queue.get, True, 300.0
                         )
-                    except Exception:
-                        break
+                    except queue.Empty:
+                        # ブロッキングgetのタイムアウト。中立なタイムアウトエラーとして
+                        # 扱い、外側のハンドラにtype=error送出・cancel・巻き戻しを任せる。
+                        raise _StreamError(_STREAM_TIMEOUT_MESSAGE)
+                    # queue.Empty 以外の get/executor 例外は握り潰さず伝播させる。
 
                     if token is None:
-                        # ストリーム終了
+                        # ストリーム終了。1tokenも得られずに終了した場合は、空応答の
+                        # 正常契約が無いためエラーとして扱う。
+                        if not full_response:
+                            raise _StreamError(_STREAM_EMPTY_MESSAGE)
                         break
                     if isinstance(token, Exception):
-                        raise token
+                        # Provider例外 (sentinel)。詳細はログへ、文言は中立にする。
+                        raise _StreamError(_STREAM_ERROR_MESSAGE, detail=token)
 
                     piece = emo_filter.feed(token) if emo_filter is not None else token
                     if not piece:
@@ -2474,7 +3320,7 @@ async def websocket_chat(websocket: WebSocket):
                     session.save()
                     history_admin.prune_sessions(_history_dir(), _history_max_files())
                 except Exception as e:
-                    logger.warning("会話履歴の保存に失敗: %s", e)
+                    logger.warning("会話履歴の保存に失敗: %s", type(e).__name__)
 
                 await websocket.send_json({
                     "type": "done",
@@ -2506,20 +3352,35 @@ async def websocket_chat(websocket: WebSocket):
                             "data": audio_b64,
                         })
                     except Exception as e:
+                        logger.warning("TTS synthesis failed: %s", type(e).__name__)
                         await websocket.send_json({
                             "type": "error",
-                            "message": f"TTS error: {e}",
+                            "message": _TTS_ERROR_MESSAGE,
+                            "error_type": _INTERNAL_ERROR_CODE,
                         })
 
-            except Exception as e:
+            except _StreamError as e:
+                logger.warning(
+                    "chat stream failed: %s",
+                    type(e.detail).__name__ if e.detail is not None else type(e).__name__,
+                )
                 await websocket.send_json({
                     "type": "error",
                     "message": str(e),
                 })
                 # ユーザーメッセージを巻き戻す
-                if session._messages and session._messages[-1]["role"] == "user":
-                    session._messages.pop()
+                session.rollback_last_user_message()
+            except Exception as e:
+                logger.warning("chat stream failed: %s", type(e).__name__)
+                await websocket.send_json({
+                    "type": "error",
+                    "message": _STREAM_ERROR_MESSAGE,
+                })
+                # ユーザーメッセージを巻き戻す
+                session.rollback_last_user_message()
             finally:
+                if queue_stream is not None:
+                    queue_stream.cancel()
                 if idle_manager is not None and inference_started:
                     idle_manager.notify_inference_end()
                     inference_started = False

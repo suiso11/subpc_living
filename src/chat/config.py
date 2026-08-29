@@ -8,6 +8,108 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import json
 
+from src.llm.local_endpoint import validate_loopback_openai_base_url
+
+
+# ローカル推論 backend (P0-2) の取り得る kind。
+LOCAL_PROVIDER_KINDS: tuple[str, ...] = ("ollama", "openai_compatible")
+
+# openai_compatible 選択時に ``local_base_url`` が空だった場合の慣用既定エンドポイント。
+# llama.cpp 系サーバーの慣用値であり、検証済みの実サーバー既定ではない。
+LOCAL_OPENAI_DEFAULT_BASE_URL = "http://localhost:8080/v1"
+
+_PROVIDER_ID_BY_KIND = {"ollama": "ollama", "openai_compatible": "local-openai"}
+
+
+def validate_local_provider_kind(config) -> str:
+    """``local_provider_kind`` を正規化して返す。
+
+    ``None`` と見なされる欠落は後方互換のため ``"ollama"`` へ正規化する
+    (``usage.md``: 無設定時は従来どおり Ollama)。空または空白のみの文字列も
+    ``"ollama"`` へ正規化する。``str`` / ``None`` 以外の型 (int / list / bool など)
+    は設定ミスとして ``ValueError`` で明示的に拒否する。未知の文字列値は
+    ``ValueError``。
+    """
+    raw = getattr(config, "local_provider_kind", "ollama")
+    if raw is None:
+        raw = ""
+    elif not isinstance(raw, str):
+        raise ValueError(
+            "invalid local_provider_kind: "
+            f"{raw!r}; expected a string (or None for the default)"
+        )
+    kind = raw.strip()
+    if not kind:
+        kind = "ollama"
+    if kind not in LOCAL_PROVIDER_KINDS:
+        raise ValueError(
+            "unknown local_provider_kind: "
+            f"{kind!r}; expected one of {', '.join(LOCAL_PROVIDER_KINDS)}"
+        )
+    return kind
+
+
+def resolve_local_provider_id(config) -> str:
+    """ローカルbackendの実 provider_id を返す。
+
+    ``local_provider_id`` が明示されていればそれを、空なら kind 別既定
+    (``"ollama"`` / ``"local-openai"``) を返す。
+    """
+    kind = validate_local_provider_kind(config)
+    explicit = (getattr(config, "local_provider_id", "") or "").strip()
+    if explicit:
+        return explicit
+    return _PROVIDER_ID_BY_KIND[kind]
+
+
+def validate_local_base_url(url: str) -> str:
+    """openai_compatible の ``local_base_url`` を厳格に検証し、検証済みURLを返す。
+
+    このマイルストーンでは送信先を**同一マシンのloopback**に限定する。``local=True``
+    で登録されたproviderはcloudの承認・redactionセマンティクスを受けないため、
+    任意のLAN / 公開 / 曖昧なhost名を許すと、クラウド経路の保護を迂回して
+    機密情報を送信できる境界を生む。
+
+    検証ロジックは ``src.llm.local_endpoint`` の共通validator
+    (``validate_loopback_openai_base_url``) へ委譲し、provider側と同一の
+    ルールを共有する。違反時は ``ValueError``。リモートの信頼済みノード
+    (LAN / VPN / 公開) 対応は別途の明示的な信頼設計が必要なため、
+    本マイルストーンでは deferred。
+    """
+    return validate_loopback_openai_base_url(url)
+
+
+def resolve_local_base_url(config) -> str:
+    """ローカルbackendの実 base URL を返す。
+
+    Ollama は従来の ``ollama_base_url`` を常に尊重する (後方互換)。
+    openai_compatible は ``local_base_url`` を優先し、空なら llama.cpp 慣用の
+    ``LOCAL_OPENAI_DEFAULT_BASE_URL`` を使う。これは実サーバーの検証済み既定では
+    なく、設定未指定時の慣用値である。openai_compatible は返す前に
+    ``validate_local_base_url`` でloopback限定の厳格検証を受ける。
+    """
+    kind = validate_local_provider_kind(config)
+    if kind == "ollama":
+        return getattr(config, "ollama_base_url", "http://localhost:11434")
+    local_base_url = (getattr(config, "local_base_url", "") or "").strip()
+    resolved = local_base_url or LOCAL_OPENAI_DEFAULT_BASE_URL
+    return validate_local_base_url(resolved)
+
+
+def resolve_local_api_key(config) -> str | None:
+    """openai_compatible かつ ``local_api_key_env`` 指定時のみ、実行時に環境変数からキーを解決する。
+
+    キー自体はコード・設定・ログへ保持しない。Ollama 時、env 名未指定、または
+    環境変数が未設定のときは ``None`` を返す。
+    """
+    kind = validate_local_provider_kind(config)
+    if kind != "openai_compatible":
+        return None
+    env_name = (getattr(config, "local_api_key_env", "") or "").strip()
+    if not env_name:
+        return None
+    return os.environ.get(env_name) or None
+
 
 @dataclass
 class ChatConfig:
@@ -16,6 +118,16 @@ class ChatConfig:
     # --- Ollama接続設定 ---
     ollama_base_url: str = "http://localhost:11434"
     model: str = "qwen2.5:7b-instruct-q4_K_M"
+
+    # --- ローカル推論 backend 選択 (P0-2) ---
+    # local_provider_kind: "ollama" (既定) または "openai_compatible"
+    local_provider_kind: str = "ollama"
+    # 空なら backend 既定。Ollama は従来の ollama_base_url を引き続き尊重する
+    local_base_url: str = ""
+    # 空なら kind 別既定 ("ollama" / "local-openai")
+    local_provider_id: str = ""
+    # 環境変数名のみ。キー自体は保存しない
+    local_api_key_env: str = ""
 
     # --- 生成パラメータ ---
     temperature: float = 0.7
@@ -77,6 +189,28 @@ class ChatConfig:
         if target and target in self.model_prompt_overrides:
             return self.model_prompt_overrides[target]
         return self.system_prompt
+
+    def validate_local_provider(self) -> None:
+        """ローカルbackend設定を検証する。
+
+        未知 kind は ``ValueError``。openai_compatible は加えて
+        ``local_base_url`` (既定含む) がloopback限定のURLであることを検証する。
+        """
+        kind = validate_local_provider_kind(self)
+        if kind == "openai_compatible":
+            validate_local_base_url(self.resolved_local_base_url())
+
+    def resolved_local_provider_id(self) -> str:
+        """実 provider_id。未指定なら kind 別既定 ("ollama" / "local-openai")。"""
+        return resolve_local_provider_id(self)
+
+    def resolved_local_base_url(self) -> str:
+        """実 base URL。Ollama は ``ollama_base_url`` (後方互換)、openai_compatible は ``local_base_url`` か慣用既定。"""
+        return resolve_local_base_url(self)
+
+    def resolve_local_api_key(self) -> str | None:
+        """openai_compatible かつ ``local_api_key_env`` 指定時のみ、実行時に環境変数からキーを返す。"""
+        return resolve_local_api_key(self)
 
     @staticmethod
     def _atomic_write(path: Path, payload: bytes) -> None:

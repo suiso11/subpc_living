@@ -1,0 +1,7 @@
+{
+  "local_provider_kind": "openai_compatible",
+  "local_base_url": "http://localhost:8080/v1",
+  "local_provider_id": "",
+  "local_api_key_env": "",
+  "model": "<local-model-id>"
+}

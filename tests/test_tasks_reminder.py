@@ -11,7 +11,7 @@ from src.tasks.reminder import (
     in_quiet_hours,
     parse_quiet_hours,
 )
-from src.tasks.store import TaskStore
+from src.tasks.store import TaskStore, from_iso
 
 UTC = timezone.utc
 
@@ -163,6 +163,189 @@ class ReminderEngineTest(unittest.TestCase):
         eng2 = _engine(self.store, fired2)
         self.assertEqual(eng2.run_once(now), 0)
         self.assertEqual(fired2, [])
+
+    # --- rev によるレース防御 ---
+
+    def test_engine_passes_claimed_rev_to_record(self) -> None:
+        now = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+        due = now + timedelta(hours=2)
+        self.store.add("t", due_at=due, due_granularity="datetime", now=now)
+        seen: list = []
+        real = self.store.record_notification
+
+        def spy(task_id, owner, **kw):
+            seen.append(kw.get("expected_rev"))
+            return real(task_id, owner, **kw)
+
+        self.store.record_notification = spy
+        fired: list = []
+        eng = _engine(self.store, fired)
+        self.assertEqual(eng.run_once(now), 1)
+        self.assertEqual(seen, [0])
+
+    def test_concurrent_done_before_callback_skips(self) -> None:
+        now = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+        due = now + timedelta(hours=2)
+        tid = self.store.add("t", due_at=due, due_granularity="datetime", now=now)
+        real = self.store.revalidate_notification_lease
+
+        def fake(task_id, owner, expected_rev, **kw):
+            self.store.done(task_id, now=now)  # 再検証直前に並行 done
+            return real(task_id, owner, expected_rev, **kw)
+
+        self.store.revalidate_notification_lease = fake
+        fired: list = []
+        eng = _engine(self.store, fired)
+        self.assertEqual(eng.run_once(now), 0)
+        self.assertEqual(fired, [])  # 発火しない
+        self.assertEqual(self.store.get(tid)["status"], "done")
+
+    def test_concurrent_update_before_callback_skips(self) -> None:
+        now = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+        due = now + timedelta(hours=2)
+        self.store.add("t", due_at=due, due_granularity="datetime", now=now)
+        real = self.store.revalidate_notification_lease
+
+        def fake(task_id, owner, expected_rev, **kw):
+            self.store.update(task_id, title="変更", now=now)
+            return real(task_id, owner, expected_rev, **kw)
+
+        self.store.revalidate_notification_lease = fake
+        fired: list = []
+        eng = _engine(self.store, fired)
+        self.assertEqual(eng.run_once(now), 0)
+        self.assertEqual(fired, [])  # 無効化されたのでスキップ
+
+    def test_callback_then_concurrent_done_does_not_overwrite(self) -> None:
+        now = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+        due = now + timedelta(hours=2)
+        tid = self.store.add("t", due_at=due, due_granularity="datetime", now=now)
+        fired: list = []
+
+        def cb(**k):
+            fired.append(k)
+            self.store.done(tid, now=now)  # コールバック中の並行 done
+
+        eng = TaskReminderEngine(
+            self.store, cb, owner="test", timezone_name="UTC",
+            quiet_hours=(0, 0), now_fn=lambda: now,
+        )
+        self.assertEqual(eng.run_once(now), 1)
+        self.assertEqual(len(fired), 1)
+        self.assertEqual(self.store.get(tid)["status"], "done")
+        # done がクリアした通知状態を record が上書きしていない
+        with self.store._tx() as conn:
+            n = conn.execute(
+                "SELECT next_notify_at, last_stage FROM task_notifications WHERE task_id = ?",
+                (tid,),
+            ).fetchone()
+        self.assertIsNone(n["next_notify_at"])
+        self.assertIsNone(n["last_stage"])
+        # 再評価しても再発火しない (done)
+        self.assertEqual(eng.run_once(now), 0)
+
+    def test_callback_then_concurrent_drop_does_not_overwrite(self) -> None:
+        now = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+        due = now + timedelta(hours=2)
+        tid = self.store.add("t", due_at=due, due_granularity="datetime", now=now)
+        fired: list = []
+
+        def cb(**k):
+            fired.append(k)
+            self.store.drop(tid, now=now)  # コールバック中の並行 drop
+
+        eng = TaskReminderEngine(
+            self.store, cb, owner="test", timezone_name="UTC",
+            quiet_hours=(0, 0), now_fn=lambda: now,
+        )
+        self.assertEqual(eng.run_once(now), 1)
+        self.assertEqual(len(fired), 1)
+        self.assertEqual(self.store.get(tid)["status"], "dropped")
+        with self.store._tx() as conn:
+            n = conn.execute(
+                "SELECT next_notify_at FROM task_notifications WHERE task_id = ?", (tid,)
+            ).fetchone()
+        self.assertIsNone(n["next_notify_at"])
+        self.assertEqual(eng.run_once(now), 0)
+
+    def test_callback_then_concurrent_snooze_does_not_overwrite(self) -> None:
+        now = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+        due = now + timedelta(hours=2)
+        tid = self.store.add("t", due_at=due, due_granularity="datetime", now=now)
+        fired: list = []
+        until = now + timedelta(hours=10)
+
+        def cb(**k):
+            fired.append(k)
+            self.store.snooze(tid, until, now=now)  # コールバック中の並行 snooze
+
+        eng = TaskReminderEngine(
+            self.store, cb, owner="test", timezone_name="UTC",
+            quiet_hours=(0, 0), now_fn=lambda: now,
+        )
+        self.assertEqual(eng.run_once(now), 1)
+        self.assertEqual(len(fired), 1)
+        # snooze が設定した次回通知を record が上書きしていない
+        with self.store._tx() as conn:
+            n = conn.execute(
+                "SELECT next_notify_at, snoozed_until FROM task_notifications WHERE task_id = ?",
+                (tid,),
+            ).fetchone()
+        self.assertEqual(from_iso(n["snoozed_until"]), until)
+        self.assertEqual(from_iso(n["next_notify_at"]), until)
+        # snooze 中は再発火しない
+        self.assertEqual(eng.run_once(now), 0)
+
+    def test_callback_then_concurrent_update_does_not_overwrite(self) -> None:
+        now = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+        due = now + timedelta(hours=2)
+        tid = self.store.add("t", due_at=due, due_granularity="datetime", now=now)
+        fired: list = []
+
+        def cb(**k):
+            fired.append(k)
+            self.store.update(tid, title="変更", now=now)  # rev 0→1
+
+        eng = TaskReminderEngine(
+            self.store, cb, owner="test", timezone_name="UTC",
+            quiet_hours=(0, 0), now_fn=lambda: now,
+        )
+        self.assertEqual(eng.run_once(now), 1)
+        self.assertEqual(len(fired), 1)
+        # 古い rev の record は拒否され、更新後タスクの通知状態を上書きしない
+        with self.store._tx() as conn:
+            n = conn.execute(
+                "SELECT next_notify_at, last_stage FROM task_notifications WHERE task_id = ?",
+                (tid,),
+            ).fetchone()
+        self.assertIsNone(n["next_notify_at"])
+        self.assertIsNone(n["last_stage"])
+        # rev が変わったので、次回評価で改めて claim され直す
+        self.assertEqual(eng.run_once(now), 1)
+        self.assertEqual(len(fired), 2)
+
+    def test_concurrent_done_via_second_connection(self) -> None:
+        now = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+        due = now + timedelta(hours=2)
+        tid = self.store.add("t", due_at=due, due_granularity="datetime", now=now)
+        store2 = TaskStore(db_path=self.db_path, timezone_name="UTC").initialize()
+        try:
+            fired: list = []
+
+            def cb(**k):
+                fired.append(k)
+                store2.done(tid, now=now)  # 別接続から並行 done
+
+            eng = TaskReminderEngine(
+                self.store, cb, owner="test", timezone_name="UTC",
+                quiet_hours=(0, 0), now_fn=lambda: now,
+            )
+            self.assertEqual(eng.run_once(now), 1)
+            self.assertEqual(len(fired), 1)
+            self.assertEqual(self.store.get(tid)["status"], "done")
+            self.assertEqual(eng.run_once(now), 0)
+        finally:
+            store2.close()
 
 
 if __name__ == "__main__":

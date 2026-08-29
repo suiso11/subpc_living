@@ -29,6 +29,19 @@ class VoiceTTSError(RuntimeError):
     """Raised for user-facing voice TTS failures."""
 
 
+# last_error に設定する固定型コード。生の例外テキストはログ / slash reply /
+# status へ一切載せない。
+VOICE_TTS_ERR_PLAYBACK = "playback_failed"
+VOICE_TTS_ERR_AUTOREAD = "autoread_failed"
+
+_KNOWN_TTS_ERR_CODES = frozenset({VOICE_TTS_ERR_PLAYBACK, VOICE_TTS_ERR_AUTOREAD})
+
+
+def safe_tts_last_error(value: str) -> str:
+    """last_error は既知の固定コードだけ表示し、未知の文字列は '-' に落とす。"""
+    return value if value in _KNOWN_TTS_ERR_CODES else "-"
+
+
 def _parse_bool(value: str | None, default: bool) -> bool:
     if value is None or not value.strip():
         return default
@@ -198,16 +211,22 @@ class VoiceTTSPlayer:
             except asyncio.TimeoutError:
                 voice_client.stop()
                 raise VoiceTTSError("再生がタイムアウトしました。")
+            except asyncio.CancelledError:
+                try:
+                    voice_client.stop()
+                except Exception:
+                    pass
+                raise
 
             if play_error:
-                self.last_error = str(play_error[0])
-                raise VoiceTTSError(f"再生エラー: {play_error[0]}")
+                self.last_error = VOICE_TTS_ERR_PLAYBACK
+                raise VoiceTTSError("音声再生中にエラーが発生しました。")
 
         self.played_count += 1
         return duration
 
     async def autoread(self, text: str, emotion: str | None = None) -> None:
-        """Best-effort auto readout for LLM replies; never raises."""
+        """Best-effort auto readout for LLM replies; cancellation propagates."""
         if not self.autoread_enabled:
             return
         voice_client = self._get_voice_client()
@@ -215,6 +234,8 @@ class VoiceTTSPlayer:
             return
         try:
             await self.say(text, emotion=emotion)
-        except Exception as exc:
-            self.last_error = str(exc)
-            print(f"[DiscordVoiceTTS] autoread failed: {exc}")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.last_error = VOICE_TTS_ERR_AUTOREAD
+            print("[DiscordVoiceTTS] autoread failed")

@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 from zoneinfo import ZoneInfo
 
+from src.tasks.formatting import format_short_due
+
 if TYPE_CHECKING:
     from src.tasks.store import TaskStore
 
@@ -437,7 +439,7 @@ def format_focus_decision(decision: Optional[FocusDecision], tz: ZoneInfo) -> st
     hint = str(task.get("action_hint") or "").strip()
     lines.append(f"最初の{decision.focus_minutes}分: {hint or '完了条件を小さく決めて着手'}")
     if decision.next_event_at is not None:
-        event_time = decision.next_event_at.astimezone(tz).strftime("%-m/%-d %H:%M")
+        event_time = format_short_due(decision.next_event_at.astimezone(tz), with_time=True)
         lines.append(f"次の予定: {event_time} {decision.next_event_title}")
     momentum = f"今日{decision.completed_today}件完了"
     if decision.streak_days:

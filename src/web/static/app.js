@@ -17,6 +17,27 @@ let secureWebUrl = '';
 
 const SESSION_STORAGE_KEY = 'subpc_chat_session_id';
 
+// 衝突耐性のあるブラウザ生成セッションIDを返す (nonsecret)。
+// サーバー側の安全ID検証 (^[\w.-]{1,128}$) に適合する web_<ms>_<hex> 形式を保つ。
+// ユーザー/IPからは導出しない。crypto.getRandomValues を優先し、利用不可時は
+// 乱数 fallback で16桁のhexを生成する (同一ミリ秒でも衝突しにくい)。
+function newWebSessionId() {
+  const hex = (() => {
+    try {
+      const bytes = new Uint8Array(8);
+      crypto.getRandomValues(bytes);
+      return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+    } catch (e) {
+      let fallback = '';
+      for (let i = 0; i < 16; i++) {
+        fallback += Math.floor(Math.random() * 16).toString(16);
+      }
+      return fallback;
+    }
+  })();
+  return `web_${Date.now()}_${hex}`;
+}
+
 // --- 音声録音状態 ---
 let mediaRecorder = null;
 let audioChunks = [];
@@ -48,7 +69,13 @@ const gameDetails = $('#game-details');
 const GAME_PANEL_KEY = 'subpc_game_panel_open';
 let lastClaimableMissions = null;
 let settingsRestoreFocus = null;
-const runtimeStatus = { ollama: null, stt: null, tts: null, rag: null, websocket: 'connecting' };
+const runtimeStatus = { ollama: null, stt: null, tts: null, rag: null, providerKind: null, websocket: 'connecting' };
+const companionPanel = $('#companion-panel');
+const companionMark = $('#companion-mark');
+const companionStatus = $('#companion-status');
+const companionMeta = $('#companion-meta');
+const COMPANION_POLL_MS = 15000;
+let companionPollTimer = null;
 const pwaInstallButton = $('#pwa-install-btn');
 const pwaInstallStatus = $('#pwa-install-status');
 let deferredInstallPrompt = null;
@@ -187,10 +214,19 @@ function statusWord(value) {
   return 'CHECKING';
 }
 
+const BACKEND_DISPLAY_LABELS = {
+  ollama: 'OLLAMA',
+  openai_compatible: 'OPENAI COMPATIBLE',
+};
+
+function backendDisplayLabel(providerKind) {
+  return BACKEND_DISPLAY_LABELS[providerKind] || 'LOCAL BACKEND';
+}
+
 function updateInstrumentStatus(next = {}) {
   Object.assign(runtimeStatus, next);
   const labels = {
-    'instrument-ollama': `LOCAL · OLLAMA · ${statusWord(runtimeStatus.ollama)}`,
+    'instrument-ollama': `LOCAL · ${backendDisplayLabel(runtimeStatus.providerKind)} · ${statusWord(runtimeStatus.ollama)}`,
     'instrument-stt': `VOICE · STT · ${statusWord(runtimeStatus.stt)}`,
     'instrument-tts': `VOICE · TTS · ${statusWord(runtimeStatus.tts)}`,
     'instrument-rag': `MEMORY · RAG · ${statusWord(runtimeStatus.rag)}`,
@@ -414,6 +450,56 @@ async function loadGame({ animate = false } = {}) {
   } catch (e) {
     gameHub.classList.add('game-unavailable');
     console.warn('[Game] Fetch failed:', e);
+  }
+}
+
+const COMPANION_MODE_LABELS = {
+  focused: '集中',
+  idle: 'アイドル',
+  away: '離席',
+};
+
+async function loadCompanionState() {
+  if (!companionPanel) return;
+  try {
+    const resp = await fetch('/api/companion/state', { cache: 'no-store' });
+    if (!resp.ok) throw new Error(`companion ${resp.status}`);
+    const data = await resp.json();
+    if (!data.enabled) {
+      companionPanel.hidden = true;
+      return;
+    }
+    companionPanel.hidden = false;
+    const running = Boolean(data.running);
+    companionMark.classList.toggle('active', running);
+    companionStatus.textContent = running ? '活動中' : '停止中';
+    companionStatus.dataset.state = running ? 'running' : 'stopped';
+    const state = data.state || {};
+    const modeLabel = COMPANION_MODE_LABELS[state.activity_mode] || state.activity_mode || '';
+    const parts = [];
+    if (modeLabel) parts.push(modeLabel);
+    if (Number(data.consecutive_failures) > 0) {
+      parts.push(`失敗 ${data.consecutive_failures}回`);
+    } else if (Number(data.failure_count) > 0) {
+      parts.push(`失敗 ${data.failure_count}回`);
+    }
+    companionMeta.textContent = parts.join(' · ');
+    companionMeta.hidden = parts.length === 0;
+  } catch (e) {
+    companionPanel.hidden = true;
+    console.warn('[Companion] Fetch failed:', e);
+  }
+}
+
+function startCompanionPolling() {
+  loadCompanionState();
+  companionPollTimer = setInterval(loadCompanionState, COMPANION_POLL_MS);
+}
+
+function stopCompanionPolling() {
+  if (companionPollTimer) {
+    clearInterval(companionPollTimer);
+    companionPollTimer = null;
   }
 }
 
@@ -1279,7 +1365,7 @@ function saveSessionId() {
 
 function newSession() {
   if (isStreaming) return;
-  sessionId = `web_${Date.now()}`;
+  sessionId = newWebSessionId();
   saveSessionId();
   currentBubble = null;
   chatArea.replaceChildren(createWelcome('新しい話をしよう！', 'ここからは別の話題です。'));
@@ -1292,6 +1378,9 @@ function newSession() {
 
 async function init() {
   await Promise.all([loadGrowth(), loadGame()]);
+  startCompanionPolling();
+  window.addEventListener('pagehide', stopCompanionPolling);
+  window.addEventListener('beforeunload', stopCompanionPolling);
 
   // 状態取得
   try {
@@ -1302,6 +1391,7 @@ async function init() {
     configureMicAvailability(status);
     updateInstrumentStatus({
       ollama: status.ollama,
+      providerKind: status.provider_kind,
       stt: status.stt,
       tts: status.tts,
       rag: status.rag,
@@ -1352,7 +1442,7 @@ async function init() {
   }
 
   if (!sessionId) {
-    sessionId = `web_${Date.now()}`;
+    sessionId = newWebSessionId();
     try { localStorage.setItem(SESSION_STORAGE_KEY, sessionId); } catch (e) {}
   }
 

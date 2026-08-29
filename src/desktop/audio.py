@@ -67,9 +67,26 @@ class NativeAudioRecorder:
         stream = self._stream
         if stream is None:
             return b""
-        self._stream = None
-        stream.stop()
-        stream.close()
+
+        first_error: Exception | None = None
+        try:
+            stream.stop()
+        except Exception as exc:
+            first_error = exc
+        try:
+            stream.close()
+        except Exception as exc:
+            if first_error is None:
+                first_error = exc
+        else:
+            # Keep the stream available for a retry when close itself fails.
+            self._stream = None
+
+        if first_error is not None:
+            # Retain chunks until teardown succeeds so a failed stop/close never
+            # discards captured audio. Do not expose backend exception details.
+            raise RuntimeError("audio recorder stop failed") from None
+
         try:
             import numpy as np
         except ImportError as exc:

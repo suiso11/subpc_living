@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import queue
+import stat
 import threading
 from collections import deque
 from dataclasses import dataclass
@@ -19,6 +20,7 @@ import numpy as np
 from discord.opus import OpusError
 
 from src.audio.stt import WhisperSTT
+from src.perception.policy import parse_opt_in, resolve_sensor_policy
 
 try:
     from discord.ext import voice_recv
@@ -72,7 +74,7 @@ def _patch_voice_recv_opus_decoder() -> None:
         global _OPUS_DECODE_ERRORS
         try:
             return original(self, packet)
-        except OpusError as exc:
+        except OpusError:
             _OPUS_DECODE_ERRORS += 1
             decoder = getattr(self, "_decoder", None)
             concealed = b""
@@ -86,7 +88,7 @@ def _patch_voice_recv_opus_decoder() -> None:
             if _OPUS_DECODE_ERRORS == 1 or _OPUS_DECODE_ERRORS % 50 == 0:
                 print(
                     "[DiscordVoiceSTT] opus decode error concealed "
-                    f"count={_OPUS_DECODE_ERRORS} ssrc={getattr(self, 'ssrc', '?')}: {exc}"
+                    f"count={_OPUS_DECODE_ERRORS}"
                 )
             return packet, concealed
 
@@ -141,12 +143,12 @@ def _dave_decrypt_frame(voice_client: Any, ssrc: int, data: bytes) -> bytes:
         if _DAVE_DECRYPT_OK == 1:
             print("[DiscordVoiceSTT] DAVE E2EE フレーム復号 OK (受信音声は正常に復号されます)")
         return bytes(frame)
-    except Exception as exc:
+    except Exception:
         _DAVE_DECRYPT_FAILURES += 1
         if _DAVE_DECRYPT_FAILURES <= 3 or _DAVE_DECRYPT_FAILURES % 200 == 0:
             print(
                 "[DiscordVoiceSTT] DAVE decrypt failed "
-                f"count={_DAVE_DECRYPT_FAILURES} ssrc={ssrc} len={len(data)}: {exc}"
+                f"count={_DAVE_DECRYPT_FAILURES}"
             )
         return data
 
@@ -192,6 +194,23 @@ DISCORD_PCM_CHANNELS = 2
 STT_SAMPLE_RATE = 16000
 MAX_DISCORD_MESSAGE = 1900
 
+# Bounded wait for the STT worker to exit after a stop. Kept deliberately short
+# so async stop never wedges the event loop; if the worker is stuck mid-LLM/STT
+# it is left alive and reported truthfully via worker_alive/stop_pending.
+WORKER_JOIN_TIMEOUT = 5.0
+
+# Bounded best-effort wait for the "[voice] STT started/stopped." notice post.
+# A stuck transcript channel (slow fetch/send) must never wedge start/stop on
+# the event loop, so the notice is wrapped in wait_for and failures swallowed.
+NOTICE_SEND_TIMEOUT = 5.0
+
+# Bounded retention for the opt-in debug WAV dump. Positive seconds only;
+# unset uses a conservative default so debug audio never accumulates without
+# bound. Zero / negative / non-numeric / over-max TTL values are invalid and
+# fail closed by disabling debug writes entirely.
+_DEBUG_AUDIO_TTL_DEFAULT_SEC = 3600
+_DEBUG_AUDIO_TTL_MAX_SEC = 86400
+
 
 # Whisper on near-silent or short Japanese audio reliably emits these filler
 # phrases. Drop them so the transcript channel stays useful.
@@ -234,6 +253,20 @@ class VoiceSTTError(RuntimeError):
     """Raised for user-facing voice STT command failures."""
 
 
+# last_error に設定する固定型コード。生の例外テキスト・パス・URL・端末情報は
+# ログ / slash reply / status へ一切載せず、診断はこれらのコードで行う。
+VOICE_STT_ERR_WORKER = "worker_failure"
+VOICE_STT_ERR_SEND = "transcript_send_failed"
+VOICE_STT_ERR_LISTEN = "listen_failed"
+
+_KNOWN_STT_ERR_CODES = frozenset({VOICE_STT_ERR_WORKER, VOICE_STT_ERR_SEND, VOICE_STT_ERR_LISTEN})
+
+
+def safe_stt_last_error(value: str) -> str:
+    """last_error は既知の固定コードだけ表示し、未知の文字列は '-' に落とす。"""
+    return value if value in _KNOWN_STT_ERR_CODES else "-"
+
+
 def _parse_bool(value: str | None, default: bool = False) -> bool:
     if value is None:
         return default
@@ -267,15 +300,38 @@ def _parse_float(value: str | None, default: float) -> float:
         return default
 
 
+def _resolve_debug_audio_ttl_sec() -> int | None:
+    """Resolve the debug-audio retention TTL, or None on invalid value.
+
+    Positive bounded seconds (1.._DEBUG_AUDIO_TTL_MAX_SEC). Unset -> the
+    conservative default. Zero / negative / non-numeric / over-max -> None,
+    which callers treat as fail closed (debug writes disabled).
+    """
+    raw = os.environ.get("DISCORD_VOICE_STT_DEBUG_AUDIO_TTL_SEC", "").strip()
+    if not raw:
+        return _DEBUG_AUDIO_TTL_DEFAULT_SEC
+    try:
+        ttl = int(raw)
+    except ValueError:
+        return None
+    if ttl <= 0 or ttl > _DEBUG_AUDIO_TTL_MAX_SEC:
+        return None
+    return ttl
+
+
 def _resolve_debug_audio_dir(project_root: Path) -> Path | None:
     """Optional dir for dumping the exact 16 kHz mono audio sent to Whisper.
 
     Set DISCORD_VOICE_STT_DEBUG_AUDIO_DIR to a path to enable. Diagnostic only:
     lets us inspect/listen to what STT actually receives when transcripts look
-    like noise. Unset (default) means no dump.
+    like noise. Unset (default) means no dump. An invalid
+    DISCORD_VOICE_STT_DEBUG_AUDIO_TTL_SEC (zero / negative / non-numeric /
+    over-max) fails closed and disables debug writes entirely.
     """
     raw = os.environ.get("DISCORD_VOICE_STT_DEBUG_AUDIO_DIR", "").strip()
     if not raw:
+        return None
+    if _resolve_debug_audio_ttl_sec() is None:
         return None
     path = Path(raw)
     return path if path.is_absolute() else project_root / path
@@ -292,6 +348,37 @@ def _write_debug_wav(path: Path, audio: np.ndarray) -> None:
         wav.setsampwidth(2)
         wav.setframerate(STT_SAMPLE_RATE)
         wav.writeframes(pcm16.tobytes())
+
+
+def _sweep_debug_audio(
+    debug_dir: Path,
+    ttl_sec: int,
+    now: datetime | None = None,
+) -> None:
+    """Best-effort delete regular *.wav files directly in debug_dir older than TTL.
+
+    Diagnostics must never break the worker, so every failure is swallowed.
+    Candidates are only regular .wav files in the top level of debug_dir: no
+    recursion, no symlink following, no other file types, and nothing outside
+    the configured directory is ever touched. Never exposes paths/filenames.
+    """
+    if ttl_sec <= 0:
+        return
+    try:
+        cutoff = (now or datetime.now(timezone.utc)).timestamp() - ttl_sec
+        for entry in debug_dir.iterdir():
+            try:
+                st = os.lstat(entry)
+                if not stat.S_ISREG(st.st_mode):
+                    continue
+                if entry.suffix.lower() != ".wav":
+                    continue
+                if st.st_mtime < cutoff:
+                    entry.unlink(missing_ok=True)
+            except OSError:
+                continue
+    except OSError:
+        return
 
 
 def _split_message(text: str) -> list[str]:
@@ -333,6 +420,7 @@ class VoiceSTTConfig:
     enabled: bool
     transcript_channel_id: int | None
     transcript_dir: Path
+    microphone_enabled: bool = False
     timezone: str = "Asia/Tokyo"
     language: str = "ja"
     model_size: str = "auto"
@@ -345,9 +433,10 @@ class VoiceSTTConfig:
     min_speech_duration_ms: int = 400
     max_segment_seconds: float = 12.0
     max_queue_size: int = 16
-    save_transcripts: bool = True
+    save_transcripts: bool = False
     hallucination_filter: bool = True
     debug_audio_dir: Path | None = None
+    debug_audio_ttl_sec: int = _DEBUG_AUDIO_TTL_DEFAULT_SEC
 
     @classmethod
     def from_env(cls, project_root: str | Path, *, timezone: str = "Asia/Tokyo") -> "VoiceSTTConfig":
@@ -362,7 +451,8 @@ class VoiceSTTConfig:
             transcript_dir = root / transcript_dir
 
         return cls(
-            enabled=_parse_bool(os.environ.get("DISCORD_VOICE_STT_ENABLED"), default=False),
+            enabled=parse_opt_in(os.environ.get("DISCORD_VOICE_STT_ENABLED")),
+            microphone_enabled=resolve_sensor_policy(os.environ).microphone,
             transcript_channel_id=_parse_optional_int(os.environ.get("DISCORD_VOICE_TRANSCRIPT_CHANNEL_ID")),
             transcript_dir=transcript_dir,
             timezone=os.environ.get("DISCORD_VOICE_TIMEZONE", timezone).strip() or timezone,
@@ -392,15 +482,16 @@ class VoiceSTTConfig:
                 12.0,
             ),
             max_queue_size=_parse_int(os.environ.get("DISCORD_VOICE_STT_QUEUE_SIZE"), 16),
-            save_transcripts=_parse_bool(
-                os.environ.get("DISCORD_VOICE_STT_SAVE_TRANSCRIPTS"),
-                default=True,
+            save_transcripts=parse_opt_in(
+                os.environ.get("DISCORD_VOICE_STT_SAVE_TRANSCRIPTS")
             ),
             hallucination_filter=_parse_bool(
                 os.environ.get("DISCORD_VOICE_STT_HALLUCINATION_FILTER"),
                 default=True,
             ),
             debug_audio_dir=_resolve_debug_audio_dir(root),
+            debug_audio_ttl_sec=_resolve_debug_audio_ttl_sec()
+            or _DEBUG_AUDIO_TTL_DEFAULT_SEC,
         )
 
 
@@ -462,6 +553,15 @@ class SpeechSegmenter:
             if speech is not None:
                 completed.append(speech)
         return completed
+
+    def discard(self) -> None:
+        """Drop all buffered (not yet emitted) audio without producing a segment."""
+        self._pending = np.empty(0, dtype=np.float32)
+        self._pre_buffer.clear()
+        self._speech_frames = []
+        self._is_speaking = False
+        self._silence_count = 0
+        self._started_at = None
 
     def flush(self, now: datetime, *, reason: str = "speaking_stop") -> CompletedSpeech | None:
         if self._pending.size and self._is_speaking:
@@ -558,23 +658,24 @@ class DiscordSTTSink(_AudioSinkBase):
         return False
 
     def write(self, user: discord.User | discord.Member | None, data: Any) -> None:
-        if self._closed or user is None or getattr(user, "bot", False):
+        if user is None or getattr(user, "bot", False):
             return
         pcm = getattr(data, "pcm", b"")
         if not pcm:
             return
 
-        now = datetime.now(timezone.utc)
-        audio = pcm48_stereo_to_16k_mono(pcm)
         with self._lock:
+            if self._closed:
+                return
+            now = datetime.now(timezone.utc)
+            audio = pcm48_stereo_to_16k_mono(pcm)
             self.received_packets += 1
             self.received_audio_seconds += audio.size / STT_SAMPLE_RATE
             if self.received_packets == 1 or self.received_packets % 250 == 0:
                 print(
                     "[DiscordVoiceSTT] receiving audio "
                     f"packets={self.received_packets} "
-                    f"audio_sec={self.received_audio_seconds:.1f} "
-                    f"user={getattr(user, 'display_name', None) or user}"
+                    f"audio_sec={self.received_audio_seconds:.1f}"
                 )
             segmenter = self._buffers.setdefault(user.id, SpeechSegmenter(self.config))
             completed = segmenter.add_audio(audio, now)
@@ -611,9 +712,20 @@ class DiscordSTTSink(_AudioSinkBase):
         for user, speech in pending:
             self._enqueue(user, speech)
 
+    def discard_all(self) -> None:
+        """Drop every segmenter's raw buffer and close the sink without enqueueing.
+
+        Used on consent withdrawal so in-progress audio is never turned into a
+        queued SpeechChunk (and therefore never transcribed/posted).
+        """
+        with self._lock:
+            self._closed = True
+            for segmenter in self._buffers.values():
+                segmenter.discard()
+            self._buffers.clear()
+
     def cleanup(self) -> None:
-        self.flush_all()
-        self._closed = True
+        self.discard_all()
 
     def _enqueue(self, user: discord.User | discord.Member, speech: CompletedSpeech) -> None:
         chunk = SpeechChunk(
@@ -626,19 +738,27 @@ class DiscordSTTSink(_AudioSinkBase):
             ended_at=speech.ended_at,
             reason=speech.reason,
         )
-        try:
-            self.output_queue.put_nowait(chunk)
-            print(
-                "[DiscordVoiceSTT] speech segment queued "
-                f"user={chunk.user_name} duration={chunk.duration_sec:.2f}s "
-                f"reason={chunk.reason} queue={self.output_queue.qsize()}"
-            )
-        except queue.Full:
-            self.dropped_segments += 1
-            print(
-                "[DiscordVoiceSTT] speech segment dropped "
-                f"user={chunk.user_name} dropped={self.dropped_segments}"
-            )
+        # The closed check must share discard_all's lock: a discard (consent
+        # withdrawal) that races an in-flight enqueue either wins the lock first
+        # (chunk rejected) or loses (chunk queued strictly before discard), so a
+        # closed sink never emits a new chunk after discard returns.
+        with self._lock:
+            if self._closed:
+                print("[DiscordVoiceSTT] sink closed; speech segment dropped")
+                return
+            try:
+                self.output_queue.put_nowait(chunk)
+                print(
+                    "[DiscordVoiceSTT] speech segment queued "
+                    f"duration={chunk.duration_sec:.2f}s "
+                    f"reason={chunk.reason} queue={self.output_queue.qsize()}"
+                )
+            except queue.Full:
+                self.dropped_segments += 1
+                print(
+                    "[DiscordVoiceSTT] speech segment dropped "
+                    f"dropped={self.dropped_segments}"
+                )
 
     def _user_from_id(self, user_id: int) -> discord.User | discord.Member | None:
         voice_client = getattr(self, "voice_client", None)
@@ -667,9 +787,19 @@ class DiscordVoiceSTT:
         self._queue: "queue.Queue[SpeechChunk]" = queue.Queue(maxsize=config.max_queue_size)
         self._stop_event = threading.Event()
         self._worker: threading.Thread | None = None
+        self._stop_pending = False
         self._stt: WhisperSTT | None = None
         self._stt_lock = threading.Lock()
         self._file_lock = threading.Lock()
+
+        # Monotonically increasing processing generation. A worker or a pending
+        # send captures the generation at the moment it starts work; stop/close
+        # revokes it (bumps under the consent lock) so anything still in flight
+        # from the revoked generation can finish transcribing but can never
+        # persist a transcript, dump debug audio, or post/schedule a send.
+        self._generation = 0
+        self._consent_lock = threading.RLock()
+        self._send_futures: set[Any] = set()
 
         self.started_at: datetime | None = None
         self.transcript_count = 0
@@ -691,6 +821,16 @@ class DiscordVoiceSTT:
             and hasattr(self.voice_client, "is_listening")
             and self.voice_client.is_listening()
         )
+
+    @property
+    def worker_alive(self) -> bool:
+        """True only while the STT worker thread is actually running."""
+        return self._worker is not None and self._worker.is_alive()
+
+    @property
+    def stop_pending(self) -> bool:
+        """True only while a stop is requested but the worker is still alive."""
+        return self._stop_pending and self.worker_alive
 
     async def join(self, interaction: discord.Interaction) -> str:
         self._validate_enabled()
@@ -737,7 +877,10 @@ class DiscordVoiceSTT:
             if transcript_channel is not None
             else self.config.transcript_channel_id or interaction.channel_id
         )
-        self._ensure_worker()
+        if not self._ensure_worker():
+            raise VoiceSTTError(
+                "voice STT は前回の処理がまだ停止していません。少し待ってから再試行してください。"
+            )
 
         guild_id = interaction.guild_id
         voice_channel_id = getattr(getattr(self.voice_client, "channel", None), "id", None)
@@ -760,22 +903,112 @@ class DiscordVoiceSTT:
         return "voice STT を開始しました。通話音声を文字起こしします。"
 
     async def stop(self) -> str:
-        if self.voice_client is not None and hasattr(self.voice_client, "is_listening"):
-            if self.voice_client.is_listening():
-                self.voice_client.stop_listening()
-        if self.sink is not None:
-            self.sink.flush_all()
-            print(
-                "[DiscordVoiceSTT] listening stopped "
-                f"packets={self.sink.received_packets} "
-                f"audio_sec={self.sink.received_audio_seconds:.1f} "
-                f"transcripts={self.transcript_count}"
-            )
-        self.sink = None
-        self.started_at = None
-        self._stop_event.set()
+        await self._halt_processing()
         await self._send_notice("[voice] STT stopped.")
         return "voice STT を停止しました。"
+
+    async def _halt_processing(self) -> None:
+        """Consent withdrawal: stop all future processing and posting promptly.
+
+        Signals the worker first so anything already in flight is discarded
+        rather than transcribed/posted. The processing generation is revoked
+        (and retained send futures cancelled) before the sink is discarded, so
+        an in-flight worker of the old generation can finish transcribing but
+        cannot persist/post/count. Then stops listening, discards the sink's
+        raw buffers (never flushing them to the queue), clears queued chunks,
+        and bounded-joins the worker without blocking the event loop.
+        """
+        self._stop_event.set()
+        # Revoke off the event loop: the worker's commit barrier holds the
+        # consent lock while persisting, and waiting on that lock (plus
+        # cancelling retained futures) must never block the event loop during
+        # stop.
+        await asyncio.to_thread(self._revoke_generation)
+        if self.voice_client is not None and hasattr(self.voice_client, "is_listening"):
+            try:
+                if self.voice_client.is_listening():
+                    self.voice_client.stop_listening()
+            except Exception:
+                print("[DiscordVoiceSTT] failed to stop listening")
+        if self.sink is not None:
+            sink = self.sink
+            sink.discard_all()
+            print(
+                "[DiscordVoiceSTT] listening stopped "
+                f"packets={sink.received_packets} "
+                f"audio_sec={sink.received_audio_seconds:.1f} "
+                f"transcripts={self.transcript_count}"
+            )
+            self.sink = None
+        self.started_at = None
+        self._clear_queue()
+        await self._join_worker_async()
+
+    def _clear_queue(self) -> None:
+        """Drain queued SpeechChunks, discarding each with its task_done call."""
+        while True:
+            try:
+                self._queue.get_nowait()
+                self._queue.task_done()
+            except queue.Empty:
+                return
+
+    def _capture_generation(self) -> int:
+        """Read the current processing generation atomically w.r.t. revoke."""
+        with self._consent_lock:
+            return self._generation
+
+    def _is_generation_active(self, generation: int) -> bool:
+        """True while `generation` is still the live processing generation.
+
+        Synchronized with _revoke_generation via the consent lock, so a revoked
+        worker/send deterministically sees an inactive generation and a worker
+        that already passed this check persists only while holding the lock.
+        """
+        with self._consent_lock:
+            return generation == self._generation
+
+    def _revoke_generation(self) -> int:
+        """Revoke the current processing generation and cancel retained sends.
+
+        Bumps the generation under the consent lock and cancels every retained
+        run_coroutine_threadsafe send future. Cancelling is done after releasing
+        the lock so a cancel's done callback never runs while holding it; a
+        cancelled future records no error (see _record_future_error).
+        """
+        with self._consent_lock:
+            self._generation += 1
+            futures = list(self._send_futures)
+            self._send_futures.clear()
+        for future in futures:
+            future.cancel()
+        return self._generation
+
+    def _join_worker(self, timeout: float | None = None) -> None:
+        """Bounded join. Release thread ownership only when death is confirmed."""
+        if timeout is None:
+            timeout = WORKER_JOIN_TIMEOUT
+        worker = self._worker
+        if worker is None or not worker.is_alive():
+            self._worker = None
+            self._stop_pending = False
+            return
+        worker.join(timeout)
+        if worker.is_alive():
+            self._stop_pending = True
+        else:
+            self._worker = None
+            self._stop_pending = False
+
+    async def _join_worker_async(self, timeout: float | None = None) -> None:
+        """Bounded join off the event loop so async stop never blocks it."""
+        if timeout is None:
+            timeout = WORKER_JOIN_TIMEOUT
+        if self._worker is None or not self._worker.is_alive():
+            self._worker = None
+            self._stop_pending = False
+            return
+        await asyncio.to_thread(self._join_worker, timeout)
 
     async def leave(self) -> str:
         await self.stop()
@@ -785,24 +1018,35 @@ class DiscordVoiceSTT:
         return "voice channel から退出しました。"
 
     def close(self) -> None:
-        if self.sink is not None:
-            self.sink.flush_all()
+        """Synchronous shutdown: revoke, discard, clear, signal, bounded-join worker."""
         self._stop_event.set()
+        self._revoke_generation()
+        if self.voice_client is not None and hasattr(self.voice_client, "is_listening"):
+            try:
+                if self.voice_client.is_listening():
+                    self.voice_client.stop_listening()
+            except Exception:
+                pass
+        if self.sink is not None:
+            self.sink.discard_all()
+            self.sink = None
+        self.started_at = None
+        self._clear_queue()
+        self._join_worker()
 
     def status_text(self) -> str:
-        channel_name = "-"
-        if self.voice_client is not None and getattr(self.voice_client, "channel", None) is not None:
-            channel_name = getattr(self.voice_client.channel, "name", "-")
         dropped = self.sink.dropped_segments if self.sink is not None else 0
         packets = self.sink.received_packets if self.sink is not None else 0
         audio_seconds = self.sink.received_audio_seconds if self.sink is not None else 0.0
         decode_errors = opus_decode_error_count()
         return (
             f"voice_stt_enabled: {self.config.enabled}\n"
+            f"voice_microphone_enabled: {self.config.microphone_enabled}\n"
             f"voice_recv_available: {self.available}\n"
             f"voice_connected: {self.connected}\n"
             f"voice_listening: {self.listening}\n"
-            f"voice_channel: {channel_name}\n"
+            f"voice_worker_alive: {self.worker_alive}\n"
+            f"voice_stop_pending: {self.stop_pending}\n"
             f"voice_transcript_channel_id: {self.transcript_channel_id or '-'}\n"
             f"voice_queue_size: {self._queue.qsize()}\n"
             f"voice_received_packets: {packets}\n"
@@ -811,12 +1055,23 @@ class DiscordVoiceSTT:
             f"voice_decode_errors: {decode_errors}\n"
             f"voice_dave_decrypt_failures: {dave_decrypt_failure_count()}\n"
             f"voice_dropped_segments: {dropped}\n"
-            f"voice_last_error: {self.last_error or '-'}"
+            f"voice_last_error: {safe_stt_last_error(self.last_error)}"
         )
 
     def _validate_enabled(self) -> None:
+        # 接続前に二重ゲートを検証する (fail closed)。両方 true のときだけ実
+        # receive / STT の構築・開始を許す。canonical 名 (SENSOR_MICROPHONE_ENABLED)
+        # は共有 SensorPolicy の resolve_sensor_policy で解決済みで、canonical が
+        # 存在すればその値が確定 (false/空/不正値は fail closed)。
         if not self.config.enabled:
-            raise VoiceSTTError("voice STT は無効です。DISCORD_VOICE_STT_ENABLED=true を設定してください。")
+            raise VoiceSTTError(
+                "voice STT は無効です。DISCORD_VOICE_STT_ENABLED=true を設定してください。"
+            )
+        if not self.config.microphone_enabled:
+            raise VoiceSTTError(
+                "voice STT のマイク政策が無効です。共有 SensorPolicy の "
+                "SENSOR_MICROPHONE_ENABLED=true を設定してください。"
+            )
         if voice_recv is None:
             raise VoiceSTTError(
                 "discord-ext-voice-recv が未導入です。requirements を更新してインストールしてください。"
@@ -832,17 +1087,29 @@ class DiscordVoiceSTT:
             raise VoiceSTTError("通常のvoice channelで実行してください。")
         return channel
 
-    def _ensure_worker(self) -> None:
+    def _ensure_worker(self) -> bool:
+        """Start a fresh STT worker unless one is still alive.
+
+        Returns True when a fresh worker was started. Returns False (and does
+        NOT start a new worker) while the previous one remains alive, so a
+        restart never runs two workers at once.
+        """
         if self._worker is not None and self._worker.is_alive():
-            self._stop_event.clear()
-            return
+            return False
         self._stop_event.clear()
+        self._stop_pending = False
         self._worker = threading.Thread(
             target=self._worker_loop,
             daemon=True,
             name="discord-voice-stt-worker",
         )
         self._worker.start()
+        return True
+
+    def _record_worker_error(self) -> None:
+        """Set last_error to a fixed type code without leaking exception text."""
+        self.last_error = VOICE_STT_ERR_WORKER
+        print("[DiscordVoiceSTT] worker failure")
 
     def _worker_loop(self) -> None:
         while not self._stop_event.is_set() or not self._queue.empty():
@@ -851,46 +1118,65 @@ class DiscordVoiceSTT:
             except queue.Empty:
                 continue
             try:
-                if self.config.debug_audio_dir is not None:
-                    self._dump_debug_audio(chunk)
+                if self._stop_event.is_set():
+                    continue
+                generation = self._capture_generation()
                 text = self._transcribe(chunk.audio)
-                if text and self.config.hallucination_filter and _is_likely_hallucination(text):
-                    print(
-                        "[DiscordVoiceSTT] filtered hallucination "
-                        f"user={chunk.user_name} duration={chunk.duration_sec:.2f}s "
-                        f"text={text!r}"
-                    )
-                    text = ""
-                if text:
-                    self.transcript_count += 1
-                    self.last_transcript_at = datetime.now(timezone.utc)
-                    self._write_transcript(chunk, text)
-                    self._schedule_transcript_send(chunk, text)
-                else:
-                    print(
-                        "[DiscordVoiceSTT] empty transcript "
-                        f"user={chunk.user_name} duration={chunk.duration_sec:.2f}s"
-                    )
-            except Exception as exc:
-                self.last_error = str(exc)
-                print(f"[DiscordVoiceSTT] worker error: {exc}")
+                # Final generation-active check synchronized with revoke. All
+                # persist/post/count work happens under the consent lock so a
+                # revoke either wins first (nothing is written/scheduled) or
+                # runs after this block completes; it can never interleave.
+                with self._consent_lock:
+                    if generation != self._generation:
+                        continue
+                    if self.config.debug_audio_dir is not None:
+                        self._dump_debug_audio(chunk)
+                    if text and self.config.hallucination_filter and _is_likely_hallucination(text):
+                        print(
+                            "[DiscordVoiceSTT] filtered hallucination "
+                            f"duration={chunk.duration_sec:.2f}s"
+                        )
+                        text = ""
+                    if text:
+                        self.transcript_count += 1
+                        self.last_transcript_at = datetime.now(timezone.utc)
+                        self._write_transcript(chunk, text)
+                        self._schedule_transcript_send(chunk, text, generation)
+                    else:
+                        print(
+                            "[DiscordVoiceSTT] empty transcript "
+                            f"duration={chunk.duration_sec:.2f}s"
+                        )
+            except Exception:
+                self._record_worker_error()
             finally:
                 self._queue.task_done()
 
     def _dump_debug_audio(self, chunk: SpeechChunk) -> None:
+        if self.config.debug_audio_ttl_sec <= 0:
+            # invalid retention TTL must fail closed: never write debug audio
+            return
         try:
             local_dt = chunk.ended_at.astimezone(ZoneInfo(self.config.timezone))
             stamp = local_dt.strftime("%H%M%S_%f")[:-3]
             name = f"{local_dt.date().isoformat()}_{stamp}_{chunk.user_name}_{chunk.reason}.wav"
             safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in name)
             path = self.config.debug_audio_dir / safe  # type: ignore[operator]
+            _sweep_debug_audio(
+                self.config.debug_audio_dir,  # type: ignore[arg-type]
+                self.config.debug_audio_ttl_sec,
+            )
             _write_debug_wav(path, chunk.audio)
+            _sweep_debug_audio(
+                self.config.debug_audio_dir,  # type: ignore[arg-type]
+                self.config.debug_audio_ttl_sec,
+            )
             print(
-                f"[DiscordVoiceSTT] debug audio saved {path} "
+                f"[DiscordVoiceSTT] debug audio saved "
                 f"duration={chunk.duration_sec:.2f}s"
             )
-        except Exception as exc:  # diagnostics must never break the worker
-            print(f"[DiscordVoiceSTT] debug audio dump failed: {exc}")
+        except Exception:  # diagnostics must never break the worker
+            print("[DiscordVoiceSTT] debug audio dump failed")
 
     def _transcribe(self, audio: np.ndarray) -> str:
         with self._stt_lock:
@@ -904,29 +1190,90 @@ class DiscordVoiceSTT:
                 )
             return self._stt.transcribe(audio, sample_rate=STT_SAMPLE_RATE)
 
-    def _schedule_transcript_send(self, chunk: SpeechChunk, text: str) -> None:
-        if self._loop is None:
+    def _schedule_transcript_send(self, chunk: SpeechChunk, text: str, generation: int) -> None:
+        loop = self._loop
+        if loop is None:
             return
-        future = asyncio.run_coroutine_threadsafe(self._send_transcript(chunk, text), self._loop)
-        future.add_done_callback(self._record_future_error)
+        coro = self._send_transcript(chunk, text, generation)
+        # Atomic under the consent lock: the generation check, the loop
+        # eligibility check, the run_coroutine_threadsafe submission, and the
+        # retained-future insertion are one critical section so a concurrent
+        # revoke can never interleave (which would leave a
+        # retained-but-never-cancelled future or let a revoked generation
+        # schedule a send). run_coroutine_threadsafe only schedules on the loop
+        # and never blocks on it, so holding the lock here is safe.
+        with self._consent_lock:
+            if generation != self._generation:
+                coro.close()
+                return
+            # The loop must exist, be open, and be running before submission so
+            # a run_coroutine_threadsafe future is never stranded on a dead or
+            # inert loop. Test doubles that lack is_closed/is_running are
+            # rejected (treated as ineligible) rather than guessed at. Every
+            # rejection closes the coroutine so it never dangles un-awaited.
+            is_closed = getattr(loop, "is_closed", None)
+            is_running = getattr(loop, "is_running", None)
+            if (
+                is_closed is None
+                or is_running is None
+                or is_closed()
+                or not is_running()
+            ):
+                coro.close()
+                return
+            try:
+                future = asyncio.run_coroutine_threadsafe(coro, loop)
+            except RuntimeError:
+                # Loop closed/shut down between the eligibility check and the
+                # submission: nothing will ever run the coroutine, so close it
+                # to avoid a "never awaited" leak.
+                coro.close()
+                return
+            self._send_futures.add(future)
+        future.add_done_callback(self._on_send_future_done)
+
+    def _on_send_future_done(self, future: Any) -> None:
+        with self._consent_lock:
+            self._send_futures.discard(future)
+        self._record_future_error(future)
 
     def _record_future_error(self, future: Any) -> None:
+        if future.cancelled():
+            return
         try:
             future.result()
-        except Exception as exc:
-            self.last_error = str(exc)
-            print(f"[DiscordVoiceSTT] send error: {exc}")
+        except Exception:
+            self.last_error = VOICE_STT_ERR_SEND
+            print("[DiscordVoiceSTT] transcript send failed")
 
-    async def _send_transcript(self, chunk: SpeechChunk, text: str) -> None:
+    async def _send_transcript(self, chunk: SpeechChunk, text: str, generation: int) -> None:
         channel = await self._resolve_transcript_channel()
         if channel is None:
             return
         local_dt = chunk.ended_at.astimezone(ZoneInfo(self.config.timezone))
         prefix = f"[{local_dt.strftime('%H:%M:%S')}] {chunk.user_name}: "
         for part in _split_message(prefix + text):
+            # Recheck generation immediately before each send: the channel
+            # resolve above yielded, so a revoke may have run meanwhile. The
+            # check is synchronized with revoke and, for a send already running
+            # on the loop, the revoke's future.cancel() is delivered at this
+            # same await, so a revoked generation never posts.
+            if not self._is_generation_active(generation):
+                return
             await channel.send(part)
 
     async def _send_notice(self, text: str) -> None:
+        # Best-effort and bounded: a stuck transcript channel (slow fetch/send)
+        # must never wedge start/stop on the event loop. wait_for cancels the
+        # inner coroutine on timeout, so nothing dangles.
+        try:
+            await asyncio.wait_for(self._post_notice(text), timeout=NOTICE_SEND_TIMEOUT)
+        except asyncio.TimeoutError:
+            print("[DiscordVoiceSTT] notice send timed out")
+        except Exception:
+            print("[DiscordVoiceSTT] notice send failed")
+
+    async def _post_notice(self, text: str) -> None:
         channel = await self._resolve_transcript_channel()
         if channel is not None:
             await channel.send(text)
@@ -964,5 +1311,5 @@ class DiscordVoiceSTT:
 
     def _after_listening(self, error: Exception | None) -> None:
         if error is not None:
-            self.last_error = str(error)
-            print(f"[DiscordVoiceSTT] listen stopped with error: {error}")
+            self.last_error = VOICE_STT_ERR_LISTEN
+            print("[DiscordVoiceSTT] listen stopped with error")

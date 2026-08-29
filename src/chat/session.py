@@ -67,13 +67,19 @@ class ChatSession:
         self._messages.append({"role": "user", "content": content})
         self._trim_history()
 
-    def add_assistant_message(self, content: str, *, store_memory: bool = True) -> None:
+    def add_assistant_message(
+        self,
+        content: str,
+        *,
+        store_memory: bool = True,
+        record_growth: bool = True,
+    ) -> None:
         """アシスタントの応答を追加（RAG有効時はベクトルDBにも保存）
 
         store_memory=False のときは RAG への長期記憶保存をスキップする。
-        セッション履歴の追加・トリムは常に行い、成長台帳には
-        memory_saved=False で記録する。テキスト内容に基づく分類は行わない。
-        save() は呼び出さないためファイル保存が必要なら別途呼ぶこと。
+        record_growth=False のときは成長台帳への記録もスキップする。
+        セッション履歴の追加・トリムは常に行う。save() は呼び出さないため
+        ファイル保存が必要なら別途呼ぶこと。
         """
         self._messages.append({"role": "assistant", "content": content})
         self._trim_history()
@@ -92,9 +98,12 @@ class ChatSession:
                 )
 
         # 成長台帳: 本文は保存せず、成功した会話例とRAG保存成否だけを記録する。
-        # store_memory=False のときは memory_id が None のままなので
-        # memory_saved=False として記録される。
-        if self.growth_tracker is not None and len(self._messages) >= 2:
+        # record_growth=False のときは成長台帳へ一切アクセスしない。
+        if (
+            record_growth
+            and self.growth_tracker is not None
+            and len(self._messages) >= 2
+        ):
             user_msg = user_msg or self._messages[-2]
             if user_msg.get("role") == "user":
                 try:
@@ -109,35 +118,54 @@ class ChatSession:
                     # 計測失敗で会話自体を失敗させない。
                     pass
 
-    def build_messages(self) -> list[dict]:
+    def rollback_last_user_message(self) -> bool:
+        """最終メッセージがユーザー発言のときだけ原子的に除去し True を返す。
+
+        履歴が空・最終メッセージが assistant など user でない場合は変更せず
+        False を返す。エラー時の巻き戻し (CLI / Voice / Web / Discord) に使い、
+        メッセージ内容は診断へ出さない。
         """
-        Ollama APIに渡すメッセージリストを構築
+        if not self._messages or self._messages[-1].get("role") != "user":
+            return False
+        self._messages.pop()
+        return True
 
-        RAGが有効な場合、最新のユーザーメッセージで長期記憶を検索し、
-        関連する過去の文脈をシステムプロンプトに注入する。
+    def build_blocks(self) -> tuple:
+        """build_messages が描画する ContextBlock を返す（描画前）。
+
+        プリロード・RAG・Web検索・Vision・Monitor・Screen・Calendar・Emotion（有効時のみ）・
+        Tasks・History の各 ContextProvider から収集した ContextBlock を tuple で返す。
+        Emotion は Calendar の直後・Tasks の前に収集し、ContextPolicy の tasks-last 権威を
+        尊重してタスク状態が常に system 本文の最終文字列 block になるようにする。
         """
-        messages = []
+        from src.context.contracts import ContextBlock as _CB
+        from src.context.providers.preload import PreloadContextProvider
+        from src.context.providers.rag import RAGContextProvider
+        from src.context.providers.web_search import WebSearchContextProvider
+        from src.context.providers.vision import VisionContextProvider
+        from src.context.providers.monitor import MonitorContextProvider
+        from src.context.providers.screen import ScreenContextProvider
+        from src.context.providers.calendar import CalendarContextProvider
+        from src.context.providers.tasks import TasksContextProvider
+        from src.context.providers.history import HistoryContextProvider
 
-        # システムプロンプト + プリロード + RAGコンテキスト + Visionコンテキスト
-        system_content = self.system_prompt or ""
+        blocks: list[_CB] = []
 
-        # Preload: プロフィール・スケジュール・最近の会話要約・時刻 (Phase 7)
         if self.preloader is not None:
-            preload_text = self.preloader.build_preload_context()
-            if preload_text:
-                system_content = system_content + preload_text
+            block = PreloadContextProvider.collect(self.preloader)
+            if block is not None:
+                blocks.append(block)
 
         if self.rag is not None and self._messages:
-            # 最新のユーザーメッセージで検索
             last_user = None
             for msg in reversed(self._messages):
                 if msg["role"] == "user":
                     last_user = msg["content"]
                     break
             if last_user:
-                rag_context = self.rag.build_context_prompt(last_user)
-                if rag_context:
-                    system_content = system_content + rag_context
+                block = RAGContextProvider.collect(self.rag, last_user)
+                if block is not None:
+                    blocks.append(block)
 
         if self.web_search is not None and self._messages:
             last_user = None
@@ -146,61 +174,78 @@ class ChatSession:
                     last_user = msg["content"]
                     break
             if last_user:
-                web_context = self.web_search.build_context_prompt(last_user)
-                if web_context:
-                    system_content = system_content + web_context
+                block = WebSearchContextProvider.collect(self.web_search, last_user)
+                if block is not None:
+                    blocks.append(block)
 
-        # Vision: カメラ映像の現在の状態を注入
         if self.vision_context is not None:
-            vision_text = self.vision_context.get_context_text()
-            if vision_text:
-                system_content = system_content + vision_text
+            block = VisionContextProvider.collect(self.vision_context)
+            if block is not None:
+                blocks.append(block)
 
-        # Monitor: サブPCの状態を注入 (Phase 6)
         if self.monitor_context is not None:
-            monitor_text = self.monitor_context.get_context_text()
-            if monitor_text:
-                system_content = system_content + monitor_text
+            block = MonitorContextProvider.collect(self.monitor_context)
+            if block is not None:
+                blocks.append(block)
 
-        # Screen: ユーザーの画面で何をしているかを注入 (VLM描写)
         if self.screen_context is not None:
-            screen_text = self.screen_context.get_context_text()
-            if screen_text:
-                system_content = system_content + screen_text
+            block = ScreenContextProvider.collect(self.screen_context)
+            if block is not None:
+                blocks.append(block)
 
-        # Calendar: Google Calendar の今日〜明日の予定を注入 (ファイル読取のみ)
         if self.calendar_context is not None:
-            try:
-                cal_text = self.calendar_context.get_context_text()
-                if cal_text:
-                    system_content = system_content + cal_text
-            except Exception:
-                pass
+            block = CalendarContextProvider.collect(self.calendar_context)
+            if block is not None:
+                blocks.append(block)
 
         # 感情タグの指示 (有効時のみ)。タスク状態の権威ブロックよりも前に置くことで、
-        # タスク状態がシステムプロンプトの最終権威となる。
+        # タスク状態がシステムプロンプトの最終権威となる。指示文は機密を含まないため
+        # public / 非 local_only とし、ContextPolicy の tasks-last で tasks より前になる。
         if self.emotion_tags:
             from src.chat.emotion import EMOTION_TAG_INSTRUCTION
-            separator = "\n\n" if system_content else ""
-            system_content = system_content + separator + EMOTION_TAG_INSTRUCTION
 
-        # Tasks: 未完了タスク + 現在状態の権威ブロックを末尾に置く (0件でも必ず注入)。
-        # 会話履歴・RAG・訓練データを上書きする最終権威なので、他の動的コンテキスト・
-        # 感情タグ指示の後に配置する。
-        if self.task_store is not None:
-            try:
-                from src.tasks.store import build_task_context
-                task_text = build_task_context(self.task_store)
-                if task_text:
-                    system_content = system_content + task_text
-            except Exception:
-                pass
+            blocks.append(
+                _CB(
+                    source="emotion",
+                    content=EMOTION_TAG_INSTRUCTION,
+                    sensitivity="public",
+                    local_only=False,
+                )
+            )
 
-        if system_content:
-            messages.append({"role": "system", "content": system_content})
+        tasks_block = (
+            TasksContextProvider.collect(self.task_store)
+            if self.task_store is not None
+            else None
+        )
+        history_block = HistoryContextProvider.collect(self._messages)
 
-        messages.extend(self._messages)
-        return messages
+        for block in (tasks_block, history_block):
+            if block is not None:
+                blocks.append(block)
+
+        return tuple(blocks)
+
+    def build_messages(self) -> list[dict]:
+        """
+        Ollama APIに渡すメッセージリストを構築
+
+        RAGが有効な場合、最新のユーザーメッセージで長期記憶を検索し、
+        関連する過去の文脈をシステムプロンプトに注入する。
+        History は ContextBlock 化して ContextBuilder 経由で描画する (Phase J)。
+        プロバイダ収集は build_blocks() へ委譲し、ContextBuilder 一経路で描画する。
+        build_messages() は引数なしで呼ばれるため local_only / local target を既定とし、
+        ContextPolicy で選択された block だけを描画する。
+        """
+        from src.context.builder import ContextBuilder
+
+        blocks = self.build_blocks()
+        builder = ContextBuilder(self.system_prompt or "")
+        return builder.build_messages(
+            blocks,
+            privacy="local_only",
+            target_local=True,
+        )
 
     def _trim_history(self) -> None:
         """履歴をターン単位で max_history_turns に収める"""

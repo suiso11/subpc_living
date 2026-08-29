@@ -54,6 +54,31 @@ def set_autostart(enabled: bool) -> bool:
     return is_autostart_enabled() == enabled
 
 
+def apply_click_through(hwnd: int, enabled: bool) -> bool:
+    """Set or clear click-through (WS_EX_LAYERED | WS_EX_TRANSPARENT) on *hwnd*.
+
+    Returns True on success, False if not Windows or hwnd is invalid.
+    """
+    if os.name != "nt" or hwnd == 0:
+        return False
+    import ctypes
+
+    GWL_EXSTYLE = -20
+    WS_EX_LAYERED = 0x00080000
+    WS_EX_TRANSPARENT = 0x00000020
+    user32 = ctypes.windll.user32
+    try:
+        exstyle = user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
+        if enabled:
+            new_style = exstyle | WS_EX_LAYERED | WS_EX_TRANSPARENT
+        else:
+            new_style = exstyle & ~(WS_EX_LAYERED | WS_EX_TRANSPARENT)
+        user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style)
+        return True
+    except Exception:
+        return False
+
+
 def apply_windows_backdrop(window_id: int) -> bool:
     """Enable Windows 11 dark Mica. Older Windows safely ignores this."""
     if os.name != "nt" or not window_id:

@@ -5,7 +5,7 @@ merged checkpoint.  Supports a dry-run mode that verifies the adapter config,
 base model name/revision and target modules without downloading any weights
 or importing the heavy training stack.
 
-Design rules (see docs/personal_lora_training.md and ``training/runtime.py``):
+Design rules (see docs/training/personal_lora_training.md and ``training/runtime.py``):
 
 - BF16 LoRA only.  Quantized base models (4bit/8bit, ``quantization`` is not
   ``None``) or quantized adapters are rejected so we never silently produce a

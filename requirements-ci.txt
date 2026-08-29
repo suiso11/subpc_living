@@ -1,0 +1,14 @@
+# Minimal CI dependency set for the offline Linux unit-test gate.
+#
+# Only the deterministic offline slices (llm / assistant / context / chat /
+# tasks / perception policy / markdown link checker) are exercised. Their
+# source imports use stdlib except `httpx` (used by src/chat/client.py,
+# src/llm/providers/*, src/llm/providers/cloud_http.py, src/chat/web_search.py).
+# The tasks slice is stdlib-only (decomposer / prioritizer / store / reminder /
+# formatting / calendar_sync). tests.test_task_chat_editor is NOT run here:
+# it transitively imports discord.py via src/tasks/chat_editor.py ->
+# src/discord_bot/task_ui.py, and discord is not installed.
+#
+# No Ollama, GPU, audio, vision, sensor, Discord, Docker, PostgreSQL,
+# model-download, or real-data dependencies are installed here.
+httpx>=0.27,<0.29

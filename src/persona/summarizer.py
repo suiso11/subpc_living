@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from src.chat.client import OllamaClient
+    from src.llm.provider import LLMProvider
     from src.persona.profile import UserProfile
 
 
@@ -80,7 +80,7 @@ class ConversationSummarizer:
 
     def summarize_session(
         self,
-        llm: "OllamaClient",
+        llm: "LLMProvider",
         messages: list[dict],
         session_id: str,
         *,
@@ -91,7 +91,7 @@ class ConversationSummarizer:
         セッションを要約してファイル保存
 
         Args:
-            llm: OllamaClient
+            llm: LLMProvider
             messages: セッションの全メッセージ
             session_id: セッションID
 
@@ -133,7 +133,7 @@ class ConversationSummarizer:
 
     def extract_facts(
         self,
-        llm: "OllamaClient",
+        llm: "LLMProvider",
         messages: list[dict],
         profile: "UserProfile",
         *,
@@ -144,7 +144,7 @@ class ConversationSummarizer:
         会話からユーザー情報を抽出してプロファイルに追加
 
         Args:
-            llm: OllamaClient
+            llm: LLMProvider
             messages: セッションの全メッセージ
             profile: ユーザープロファイル
 
@@ -186,7 +186,7 @@ class ConversationSummarizer:
 
     def process_session_end(
         self,
-        llm: "OllamaClient",
+        llm: "LLMProvider",
         messages: list[dict],
         session_id: str,
         profile: Optional["UserProfile"] = None,

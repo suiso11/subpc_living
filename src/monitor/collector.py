@@ -6,7 +6,7 @@ Phase 10: マルチGPUメトリクス収集対応 (P40 + RTX 2070 Super)
 import time
 import threading
 from dataclasses import dataclass, field, asdict
-from typing import Optional
+from typing import Callable, Optional
 
 try:
     import psutil
@@ -71,17 +71,37 @@ class SystemCollector:
     バックグラウンドスレッドで動作し、指定間隔でメトリクスを収集。
     """
 
-    def __init__(self, interval: float = 30.0):
+    def __init__(
+        self,
+        interval: float = 30.0,
+        process_details_enabled: bool = False,
+        *,
+        join_timeout: float = 5.0,
+        thread_factory: Optional[Callable[[], threading.Thread]] = None,
+        collect_fn: Optional[Callable[[], SystemMetrics]] = None,
+    ):
         """
         Args:
             interval: 収集間隔 (秒)。デフォルト30秒。
+            process_details_enabled: プロセス名・PID・トップリスト収集の opt-in。
+                既定オフ (fail closed)。SENSOR_PROCESS_DETAILS_ENABLED=true で有効化。
+            join_timeout: stop() がスレッド終了を待つ最大秒数。
+            thread_factory: 収集スレッド生成用の注入フック (テスト用)。
+                None のとき既定の threading.Thread を使う。start() ごとに1回呼ばれる。
+            collect_fn: 1回分の収集処理の注入フック (テスト用)。
+                None のとき self.collect_once を使う。
         """
         if not HAS_PSUTIL:
             raise RuntimeError("psutil がインストールされていません: pip install psutil")
 
         self.interval = interval
+        self._process_details_enabled = process_details_enabled
+        self._join_timeout = join_timeout
+        self._thread_factory = thread_factory
+        self._collect_fn = collect_fn or self.collect_once
         self._thread: Optional[threading.Thread] = None
         self._running = False
+        self._stop_pending = False
         self._latest: Optional[SystemMetrics] = None
         self._lock = threading.Lock()
         self._callback = None  # メトリクス収集時のコールバック
@@ -91,37 +111,180 @@ class SystemCollector:
         self._prev_net_io = None
         self._prev_time = None
 
-    def start(self, callback=None) -> None:
+    def start(self, callback=None) -> bool:
         """
         バックグラウンド収集を開始
 
+        戻り値は真偽のみ (生例外は外部へ露出しない)。
+        - True: ライブな収集 worker が存在する場合。今回開始した場合、既に稼働中、
+          あるいは前回 stop で停止しきらず生存している旧スレッドの所有権が
+          残っている場合を含む。また thread.start() が例外を投げてもスレッドが
+          生存していれば保持して True とする。
+        - False: ライブな worker が残っていない場合のみ。thread_factory の失敗、
+          起動失敗で死亡・未起動、起動直後に即死した場合。さらに、stop 要求
+          (stop_pending) 中に旧 worker が生存し続けている場合は、その worker を
+          reactivate せず _running を変更しないまま False を返す。
+
+        不変条件: start() が False を返すのは、ライブな worker が残っていない場合
+        だけである。呼び出し側は False を見たらコレクターを破棄してよい。
+        (stop_pending 中の旧 worker は「停止中」であってライブ worker ではない)
+
         Args:
             callback: 収集のたびに呼ばれる関数 callback(metrics: SystemMetrics)
+
+        Returns:
+            ライブな worker が存在するとき True、それ以外は False。
         """
-        self._callback = callback
-        self._running = True
+        with self._lock:
+            if self._running:
+                return True
 
-        # 初回の I/O カウンタを取得
-        try:
-            self._prev_disk_io = psutil.disk_io_counters()
-            self._prev_net_io = psutil.net_io_counters()
-            self._prev_time = time.time()
-        except Exception:
-            pass
+            # 前回の stop タイムアウト等で生存スレッドの所有権が残っている場合。
+            if self._thread is not None:
+                try:
+                    alive = self._thread.is_alive()
+                except Exception:
+                    alive = False
+                if alive:
+                    if self._stop_pending:
+                        # stop 保留中の旧 worker は reactivate しない。
+                        # _running を変更せず False を返す (停止を継続させる)。
+                        return False
+                    self._running = True
+                    self._callback = callback
+                    return True
 
-        self._thread = threading.Thread(target=self._collect_loop, daemon=True)
-        self._thread.start()
+            self._stop_pending = False
+            self._running = True
+
+            # 初回の I/O カウンタを取得
+            try:
+                self._prev_disk_io = psutil.disk_io_counters()
+                self._prev_net_io = psutil.net_io_counters()
+                self._prev_time = time.time()
+            except Exception:
+                pass
+
+            try:
+                thread = (
+                    self._thread_factory()
+                    if self._thread_factory is not None
+                    else threading.Thread(target=self._collect_loop, daemon=True)
+                )
+            except Exception:
+                self._running = False
+                self._callback = None
+                self._thread = None
+                self._stop_pending = False
+                return False
+
+            try:
+                thread.start()
+            except Exception:
+                # start() が例外を投げても、スレッドが生存していれば所有権を保持し
+                # ライブ worker として扱う。死亡・未起動なら破棄して False。
+                try:
+                    alive = thread.is_alive()
+                except Exception:
+                    alive = False
+                if alive:
+                    self._thread = thread
+                    self._running = True
+                    self._stop_pending = False
+                    self._callback = callback
+                    return True
+                self._running = False
+                self._callback = None
+                self._thread = None
+                self._stop_pending = False
+                return False
+
+            # 起動直後に即死していないか確認。即死ならライブ worker は残らない。
+            try:
+                alive = thread.is_alive()
+            except Exception:
+                alive = True
+            if not alive:
+                self._running = False
+                self._callback = None
+                self._thread = None
+                self._stop_pending = False
+                return False
+
+            self._thread = thread
+            self._callback = callback
+            return True
 
     def stop(self) -> None:
-        """収集を停止"""
-        self._running = False
-        if self._thread:
-            self._thread.join(timeout=5)
-            self._thread = None
+        """収集を停止 (冪等)
+
+        スレッド終了は join_timeout 秒まで待つ。タイムアウトで生存している場合は
+        参照を保持して回収しない (stop_pending を立て、後続の stop() で再度 join
+        できる)。死亡を確認できたときだけ参照を破棄し、stop_pending を解除する。
+        join / is_alive の失敗でも生例外は露出しない。
+        """
+        with self._lock:
+            self._running = False
+            thread = self._thread
+
+        if thread is None:
+            return
+
+        try:
+            thread.join(timeout=self._join_timeout)
+        except Exception:
+            with self._lock:
+                if self._thread is thread:
+                    self._stop_pending = True
+            return
+
+        with self._lock:
+            try:
+                alive = thread.is_alive()
+            except Exception:
+                alive = True
+            if self._thread is thread and not alive:
+                self._thread = None
+                self._stop_pending = False
+            elif self._thread is thread:
+                self._stop_pending = True
 
     @property
     def is_running(self) -> bool:
-        return self._running
+        """実際に稼働中 (収集スレッドが生存 かつ 停止要求なし) のときだけ True。
+
+        予期せぬスレッド死亡や停止後 (join タイムアウト / stop_pending) の状態を
+        「稼働中」として報告しない。停止保留中に保持される生存スレッドの
+        所有権は _thread に残り、再起動をブロックし続ける。
+        """
+        if not self._running or self._stop_pending:
+            return False
+        thread = self._thread
+        if thread is None:
+            return False
+        try:
+            return thread.is_alive()
+        except Exception:
+            return False
+
+    @property
+    def thread_alive(self) -> bool:
+        """所有する収集スレッドが実際に生存しているか (生の生存判定)。
+
+        stop 要求 (stop_pending) の有無に関係なく報告する。
+        """
+        thread = self._thread
+        if thread is None:
+            return False
+        try:
+            return thread.is_alive()
+        except Exception:
+            return False
+
+    @property
+    def stop_pending(self) -> bool:
+        """停止要求済みだが収集スレッドの死亡が未確認か。"""
+        return self._stop_pending
 
     def get_latest(self) -> Optional[SystemMetrics]:
         """最新のメトリクスを取得"""
@@ -212,25 +375,32 @@ class SystemCollector:
         metrics = self._collect_gpu(metrics)
 
         # --- プロセス ---
+        # プロセス詳細 (名前・PID・トップリスト) は opt-in (SENSOR_PROCESS_DETAILS_ENABLED)。
+        # 既定オフ。オフのときは集計 (プロセス件数) のみを残し、詳細は収集しない。
         try:
             metrics.process_count = len(psutil.pids())
-            procs = []
-            for proc in psutil.process_iter(["pid", "name", "cpu_percent"]):
-                try:
-                    info = proc.info
-                    if info["cpu_percent"] and info["cpu_percent"] > 0:
-                        procs.append({
-                            "name": info["name"],
-                            "pid": info["pid"],
-                            "cpu_percent": round(info["cpu_percent"], 1),
-                        })
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
-            # CPU使用率トップ5
-            procs.sort(key=lambda x: x["cpu_percent"], reverse=True)
-            metrics.top_cpu_processes = procs[:5]
         except Exception:
             pass
+
+        if self._process_details_enabled:
+            try:
+                procs = []
+                for proc in psutil.process_iter(["pid", "name", "cpu_percent"]):
+                    try:
+                        info = proc.info
+                        if info["cpu_percent"] and info["cpu_percent"] > 0:
+                            procs.append({
+                                "name": info["name"],
+                                "pid": info["pid"],
+                                "cpu_percent": round(info["cpu_percent"], 1),
+                            })
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+                # CPU使用率トップ5
+                procs.sort(key=lambda x: x["cpu_percent"], reverse=True)
+                metrics.top_cpu_processes = procs[:5]
+            except Exception:
+                pass
 
         return metrics
 
@@ -284,12 +454,15 @@ class SystemCollector:
     def _collect_loop(self) -> None:
         """バックグラウンド収集ループ"""
         # 起動直後に1回収集（psutil のcpu_percentは初回呼び出しが不正確なため）
-        psutil.cpu_percent(interval=0.1)
+        try:
+            psutil.cpu_percent(interval=0.1)
+        except Exception:
+            pass
         time.sleep(0.5)
 
         while self._running:
             try:
-                metrics = self.collect_once()
+                metrics = self._collect_fn()
                 with self._lock:
                     self._latest = metrics
 

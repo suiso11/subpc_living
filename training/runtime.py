@@ -7,7 +7,7 @@ training frameworks (``transformers``, ``peft``, ``trl``, ``torch``) MUST be
 imported lazily inside the CLI entry points, never at module import time, so
 that dry-runs and unit tests run without any model download or GPU dependency.
 
-Design rules enforced here (see docs/personal_lora_training.md):
+Design rules enforced here (see docs/training/personal_lora_training.md):
 
 - BF16 LoRA only.  ``precision`` must be ``"bf16"``.  Quantized (4bit/8bit)
   precisions and FP16/FP32 full fine-tuning are rejected explicitly so the

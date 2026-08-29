@@ -5,10 +5,13 @@
 - Phase 9: onnxruntime-gpu 利用時は CUDAExecutionProvider を自動選択
 - Phase 10: デュアルGPU対応 — device_id で推論GPUを指定
 """
+import logging
 import numpy as np
 from pathlib import Path
 from typing import Optional
 from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
 
 try:
     import cv2
@@ -175,10 +178,7 @@ class EmotionDetector:
         input_shape = self._session.get_inputs()[0].shape
         self._input_h = input_shape[2] if len(input_shape) == 4 else 64
         self._input_w = input_shape[3] if len(input_shape) == 4 else 64
-        provider_str = ", ".join(
-            p[0] if isinstance(p, tuple) else p for p in providers
-        )
-        print(f"  感情推定: emotion-ferplus ONNX ({provider_str})")
+        logger.info("emotion model loaded")
 
     def detect(self, face_image: np.ndarray) -> tuple[str, float, dict]:
         """
@@ -236,8 +236,8 @@ class VisionAnalyzer:
         if emotion_model_path and Path(emotion_model_path).exists():
             try:
                 self.emotion_detector = EmotionDetector(emotion_model_path)
-            except Exception as e:
-                print(f"⚠️  感情モデル ロード失敗 (顔検出のみ使用): {e}")
+            except Exception as exc:
+                logger.warning("emotion model load failed (face-only mode): %s", type(exc).__name__)
 
     @property
     def has_emotion(self) -> bool:
@@ -285,10 +285,10 @@ class VisionAnalyzer:
                         face_info.emotion_ja = EMOTION_JA.get(emotion, "不明")
                         face_info.emotion_confidence = confidence
                         face_info.emotion_scores = scores
-                    except Exception as e:
-                        # 初回のみ警告表示。連続失敗によるログ氾濫を避ける
+                    except Exception as exc:
+                        # 初回のみ警告ログ。連続失敗によるログ氾濫を避ける
                         if not getattr(self, "_emotion_warned", False):
-                            print(f"⚠️  感情推定失敗 (以降サイレント): {e}")
+                            logger.warning("emotion inference failed (subsequent silent): %s", type(exc).__name__)
                             self._emotion_warned = True
 
             result.faces.append(face_info)
