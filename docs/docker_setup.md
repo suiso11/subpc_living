@@ -1,11 +1,30 @@
 # Docker Engine + PostgreSQL (I1) セットアップ
 
+> **状態**: draft / supporting（pre-deployment・未検証）
+> **位置付け**: Ubuntu 24.04 (I1) セットアップのドラフト手順（未検証）
+> **対象範囲**: サブPCでの Docker Engine / Compose plugin / postgres:16 の導入・起動・確認・更新・rollback
+> **作成日**: 2026-08-27
+> **更新日**: 2026-08-28
+> **日付根拠**: Git commit date
+
+> **未検証のドラフト手順**: 本手順はデプロイ前の草案であり、実機での成功は確認されていない。
+> 各コマンドの成功出力・稼働状態を「完了」と主張しないこと。実行は要件を満たす実機上で行い、
+> 第5節の静的チェックを事前に、実機チェックを実行後に必ず行うこと。
+
 対象: サブPC (Ubuntu 24.04)。Docker 導入はサブPC上で行う（この文書は手順書であり、
 リポジトリ側では Docker を実行しない）。Compose で `postgres:16` を常駐させる。
 
 > **絶対に `.env` をコミットしないこと。** `.env` には実パスワードが入る。
 > git 管理されるのは `.env.example`（プレースホルダのみ）だけ。`.env` は
 > `.gitignore` 済みだが、`git add -f` しない・コピーして共有しない。
+
+## 0. 前提条件（事前確認）
+
+- Ubuntu 24.04 のサブPC実機、`sudo` 権限、ログアウト/再ログインが可能なユーザー
+- `scripts/systemd/` の unit と Ollama が動いている環境を想定（本手順は postgres 導入に限定）
+- リポジトリの `compose.yaml` / `.env.example` が最新であること（`git pull`）
+- 秘密情報: 実 `.env` は git 管理外。`config/*.env` は本ドキュメントの対象外
+- **本手順は未検証**。実機で検証できた項目は第5節へ反映し、検証前は「成功した手順」として扱わない
 
 ## 1. Docker Engine + Compose plugin のインストール (Ubuntu 24.04)
 
@@ -99,9 +118,21 @@ scripts/restore.sh <backup_dir> --target /tmp/subpc-restore --restore-postgres
 dumpをスキップする。`off` はDBを対象外にする。**postgres 実行中に `infra/pgdata` を直接
 コピーしない**（整合性が壊れる）。物理コピーする場合は必ずDBを停止する。
 
-## 5. チェックリスト
+## 5. 検証チェックリスト
+
+### 5a. 静的チェック（リポジトリ内で確認可能・未検証の判定材料）
+
+- [ ] `compose.yaml` が `postgres:16`、healthcheck、`restart: unless-stopped`、loopback bind 既定を持つ
+- [ ] `.env.example` に `POSTGRES_PASSWORD` がプレースホルダ（`change-me`）で存在する
+- [ ] `.env` / `config/*.env` / `infra/pgdata/` が `.gitignore` されており `git status` に出ない
+- [ ] `scripts/backup.sh` / `scripts/restore.sh` に `POSTGRES_BACKUP_MODE` と `--restore-postgres` の実装がある
+
+### 5b. 実機チェック（デプロイ後にのみ検証可能。現時点では未検証）
 
 - [ ] `.env` が存在し、パスワードが change-me から変わっている（かつ未コミット）
 - [ ] `docker compose ps` が healthy
 - [ ] `ss -ltnp` で 5432 が 127.0.0.1 のみに bind
-- [ ] `infra/pgdata/`, `backups/`, `.env` が `git status` に出ない
+- [ ] OS 再起動後も postgres が自動起動する
+- [ ] 実 `pg_dump` / `--verify-only` / 復元訓練が成功する
+
+> 5b は未実施。実機で成功が確認されるまで、本手順を「成功した手順」として扱わない。

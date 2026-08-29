@@ -1,6 +1,10 @@
 # Tailscale SSH セットアップ・使い方
 
-マンション共有回線（NAT越え不可）でも外部からSSH接続できるようにするため、Tailscaleを利用する。
+> ⚠️ **未検証テンプレート**: このプロジェクトでは **Tailscale ノードは未検証**（デプロイ済みの
+> サブPCは存在しない）。以下の内容は**汎用テンプレート**であり、ホスト名・IP・OS・バージョンは
+> プレースホルダで表す。実機で確定する値は各節の「確認コマンド」で発見し、ここへ反映すること。
+
+マンション共有回線（NAT越え不可）でも外部からSSH接続できるようにするため、Tailscaleを利用する想定。
 
 ## 仕組み
 
@@ -9,15 +13,17 @@
 - 外部にSSHポートを晒さないので安全
 - `--ssh` オプションでTailscale SSHを有効化すると、SSH鍵の管理もTailscale側で自動化される
 
-## このマシンの情報
+## このマシンの情報（デプロイ後に記入）
 
-- ホスト名: `haruka-HP-EliteDesk-800-G4-TWR`
-- OS: Ubuntu 24.04 (noble)
-- Tailscale バージョン: 1.94.2
+以下の項目は**実機導入時に確定・記入する**。本リポジトリからは断定しない。
+
+- ホスト名: `<サブPCのホスト名>`（未確定）
+- OS: `<サブPCのOSとバージョン>`（未確定）
+- Tailscale バージョン: `<導入時に確認>`（未確定）
 
 ---
 
-## 初回セットアップ（済）
+## 初回セットアップ（未検証テンプレート）
 
 ```bash
 # インストール
@@ -29,19 +35,25 @@ sudo tailscale up --ssh
 # ブラウザで認証URLを開いてログイン
 ```
 
-## 確認コマンド
+## 確認コマンド（発見用・★未検証）
 
 ```bash
 # 接続状態の確認
 tailscale status
 
-# このマシンのTailscale IPを確認
+# このマシンのTailscale IPを確認（実機で確認して記録）
 tailscale ip -4
-# → 100.124.212.90
+
+# ホスト名・MagicDNS名を確認（実機で確認して記録）
+hostname
+tailscale status --json | jq -r '.Self.DNSName'
 
 # 詳細情報
 tailscale status --json | jq '.Self'
 ```
+
+> **このプロジェクトでは Tailscale ノードは未検証**。上記コマンドの実行結果は
+> デプロイ時にここへ反映すること。
 
 ---
 
@@ -63,26 +75,26 @@ sudo tailscale up
 # ブラウザで認証（同じアカウントでログイン）
 ```
 
-### 3. SSH接続
+### 3. SSH接続（★未検証）
 
 ```bash
-# Tailscale IP で接続
-ssh haruka@100.124.212.90
+# Tailscale IP で接続（IP は実機で確認）
+ssh <ユーザー名>@<サブPCのIP>
 
 # または MagicDNS が有効ならホスト名で接続
-ssh haruka@haruka-hp-elitedesk-800-g4-twr
+ssh <ユーザー名>@<サブPCのホスト名>
 
 # Tailscale SSH (鍵なし) の場合はそのまま繋がる
 ```
 
 ### 4. VS Code Remote SSH で使う場合
 
-`~/.ssh/config` に追加：
+`~/.ssh/config` に追加（値は実機で確定・★未検証）：
 
 ```
 Host subpc
-    HostName 100.124.212.90
-    User haruka
+    HostName <サブPCのIP>
+    User <ユーザー名>
 ```
 
 VS Code で `Ctrl+Shift+P` → `Remote-SSH: Connect to Host` → `subpc` を選択。
@@ -111,14 +123,14 @@ sudo systemctl status tailscaled
 sudo systemctl restart tailscaled
 ```
 
-## ファイル転送
+## ファイル転送（★未検証）
 
 ```bash
 # Tailscale経由でSCP
-scp ./file.txt haruka@100.124.212.90:/home/haruka/
+scp ./file.txt <ユーザー名>@<サブPCのIP>:/home/<ユーザー名>/
 
 # Tailscale 組み込みのファイル送信（taildrop）
-tailscale file cp ./file.txt haruka-hp-elitedesk-800-g4-twr:
+tailscale file cp ./file.txt <サブPCのホスト名>:
 
 # 受信側で受け取り
 tailscale file get ./
@@ -178,14 +190,13 @@ sudo journalctl -u tailscaled -f
 
 ---
 
-## 自動起動
+## 自動起動（★未検証）
 
-`tailscaled` サービスはインストール時にsystemdで自動有効化済み：
+`tailscaled` サービスはインストール時にsystemdで自動有効化される想定：
 
 ```bash
-# 確認
+# 確認（実機で確認）
 sudo systemctl is-enabled tailscaled
-# → enabled
 ```
 
-OS再起動後も自動的に接続される。
+OS再起動後も自動的に接続される想定。実機での動作確認は未実施。

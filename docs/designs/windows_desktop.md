@@ -1,5 +1,12 @@
 # Windowsネイティブアプリ
 
+> **状態**: active / supporting
+> **位置付け**: Windowsネイティブアプリの設計・ビルド手順書
+> **対象範囲**: PySide6 + Qt Quick/QML クライアント（`src.desktop`）、`requirements-desktop.txt`、EXEビルド
+> **作成日**: 2026-07-14
+> **更新日**: 2026-08-27
+> **日付根拠**: Git commit date
+
 SUBPC BUDDYの普段使い用クライアントです。64bit Windows 10/11を対象に、HTML/WebViewではなく、PySide6 + Qt Quick/QML（Qt 6.8 LTS系）で描画します。
 会話・タスク・記録・実績は既存の `subpc-web` APIと同じデータを利用するため、DiscordやWeb画面との状態が分裂しません。
 

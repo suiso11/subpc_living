@@ -1,14 +1,28 @@
 # Assistant Platform 実装計画
 
+> **状態**: completed / supporting
+> **位置付け**: マルチモデル基盤実装の記録（Provider / Router / Service / Context / Cloud）
+> **対象範囲**: Assistant Platform の実装計画（Phase A〜K）と基盤実装履歴
+> **作成日**: 2026-08-16
+> **更新日**: 2026-08-28
+> **日付根拠**: Git commit date
+
 ## 位置付け
 
 この計画は、次の設計対話のうち「既存の`subpc_living`を壊さず、ローカルファーストなマルチモデル基盤へ育てる」部分へ集中する。
 
 - https://chatgpt.com/share/6a818ce2-f970-83e8-b59e-25408a0a469e
 
-3Dキャラクター、透過HUD、知覚イベントなどは`docs/companion_roadmap.md`に残すが、本計画の完了までは実装の主線に置かない。
+3Dキャラクター、透過HUD、知覚イベントなどは`../plans/companion_roadmap.md`に残すが、本計画の完了までは実装の主線に置かない。
 
 ## 実装状況
+
+本計画の「完了」は **リポジトリ内の基盤実装・テスト・wiring** を指す。6段階
+（planned / implemented / tested / integrated / deployed / verified）では、
+下記の項目は原則 `implemented` / `tested`、経路へ配線されたものは `integrated` に相当する。
+`deployed` / `verified`（実送信・外部モデル接続・デプロイ検証）は本リポジトリでは未実施。
+特に Cloud（Phase K）は基盤実装・ユニットテストのみで、通常の Web / Discord / Voice / CLI 経路へ
+**統合されていない**。完全に配線されたクラウド製品フローは存在しない。
 
 - [x] `LLMProvider`と`FakeProvider`
 - [x] `GenerationOptions`とProvider共通例外
@@ -31,8 +45,8 @@
 - [x] Vision / Screen移行（完了・secret / local_only）
 - [x] Calendar移行（完了）
 - [x] Tasks移行（完了・最終権威ブロックとして末尾）
-- [x] Cloud経路（Phase K、無効既定＋明示承認＋匿名化＋ローカルFallback＋OpenAI互換実送信Providerを完了。既定はローカルのみ）
-- [x] Companion Phase 4〜5（知覚状態、全入口runtime wiring、決定的Proactive Policy接続）を完了。Phase 6aと6b静的3D表示は`docs/companion_roadmap.md`を正とする）
+- [x] Cloud経路（Phase K、無効既定＋明示承認＋匿名化＋ローカルFallback＋OpenAI互換実送信Providerを**リポジトリ基盤として実装・テスト済み**。既定はローカルのみ。**ただし通常のWeb / Discord / Voice / CLI経路への統合・request-preview / IDライフサイクル・ストリーミング・実送信・デプロイ検証は未完了**）
+- [x] Companion Phase 4〜5（知覚状態、全入口runtime wiring、決定的Proactive Policy接続）を完了。Phase 6aと6b静的3D表示は`../plans/companion_roadmap.md`を正とする）
 
 ## 1. ゴール
 
@@ -72,7 +86,7 @@ flowchart TD
 - `src/audio/main.py`: `AssistantService.generate_stream()`を使用
 - `src/audio/pipeline.py`: `AssistantService.generate_stream()`とTTSを直接接続
 - `src/diary/**`, `src/persona/**`: 内部バッチ処理として`LLMProvider`を直接利用（`AssistantService`は通さない）
-- `src/chat/session.py`: 履歴は`HistoryContextProvider`、Preloadは`PreloadContextProvider` / `ContextBuilder`経由で`ContextBlock`化して構築済み。PreloadはSessionPreloaderがprofile・schedule・summary・時刻を一つのstrへまとめた結果を包む移行であり、独立Profile Providerではない。RAGは`RAGContextProvider` / `ContextBuilder`経由で`ContextBlock`化して構築済み（prompt injectionのみ）。Web searchは`WebSearchContextProvider` / `ContextBuilder`経由で`ContextBlock`化して構築済み（Context Provider化のみ・検索ロジックは未変更）。Vision / Screen（secret / local_only）、Monitor / Calendar（personal / local_only）も各Context Provider経由で`ContextBlock`化して構築済み。Tasksは最終権威ブロックとしてsystem本文の末尾に置き、Historyのrole messagesは最後に`ContextBuilder`経由で描画する。Phase Jは完了し、Cloud経路（Phase K）も完了（無効が既定）
+- `src/chat/session.py`: 履歴は`HistoryContextProvider`、Preloadは`PreloadContextProvider` / `ContextBuilder`経由で`ContextBlock`化して構築済み。PreloadはSessionPreloaderがprofile・schedule・summary・時刻を一つのstrへまとめた結果を包む移行であり、独立Profile Providerではない。RAGは`RAGContextProvider` / `ContextBuilder`経由で`ContextBlock`化して構築済み（prompt injectionのみ）。Web searchは`WebSearchContextProvider` / `ContextBuilder`経由で`ContextBlock`化して構築済み（Context Provider化のみ・検索ロジックは未変更）。Vision / Screen（secret / local_only）、Monitor / Calendar（personal / local_only）も各Context Provider経由で`ContextBlock`化して構築済み。Tasksは最終権威ブロックとしてsystem本文の末尾に置き、Historyのrole messagesは最後に`ContextBuilder`経由で描画する。Phase Jは完了し、Cloud経路（Phase K）は**リポジトリ内の実装・テスト済み基盤に限定**（無効が既定）。通常のWeb / Discord / Voice / CLI経路はすべて`build_local_service`（または直接`AssistantService`）を使用しており、完全に配線されたクラウド製品フローは存在しない
 
 ### 守る制約
 
@@ -441,8 +455,8 @@ Routerを高度化する前にSQLiteへ事実を記録する。実装とruntime 
 - Vision / Screen移行は完了: `VisionContextProvider`（source=vision / sensitivity=secret / local_only=True）と`ScreenContextProvider`（source=screen / sensitivity=secret / local_only=True）を実装し、`ChatSession.build_messages()`へ組み込み済み。どちらもsecret / local_onlyのため非Local経路へ渡らない。各収集失敗は型名だけwarningして本文をログせず、会話を継続する。各Providerは`src.context`から公開し、root公開APIテスト済み
 - Calendar移行は完了: `CalendarContextProvider`（source=calendar / sensitivity=personal / local_only=True）を実装し、`ChatSession.build_messages()`へ組み込み済み。`CalendarContext`の結果（ファイル読取のみ）を包むだけで、本体は変更しない。収集失敗は型名だけwarningして本文をログせず、会話を継続する。`CalendarContextProvider`と`CalendarSource`は`src.context`から公開し、root公開APIテスト済み
 - Tasks移行は完了: `TasksContextProvider`（source=TASKS_SOURCE / sensitivity=personal / local_only=True）を実装し、最終権威ブロックとして`ChatSession.build_messages()`のsystem本文末尾へ組み込み済み。0件でも必ず注入する。Historyのrole messagesはその後ろに`ContextBuilder`経由で描画する。収集失敗は型名だけwarningして本文をログせず、会話を継続する。`TasksContextProvider`は`src.context`から公開し、root公開APIテスト済み
-- Phase J全体は完了。Cloud経路（Phase K）も完了（無効が既定；OpenAI互換実送信Providerを実装済み）
-- Companion Phase 4基盤（`PerceptionEvent` / `CompanionState` / `StateAggregator` / `ActivityEventCollector`）とプラットフォーム別ActivitySource adapter（Windows / Linux(X11)、`xprintidle` / `xdotool` 必須）は完了。Web runtime wiringと読み取り専用API（`/api/companion/state`、`COMPANION_ACTIVITY_ENABLED=true` のオプトイン、起動失敗時はcompanion機能のみ無効化してWeb起動は続行）も完了。UI消費と非Web入口（Discord / Voice / Desktop）へのruntime wiringも完了（詳細は`docs/companion_roadmap.md`）
+- Phase J全体は完了。Cloud経路（Phase K）は**リポジトリ基盤として実装・テスト済み**（無効が既定；OpenAI互換実送信Providerを実装済み）。通常のWeb / Discord / Voice / CLI経路への統合・request-preview / IDライフサイクル・ストリーミング・実送信・デプロイ検証は未完了
+- Companion Phase 4基盤（`PerceptionEvent` / `CompanionState` / `StateAggregator` / `ActivityEventCollector`）とプラットフォーム別ActivitySource adapter（Windows / Linux(X11)、`xprintidle` / `xdotool` 必須）は完了。Web runtime wiringと読み取り専用API（`/api/companion/state`、`COMPANION_ACTIVITY_ENABLED=true` のオプトイン、起動失敗時はcompanion機能のみ無効化してWeb起動は続行）も完了。UI消費と非Web入口（Discord / Voice / Desktop）へのruntime wiringも完了（詳細は`../plans/companion_roadmap.md`）
 
 移行順:
 
@@ -483,7 +497,7 @@ src/context/
 - 収集失敗した任意Contextで会話全体を止めない
 - Policyの単体テストで実際の送信Payloadを検査できる
 
-### Phase K: Cloudと承認（完了・無効が既定）
+### Phase K: Cloudと承認（リポジトリ基盤のみ実装・テスト済み・無効が既定。入口統合・プレビュー/IDライフサイクル・ストリーミング・実送信・デプロイ検証は未完了）
 
 Phase Jは完了した。Cloud経路は「無効が既定」のまま、承認・匿名化・Fallback契約とテスト双重`FakeCloudProvider`を実装した。その後、同じ境界へ`OpenAICompatibleProvider`を追加済みで、`CloudConfig(enabled=True, provider_kind="openai_compatible", ...)`を明示した場合だけ実HTTP送信を有効化できる。
 
@@ -504,6 +518,12 @@ Phase Jは完了した。Cloud経路は「無効が既定」のまま、承認�
 - `src/assistant/cloud_service.py`（`CloudRouteBridge`）：`privacy=cloud_allowed` かつ `allow_cloud` のみ許可、承認必須、匿名化Payload送信、クラウド失敗時はローカル `AssistantService` へ Fallback。構築済みmessagesをそのままクラウドへ渡す経路は存在しない（既存保証維持）。
 - `src/assistant/factory.py`（`build_assistant_service`）：`cloud_config` が渡されかつ 有効時のみクラウドProviderを登録（`provider_kind` で Fake/OpenAI互換 を分岐、`cloud_provider=` での直接注入も可）。`build_local_service` は従来通りローカルのみ。
 - テスト: `tests/llm/test_cloud_provider.py`, `tests/llm/test_approval.py`, `tests/assistant/test_cloud_service.py`, `tests/assistant/test_factory_cloud.py`（personal/secret がクラウドPayloadへ到達しないことを検証）。
+
+**統合状況（未完了事項）**:
+- `build_assistant_service(cloud_config=...)` はテストからのみ呼ばれており、通常のWeb（`src/web/server.py`）、Discord（`src/discord_bot/bot.py`）、音声（`src/audio/pipeline.py` / `src/audio/main.py`）、CLI（`src/chat/main.py`）の経路はすべて `build_local_service` または直接 `AssistantService` を使用するため、**クラウドは通常経路へ統合されていない**。
+- `AssistantService.respond_stream()` はクラウド経路が非ストリームのためローカルのみを扱う（`src/assistant/service.py`）。クラウドのストリーミング利用は未実装。
+- 事前表示（`preview` / `last_preview`）と承認・失効（`approve` / `require` / `revoke`）はコード上実装・テスト済みだが、これらをUI（Web / Discord / CLI）から操作するrequest-preview / IDライフサイクルの経路は存在しない。
+- 実HTTP送信・外部モデル接続・デプロイの検証は未実施（テストは `httpx.MockTransport` 注入のみ）。
 
 ### Phase L: LangGraph
 
@@ -526,7 +546,7 @@ Phase Jは完了した。Cloud経路は「無効が既定」のまま、承認�
 4. **CLI移行**（完了）
    最も小さい入口でEnd-to-End経路を確認する。
 
-この4タスクと後続のWeb・Discord・Voice・Context・Cloud移行は完了した。現在の主線は`docs/infrastructure_plan.md`を参照する。
+この4タスクと後続のWeb・Discord・Voice・Context・Cloud移行は完了した。現在の主線は`../infrastructure_plan.md`を参照する。
 
 ## 7. テスト計画
 
@@ -589,7 +609,8 @@ Linuxのプロジェクト環境で実行する。
 - マイクロサービス化
 - コーディングJob統合
 
-PostgreSQLは`docs/infrastructure_plan.md`で段階導入を開始済み。Cloud/OpenAI互換Provider、
-センサーイベント基盤、3D Shell基盤は実装済みのため、この後回し一覧から除外した。
+PostgreSQLは`../infrastructure_plan.md`で段階導入を開始済み。Cloud/OpenAI互換Provider（Phase K 基盤）、
+センサーイベント基盤、3D Shell基盤はリポジトリ内で実装・テスト済みのため、この後回し一覧から除外した。
+ただしPhase Kのクラウド基盤は通常のWeb / Discord / Voice / CLI経路へ未統合であり、実送信・デプロイ検証も未実施（Phase K参照）。
 
 これらは本計画の境界が安定してから上へ載せる。

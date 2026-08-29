@@ -1,5 +1,20 @@
 # AIホームラボ運用計画
 
+> **状態**: completed / supporting
+> **位置付け**: 運用基盤（Inventory / Health / Backup / Runbook）の記録
+> **対象範囲**: 2ノードAIホームラボの運用基盤（P0〜P1・N1〜N7）。以降のインフラ追加は `../infrastructure_plan.md` を正とする
+> **作成日**: 2026-08-16
+> **更新日**: 2026-08-28
+> **日付根拠**: Git commit date
+
+> **この文書について**: 本ドキュメントは**提案とリポジトリ作業の完了記録**であり、
+> **デプロイ済み2ノードホームラボの証拠ではない**。本文中の「2ノード構成・既に成立」「常時実行」
+> 「メインPC/サブPC」等の記述は、作成時点の提案・設計・リポジトリ実装記録として読むこと。
+> 実機の構成・稼働は本記録では保証されない。本文中の「未整備」「不足」「次アクション」等の
+> 未完了・次のアクションを示す表現も、過去時点の記録として読むこと。
+> **現在のインフラ実装状況と次のアクションは [infrastructure_plan.md](../infrastructure_plan.md) と
+> [README.md](../README.md) を正とする。**
+
 ## 位置付け
 
 `subpc_living`は、メインPCとサブPCを使う2ノードのAIホームラボとして既に成立している。
@@ -7,10 +22,16 @@
 
 この文書では、未整備部分と次アクションを管理する。実IP、認証情報、APIキーは記載しない。
 
+> **2026-08-28追記（本記録の限界）**: 本節以下の「現在の構成」は作成時点の会話・README・
+> リポジトリ実装から書かれた提案/記録であり、実機（メインPC・サブPC、GPU、ネットワーク、
+> サービス稼働）の検証結果ではない。現在の実装状況は
+> [infrastructure_plan.md](../infrastructure_plan.md) の「現状」、次のアクションは同文書と
+> [README.md](../README.md) を参照すること。
+
 関連文書:
 
-- `docs/assistant_platform_plan.md`: Provider、Router、AssistantServiceの実装計画
-- `docs/companion_roadmap.md`: 常駐コンパニオン全体構想
+- `./assistant_platform_plan.md`: Provider、Router、AssistantServiceの実装計画
+- `../plans/companion_roadmap.md`: 常駐コンパニオン全体構想
 
 ## 1. 現在の構成
 
@@ -242,7 +263,7 @@ registry.register("local-strong", OllamaProvider(base_url="http://localhost:1143
 
 - `local=False` はクラウドなど外部サービスだけに使う。構築済みmessages経路では実行しない
 - LANの境界そのものは`local`フラグではなく、Firewallとlisten Interfaceで守る (「P0: ネットワーク境界」)
-- Phase K (Cloudと承認) を始める前に、この定義を`docs/assistant_platform_plan.md`側の
+- Phase K (Cloudと承認) を始める前に、この定義を`./assistant_platform_plan.md`側の
   Privacy設計と突き合わせる
 
 ### P1: 更新とRollback
@@ -325,7 +346,7 @@ Inventoryから複数Provider構成を組み立て、失敗時は従来の単一
 - 対象Path一覧: `scripts/backup.sh`内のアーカイブグループ定義（tasks/conversations/rag/profile/metrics/config-systemd）
 - 世代管理: `--keep-daily N`（既定7）
 - 復元コマンド: `scripts/restore.sh <backup_dir> --target DIR`（sha256検証→展開、`--verify-only`も可）
-- 月1回以上の復元確認: `docs/runbook.md`に訓練手順を記載
+- 月1回以上の復元確認: `../runbook.md`に訓練手順を記載
 
 頻度や保存先はcron/systemd timerでの運用開始時にデータ量を実測して決める。
 I1以降はcompose PostgreSQLも対象となり、`POSTGRES_BACKUP_MODE=required`でcustom形式の
@@ -333,7 +354,7 @@ I1以降はcompose PostgreSQLも対象となり、`POSTGRES_BACKUP_MODE=required
 
 ### N7: 運用Runbook（完了）
 
-`docs/runbook.md`に全9シナリオを症状/切り分け/対処/復旧確認の構造で記載:
+`../runbook.md`に全9シナリオを症状/切り分け/対処/復旧確認の構造で記載:
 
 - Ollamaが応答しない / モデルが見つからない / Web・Discord起動しない / GPU VRAM不足 /
   ディスク不足 / DB破損 / メインPC停止 / サブPC停止 / 秘密情報誤出力
@@ -374,7 +395,7 @@ I1以降はcompose PostgreSQLも対象となり、`POSTGRES_BACKUP_MODE=required
 - 高可用性Cluster
 
 > 2026-08-22更新: 「PostgreSQLへの一括移行」「全サービスDocker化」の2件は
-> `docs/infrastructure_plan.md` の策定により、**段階的導入へ方針転換**した
+> `../infrastructure_plan.md` の策定により、**段階的導入へ方針転換**した
 > （一括・全一斉は引き続き避ける）。以降のインフラ追加は同文書を正とする。
 
 2台構成の土台は、systemd、Windows自動起動、Python、SQLite、LAN内APIのまま維持し、

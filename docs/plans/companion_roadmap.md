@@ -1,5 +1,12 @@
 # ローカル常駐コンパニオン構想
 
+> **状態**: active / canonical
+> **位置付け**: コンパニオン製品方向と実装順序の正典
+> **対象範囲**: 常駐コンパニオンの製品方向と実装ロードマップ（Phase 1〜7）
+> **作成日**: 2026-08-16
+> **更新日**: 2026-08-29
+> **日付根拠**: Git commit date
+
 ## この文書の位置付け
 
 ブラウザで行った3つの設計対話を、`subpc_living`で実行可能な方針へ統合したもの。
@@ -146,21 +153,48 @@ Contextをすべて構築してから送信先を決めてはいけない。先�
 
 ## 8. 実装ロードマップ
 
-進捗は対応する節の完了条件に基づき、完了 / 一部完了 / 未着手で示す。
+進捗は6段階（planned / implemented / tested / integrated / deployed / verified）で示す。
+以下のマトリクスを正とし、各Phaseの節はその根拠（実装・テスト・wiring先）を補足する。
+`integrated` は「通常の製品経路（Web / Discord / Voice / CLI / Desktop）へ配線済み」を意味する。
+`deployed` / `verified` は本リポジトリでは該当なし（未検証・未デプロイ）。
 
-### Phase 1: LLM境界（完了）
+| フェーズ | planned | implemented | tested | integrated | deployed | verified | 根拠（主要） |
+|---|---|---|---|---|---|---|---|
+| Phase 1 LLM境界 | - | ○ | ○ | ○（全入口がProvider経由） | - | - | `src/llm/*`, `tests/llm/*` |
+| Phase 2 AssistantService | - | ○ | ○ | ○（CLI/Web/Discord/Voice） | - | - | `src/assistant/*`, `src/chat/main.py`, `src/web/server.py`, `src/audio/pipeline.py`, `src/discord_bot/bot.py` |
+| Phase 3 ContextとRouter | - | ○ | ○ | ○（ChatSession/全Context Provider） | - | - | `src/context/*`, `tests/context/*` |
+| Phase 4 知覚イベントと状態 | - | ○ | ○ | △（オプトインruntime wiringのみ） | - | - | `src/companion/*`, `src/perception/*`, `/api/companion/state`（ライブ挙動は未検証） |
+| Phase 5 Proactive Policy | - | ○ | ○ | ○（Discord/音声/Desktop wiring、Desktopは表示のみ） | - | - | `src/companion/policy.py`, `src/persona/proactive.py`（ライブ挙動は未検証） |
+| Phase 6a オーバーレイShell基盤 | - | ○ | ○ | ○（Desktop app組込み） | - | - | `src/desktop/shell.py`, `qml/Overlay.qml` |
+| Phase 6b VRM/GLB静的表示 | - | ○ | ○ | ○（QML組込み） | - | - | `src/desktop/avatar.py`, `qml/OverlayAvatar3D.qml`（実レンダリング・デプロイ検証は未実施） |
+| Phase 6b 残作業（VRM1.0表情/視線・リップシンク・live GL等） | ○ | - | - | - | - | - | 本節「Phase 6b 残作業」 |
+| P1 Quick-Chat HUD（Phase 6b のチャットHUD実装） | - | ○ | ○ | ○（Desktop app の `Overlay.qml` expanded パネル・既存 DesktopBridge 経路再利用・新規エンドポイントなし） | - | - | `src/desktop/qml/Overlay.qml`, `src/desktop/app.py`, `tests/test_desktop_contract.py`, `../decisions/desktop_quick_chat_hud.md`（実Qt/GL・実Windows・実クリックスルー・実hotkeyのlive検証は未実施） |
+| Phase 7 クラウド経路（Phase K） | - | ○ | ○ | △（通常経路へ未統合） | - | - | `src/llm/cloud_*.py`, `src/llm/approval.py`, `src/assistant/cloud_service.py`, `src/assistant/factory.py` |
+| Phase 7 LangGraph | ○ | - | - | - | - | - | 本節「Phase 7」 |
+
+凡例: ○=該当・成立、△=一部/未完成、-=該当なし・未実施。
+マトリクスの主なギャップ:
+- **Phase 7 クラウド**: Provider / 承認 / Factory クラスとユニットテストは実装・テスト済みだが、
+  `build_assistant_service(cloud_config=...)` はテストからのみ呼ばれ、通常のWeb / Discord / Voice / CLI経路
+  （いずれも`build_local_service`または直接`AssistantService`）へは統合されていない。request-preview / ID
+  ライフサイクル、ストリーミング利用、実送信・デプロイ・外部モデル接続は未完了。
+- **Phase 6**: コードと単体テストの存在は静的表示までの実装・テストであり、実レンダリング（Qt Quick 3Dでの
+  VRM/GLB表示）・GPU挙動・デプロイの検証は未実施。
+- **Phase 4 / 5**: runtime wiringは実装・テスト済みだが、実センサー・ライブ挙動の検証は未実施。
+
+### Phase 1: LLM境界（実装・テスト・統合済み）
 
 - `LLMProvider`共通契約
 - `FakeProvider`とContract Test
 - 既存`OllamaClient`の挙動を変えず、後続Adapterの土台を作る
 
-### Phase 2: AssistantService（完了）
+### Phase 2: AssistantService（実装・テスト・統合済み）
 
 - `AssistantRequest` / `AssistantResponse`
 - CLIを最初のAdapterとして接続
 - Web、Discord、音声を一つずつ移行
 
-### Phase 3: ContextとRouter（完了）
+### Phase 3: ContextとRouter（実装・テスト・統合済み）
 
 - `ContextBlock`契約とmetadataベース`ContextPolicy`（完了）
 - History Context Provider / Builder移行とChatSessionへの適用（完了）
@@ -174,7 +208,7 @@ Contextをすべて構築してから送信先を決めてはいけない。先�
 - ローカルモデルRegistry（完了）
 - 手動ルーティングと経路ログ（完了）
 
-### Phase 4: 知覚イベントと状態（完了）
+### Phase 4: 知覚イベントと状態（実装・テスト済み、オプトインruntime wiring済み、ライブ検証未実施）
 
 - 分類済みapp_categoryとidle_secondsから意味イベント生成（完了・`ActivityEventCollector`）
 - `focused` / `idle` / `away`の3状態（完了）
@@ -185,7 +219,7 @@ Contextをすべて構築してから送信先を決めてはいけない。先�
 - UI消費とWeb以外（Discord / Voice / Desktop）へのruntime wiring（完了・各入口とも `COMPANION_ACTIVITY_ENABLED=true` オプトイン時のみ起動し、privacy-safe な `companion_state_payload` のみ公開）
 
 
-### Phase 5: Proactive Policy（完了）
+### Phase 5: Proactive Policy（実装・テスト済み、各入口wiring済み、ライブ検証未実施）
 
 - 予定接近、長時間作業、離席復帰のルール
 - 黙る条件、再通知間隔、拒否フィードバック
@@ -212,7 +246,7 @@ Contextをすべて構築してから送信先を決めてはいけない。先�
 - 音声 wiring: `src/audio/pipeline.py` の `VoicePipeline` が `companion_getter=self._companion_state` を `ProactiveEngine` へ渡し、`ActivityRuntime.state` でゲート（None・例外時は従来挙動）
 - Desktop wiring: desktop は `ProactiveEngine` を持たず、companion state を表示のみに利用するため Policy ゲートの対象なし。入力である companion state は既に `companionState` Property で露出済み
 
-### Phase 6: 3DデスクトップShell（一部完了・6a＋6b静的表示）
+### Phase 6: 3DデスクトップShell（一部・6a＋6b静的表示のみ。実レンダリング・デプロイ検証は未実施）
 
 #### 完了: Phase 6a オーバーレイShell基盤
 
@@ -243,19 +277,39 @@ Contextをすべて構築してから送信先を決めてはいけない。先�
 
 - VRM 1.0 humanoid・表情・視線を解釈する専用レンダリング制御（現状はglTFとしての静的ロード）
 - 待機モーションの高度化、表情、リップシンク
-- クイック会話HUDのチャット実装（既存bridgeチャット経路を再利用予定）
 - フルスクリーン/画面共有検知による自動縮小
 
-### Phase 7: 任意の高度機能（一部完了）
+#### 完了: P1 Quick-Chat HUD（Phase 6b のチャットHUD実装）
 
-- 明示承認付きクラウド推論（完了・無効が既定、詳細は`docs/assistant_platform_plan.md` Phase K）
+- `src/desktop/qml/Overlay.qml` の expanded パネルとして実装。既存 DesktopBridge のプロパティ・
+  シグナル・送信経路（`sendMessage` / `messages` / `game.starters` / `tasks` / `growth` /
+  `calendarEvents` / `overlayShell` / `connected` / `loading`）のみを再利用し、新規 API /
+  エンドポイントは追加しない。決定記録: `../decisions/desktop_quick_chat_hud.md`
+- Today サマリは count-only（`today_points` / `streak_days` / open タスク件数 / 今日以降の予定件数）。
+  タスク本文・予定タイトル・プロセス・センサー詳細・パス・モデル・`modelData`・`statusText` /
+  `serverUrl` は HUD に露出しない。状態は固定ラベル＋`sensor_provenance`（出所・取得時刻・保存なし）
+- クリックスルーは desired-state 方式: HUD は `bridge.setOverlayClickThrough(bool)` の希望状態のみを
+  公開し、`overlayClickThroughRequested` → `OverlayClickThroughController`（`src/desktop/app.py`）→
+  `apply_click_through`（`src/desktop/windows.py`）が実適用。復帰は Ctrl+Alt+Space で
+  `restore_interaction()` を先に実行してから本体ウィンドウを toggle。停止・終了・失敗時は必ず解除
+- 既存の 2D/3D fallback を維持（`hasAvatar3D`、拡張中はアバター非表示）。VRM 参照・3D 再設計なし
+- 検証: `tests/test_desktop_contract.py`（`OverlayContractTest` / `DesktopClickThroughContractTest`）、
+  `tests/test_desktop_shell.py`、`tests/test_desktop_qml.py` ほか計151件が Windows 開発機で成功
+- 実Qt/GL・実Windowsウィンドウ・実クリックスルー・実hotkey・実サービスでの live 検証は未実施
+  （deployed / verified は該当なし）
+
+### Phase 7: 任意の高度機能（一部実装）
+
+- 明示承認付きクラウド推論（**実装・テスト済み・無効が既定**。Provider / 承認 / Factory クラスとユニットテストは完了だが、
+  通常の Web / Discord / Voice / CLI 経路への統合は未完了。request-preview / ID ライフサイクル、ストリーミング利用、
+  実送信・デプロイ検証は未実施。詳細は`../archive/assistant_platform_plan.md` Phase K）
 - LangGraphによる承認・中断・再開が必要な処理だけをWorkflow化
 - コーディングJob Adapter
 - カメラによる在席検知は安全UI完成後に追加
 
 ## 9. 現在の実装進行単位
 
-Phase 1〜2とRegistry/Router、CLI・Web・Discord・Voice移行、実行ログの実装とruntime wiringは完了し、Phase 3の`ContextBlock` / `ContextPolicy`基盤、History・Preload・RAG・Web search・Monitor・Vision・Screen・Calendar・Tasksの各Context Provider移行も完了した。Phase J全体は完了し、Phase 4の基盤実装（`PerceptionEvent` / `CompanionState` / `StateAggregator` / `ActivityEventCollector`）とプラットフォーム別ActivitySource adapter、Web runtime wiring・`/api/companion/state`、およびDiscord / 音声 / Desktop / Web UI へのruntime wiringが完了した。Phase 5の決定的Policyエンジン基盤（`DeterministicProactivePolicy`）と接続層（`ProactiveEngine`・CalendarSource・拒否cooldown永続化・Discord / 音声 / Desktop 各入口のPolicy参照wiring）も完了した。Phase 6aと6bの静的3D表示まで完了した。次のUI作業はPhase 6b残作業だが、現在の主線は`docs/infrastructure_plan.md`の段階的インフラ整備とする。
+Phase 1〜2とRegistry/Router、CLI・Web・Discord・Voice移行、実行ログの実装とruntime wiringは完了し、Phase 3の`ContextBlock` / `ContextPolicy`基盤、History・Preload・RAG・Web search・Monitor・Vision・Screen・Calendar・Tasksの各Context Provider移行も完了した。Phase J全体は完了し、Phase 4の基盤実装（`PerceptionEvent` / `CompanionState` / `StateAggregator` / `ActivityEventCollector`）とプラットフォーム別ActivitySource adapter、Web runtime wiring・`/api/companion/state`、およびDiscord / 音声 / Desktop / Web UI へのruntime wiringが完了した。Phase 5の決定的Policyエンジン基盤（`DeterministicProactivePolicy`）と接続層（`ProactiveEngine`・CalendarSource・拒否cooldown永続化・Discord / 音声 / Desktop 各入口のPolicy参照wiring）も完了した。Phase 6aと6bの静的3D表示まで完了した。次のUI作業はPhase 6b残作業だが、現在の主線は`../infrastructure_plan.md`の段階的インフラ整備とする。なお、上記「完了」は §8 マトリクスの `implemented / tested / integrated` を指し、`deployed / verified`（実センサー・実レンダリング・デプロイ検証）は未実施。
 
 ### 完了: 実行ログ
 
@@ -359,7 +413,7 @@ Phase 1〜2とRegistry/Router、CLI・Web・Discord・Voice移行、実行ログ
     privacy-safe な `companion_state_payload` のみ公開。プロセス名・PID・アプリ分類・
     window title・エラー本文・生サンプルは出さない
 
-Phase 6a オーバーレイShell基盤（透明フレームレスウィンドウ・有限状態アバター・センサー出所HUD・クリックスルー・集中モード縮小）も完了。次の実装単位: Phase 6b（VRMレンダラ・リップシンク・クイック会話チャット）。Cloud実送信Provider swap は `docs/assistant_platform_plan.md` Phase K の通り `provider_kind="openai_compatible"` で完了済み。LangGraph Workflow は別判断。
+Phase 6a オーバーレイShell基盤（透明フレームレスウィンドウ・有限状態アバター・センサー出所HUD・クリックスルー・集中モード縮小）と P1 Quick-Chat HUD（Phase 6b のチャットHUD実装、count-only・desired-state クリックスルー・Ctrl+Alt+Space 復帰）も完了。次の実装単位: Phase 6b（VRM1.0専用レンダラ・リップシンク）。Phase K のクラウド実送信Provider（`provider_kind="openai_compatible"`）は `src/llm/providers/cloud_http.py` / `src/assistant/factory.py` として実装・ユニットテスト済みだが、通常のWeb / Discord / Voice / CLI経路へは未統合で、request-preview / IDライフサイクル、ストリーミング利用、実送信・デプロイ・外部モデル接続の検証は未完了（詳細は `../archive/assistant_platform_plan.md` Phase K）。LangGraph Workflow は別判断。
 
 ## 10. 現時点の非目標
 
